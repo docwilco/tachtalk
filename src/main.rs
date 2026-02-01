@@ -1,13 +1,11 @@
 use anyhow::Result;
 use esp_idf_hal::delay::FreeRtos;
-use esp_idf_hal::gpio::PinDriver;
 use esp_idf_hal::prelude::*;
 use esp_idf_svc::eventloop::EspSystemEventLoop;
 use esp_idf_svc::nvs::EspDefaultNvsPartition;
 use esp_idf_svc::wifi::{BlockingWifi, ClientConfiguration, Configuration, EspWifi};
 use log::*;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
 
 mod config;
 mod leds;
@@ -16,7 +14,7 @@ mod web_server;
 
 use config::Config;
 use leds::LedController;
-use obd2::{Obd2Proxy, OBD2_PORT};
+use obd2::Obd2Proxy;
 
 const WIFI_SSID: &str = env!("WIFI_SSID");
 const WIFI_PASSWORD: &str = env!("WIFI_PASSWORD");
