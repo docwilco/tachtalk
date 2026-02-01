@@ -1,6 +1,6 @@
 use anyhow::Result;
 use embedded_svc::http::Method;
-use embedded_svc::io::Write;
+use embedded_svc::io::{Read, Write};
 use esp_idf_svc::http::server::{Configuration, EspHttpServer};
 use log::*;
 use std::sync::{Arc, Mutex};
