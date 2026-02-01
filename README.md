@@ -2,6 +2,12 @@
 
 Firmware for proxying OBD2 requests between RaceChroно and a Vgate iCar 2 Wi-Fi OBD2 dongle, extracting RPM data to display on WS2812B LED shift lights.
 
+## 🚀 Quick Start
+
+New to TachTalk? Start here: **[QUICKSTART.md](QUICKSTART.md)**
+
+Get up and running in 15 minutes with step-by-step instructions!
+
 ## Features
 
 - **OBD2 Proxy**: Proxies requests between RaceChroнo app and Vgate iCar 2 Wi-Fi dongle
@@ -96,6 +102,13 @@ The web UI allows you to configure:
 - Threshold 3: 5000 RPM, Red (255,0,0), 6 LEDs
 - Blink: 6000 RPM
 - Total LEDs: 8
+
+## Documentation
+
+- **[QUICKSTART.md](QUICKSTART.md)** - Get started in 15 minutes
+- **[WIRING_GUIDE.md](WIRING_GUIDE.md)** - Hardware wiring and connections
+- **[WEBUI_GUIDE.md](WEBUI_GUIDE.md)** - Configuration interface guide
+- **[ARCHITECTURE.md](ARCHITECTURE.md)** - System architecture and design
 
 ## License
 
