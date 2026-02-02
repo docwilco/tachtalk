@@ -28,3 +28,6 @@ sdkconfig
 sdkconfig.old
 build/
 .embuild/
+
+# CoPilot
+copilot_build*.log

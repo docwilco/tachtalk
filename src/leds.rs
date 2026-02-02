@@ -1,21 +1,15 @@
 use anyhow::Result;
 use esp_idf_hal::gpio::OutputPin;
 use esp_idf_hal::peripheral::Peripheral;
-use esp_idf_hal::rmt::config::TransmitConfig;
-use esp_idf_hal::rmt::{PinState, Pulse, RmtChannel, TxRmtDriver, VariableLengthSignal};
-use smart_leds::RGB8;
-use std::time::{Duration, Instant};
+use esp_idf_hal::rmt::RmtChannel;
+use smart_leds::{SmartLedsWrite, RGB8};
+use std::time::Instant;
+use ws2812_esp32_rmt_driver::Ws2812Esp32Rmt;
 
 use crate::config::Config;
 
-const WS2812_T0H: u32 = 350;  // ns
-const WS2812_T0L: u32 = 900;  // ns
-const WS2812_T1H: u32 = 900;  // ns
-const WS2812_T1L: u32 = 350;  // ns
-
 pub struct LedController {
-    driver: TxRmtDriver<'static>,
-    _num_leds: usize,
+    driver: Ws2812Esp32Rmt<'static>,
     last_blink_time: Instant,
     blink_state: bool,
 }
@@ -25,12 +19,10 @@ impl LedController {
         pin: impl Peripheral<P = P> + 'static,
         channel: impl Peripheral<P = C> + 'static,
     ) -> Result<Self> {
-        let config = TransmitConfig::new().clock_divider(1);
-        let driver = TxRmtDriver::new(channel, pin, &config)?;
+        let driver = Ws2812Esp32Rmt::new(channel, pin)?;
 
         Ok(Self {
             driver,
-            _num_leds: 8,
             last_blink_time: Instant::now(),
             blink_state: false,
         })
@@ -79,41 +71,7 @@ impl LedController {
     }
 
     fn write_leds(&mut self, leds: &[RGB8]) -> Result<()> {
-        // We'll use the ws2812-esp32-rmt-driver crate's functionality
-        // For now, simplified implementation without the driver
-        // In production, you would use the ws2812_esp32_rmt_driver crate directly
-        
-        let ticks_hz = self.driver.counter_clock()?;
-        let t0h = Pulse::new_with_duration(ticks_hz, PinState::High, &Duration::from_nanos(WS2812_T0H as u64))?;
-        let t0l = Pulse::new_with_duration(ticks_hz, PinState::Low, &Duration::from_nanos(WS2812_T0L as u64))?;
-        let t1h = Pulse::new_with_duration(ticks_hz, PinState::High, &Duration::from_nanos(WS2812_T1H as u64))?;
-        let t1l = Pulse::new_with_duration(ticks_hz, PinState::Low, &Duration::from_nanos(WS2812_T1L as u64))?;
-        
-        // 24 bits per LED (8 bits each for G, R, B) * 2 pulses per bit + 1 reset pulse
-        let mut signal = VariableLengthSignal::new();
-        
-        for led in leds {
-            // WS2812B expects GRB order
-            let bytes = [led.g, led.r, led.b];
-            for byte in bytes {
-                for bit in (0..8).rev() {
-                    let bit_set = (byte >> bit) & 1 == 1;
-                    if bit_set {
-                        signal.push(&[t1h, t1l])?;
-                    } else {
-                        signal.push(&[t0h, t0l])?;
-                    }
-                }
-            }
-        }
-
-        // Add reset signal (low for at least 50us)
-        let reset = Pulse::new_with_duration(ticks_hz, PinState::Low, &Duration::from_micros(50))?;
-        let zero = Pulse::zero();
-        signal.push(&[reset, zero])?;
-
-        self.driver.start_blocking(&signal)?;
-        
+        self.driver.write(leds.iter().copied())?;
         Ok(())
     }
 }

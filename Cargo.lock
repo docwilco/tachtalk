@@ -1710,6 +1710,7 @@ dependencies = [
  "esp-idf-sys",
  "heapless",
  "paste",
+ "smart-leds-trait",
 ]
 
 [[package]]
