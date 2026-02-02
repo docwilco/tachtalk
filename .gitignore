@@ -27,3 +27,4 @@ target
 sdkconfig
 sdkconfig.old
 build/
+.embuild/

@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 
 use crate::config::Config;
 use crate::leds::LedController;
+use crate::web_server::{SseSender, SseMessage};
 
 pub const OBD2_PORT: u16 = 35000;
 const DONGLE_IP: &str = "192.168.0.10";
@@ -17,17 +18,20 @@ pub struct Obd2Proxy {
     config: Arc<Mutex<Config>>,
     led_controller: Arc<Mutex<LedController>>,
     last_request_time: Arc<Mutex<Instant>>,
+    sse_tx: SseSender,
 }
 
 impl Obd2Proxy {
     pub fn new(
         config: Arc<Mutex<Config>>,
         led_controller: Arc<Mutex<LedController>>,
+        sse_tx: SseSender,
     ) -> Result<Self> {
         Ok(Self {
             config,
             led_controller,
             last_request_time: Arc::new(Mutex::new(Instant::now())),
+            sse_tx,
         })
     }
 
@@ -36,9 +40,10 @@ impl Obd2Proxy {
         let config_clone = self.config.clone();
         let led_clone = self.led_controller.clone();
         let last_request_clone = self.last_request_time.clone();
+        let sse_tx_clone = self.sse_tx.clone();
         
         std::thread::spawn(move || {
-            Self::background_poller(config_clone, led_clone, last_request_clone);
+            Self::background_poller(config_clone, led_clone, last_request_clone, sse_tx_clone);
         });
 
         // Start proxy server
@@ -51,9 +56,10 @@ impl Obd2Proxy {
                     let config = self.config.clone();
                     let led_controller = self.led_controller.clone();
                     let last_request = self.last_request_time.clone();
+                    let sse_tx = self.sse_tx.clone();
                     
                     std::thread::spawn(move || {
-                        if let Err(e) = Self::handle_client(stream, config, led_controller, last_request) {
+                        if let Err(e) = Self::handle_client(stream, config, led_controller, last_request, sse_tx) {
                             error!("Error handling client: {:?}", e);
                         }
                     });
@@ -71,6 +77,7 @@ impl Obd2Proxy {
         config: Arc<Mutex<Config>>,
         led_controller: Arc<Mutex<LedController>>,
         last_request_time: Arc<Mutex<Instant>>,
+        sse_tx: SseSender,
     ) {
         loop {
             std::thread::sleep(Duration::from_millis(IDLE_POLL_INTERVAL_MS));
@@ -84,6 +91,9 @@ impl Obd2Proxy {
             if should_poll {
                 // Request RPM from dongle
                 if let Ok(rpm) = Self::request_rpm() {
+                    // Send to SSE clients
+                    let _ = sse_tx.send(SseMessage::RpmUpdate(rpm));
+                    
                     if let Ok(mut led) = led_controller.lock() {
                         if let Ok(cfg) = config.lock() {
                             let _ = led.update(rpm, &cfg);
@@ -99,6 +109,7 @@ impl Obd2Proxy {
         config: Arc<Mutex<Config>>,
         led_controller: Arc<Mutex<LedController>>,
         last_request_time: Arc<Mutex<Instant>>,
+        sse_tx: SseSender,
     ) -> Result<()> {
         info!("Client connected: {:?}", client_stream.peer_addr()?);
 
@@ -127,6 +138,9 @@ impl Obd2Proxy {
                     // Check if this is an RPM request and extract it
                     if let Some(rpm) = Self::extract_rpm_from_request(request) {
                         info!("Extracted RPM from request: {}", rpm);
+                        // Send to SSE clients
+                        let _ = sse_tx.send(SseMessage::RpmUpdate(rpm));
+                        
                         if let Ok(mut led) = led_controller.lock() {
                             if let Ok(cfg) = config.lock() {
                                 let _ = led.update(rpm, &cfg);
@@ -145,6 +159,9 @@ impl Obd2Proxy {
                             // Extract RPM from response if present
                             if let Some(rpm) = Self::extract_rpm_from_response(response) {
                                 info!("Extracted RPM from response: {}", rpm);
+                                // Send to SSE clients
+                                let _ = sse_tx.send(SseMessage::RpmUpdate(rpm));
+                                
                                 if let Ok(mut led) = led_controller.lock() {
                                     if let Ok(cfg) = config.lock() {
                                         let _ = led.update(rpm, &cfg);
@@ -185,7 +202,7 @@ impl Obd2Proxy {
         Self::extract_rpm_from_response(response).ok_or_else(|| anyhow::anyhow!("Failed to extract RPM"))
     }
 
-    fn extract_rpm_from_request(data: &[u8]) -> Option<u32> {
+    fn extract_rpm_from_request(_data: &[u8]) -> Option<u32> {
         // Check if this is a response to RPM request being echoed back
         // This is a simplified implementation
         None
