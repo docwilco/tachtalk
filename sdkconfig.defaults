@@ -11,3 +11,17 @@ CONFIG_FREERTOS_HZ=1000
 # Workaround for https://github.com/espressif/esp-idf/issues/7631
 CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=n
 CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_FULL=n
+
+# Set log level to INFO (no debug output)
+CONFIG_LOG_MAXIMUM_LEVEL_INFO=y
+CONFIG_LOG_DEFAULT_LEVEL_INFO=y
+
+# Increase HTTP server header buffer for captive portal (mobile browsers send long headers)
+CONFIG_HTTPD_MAX_REQ_HDR_LEN=4096
+
+# Enable mDNS for tachtalk.local access
+CONFIG_MDNS_ENABLED=y
+
+# Increase max sockets for handling multiple concurrent connections
+# Default is 10, max is 16 per LWIP Kconfig
+CONFIG_LWIP_MAX_SOCKETS=16

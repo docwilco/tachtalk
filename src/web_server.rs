@@ -3,13 +3,14 @@ use embedded_svc::http::Method;
 use embedded_svc::io::Write;
 use esp_idf_svc::http::server::{Configuration, EspHttpServer};
 use esp_idf_svc::wifi::{BlockingWifi, EspWifi};
-use log::{info, error};
+use log::{debug, info, error, warn};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::os::unix::io::RawFd;
 
 use crate::config::Config;
 use crate::leds::LedController;
+use crate::watchdog::WatchdogHandle;
 use crate::WifiMode;
 
 /// Message types for SSE manager
@@ -36,15 +37,47 @@ pub fn start_sse_manager() -> SseSender {
 
 /// SSE manager task - handles all SSE connections in a single thread
 fn sse_manager_task(rx: Receiver<SseMessage>) {
+    info!("SSE manager starting...");
+    
     // Active connections: (socket fd, done signal sender)
     let mut connections: Vec<(RawFd, Sender<()>)> = Vec::new();
     let mut current_rpm: Option<u32> = None;
+    let mut last_heartbeat = std::time::Instant::now();
+    const HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
+    
+    let watchdog = WatchdogHandle::register("sse_manager");
+    
+    info!("SSE manager started");
     
     loop {
+        if let Some(ref wd) = watchdog {
+            wd.feed();
+        }
+        
+        // Send periodic heartbeat to detect dead connections
+        if last_heartbeat.elapsed() >= HEARTBEAT_INTERVAL && !connections.is_empty() {
+            let before = connections.len();
+            // SSE comment line as heartbeat (clients ignore lines starting with :)
+            connections.retain(|(fd, done_tx)| {
+                if write_to_fd(*fd, b": heartbeat\n\n").is_ok() {
+                    true
+                } else {
+                    debug!("SSE: Connection closed during heartbeat (fd={fd})");
+                    let _ = done_tx.send(());
+                    false
+                }
+            });
+            let removed = before - connections.len();
+            if removed > 0 {
+                info!("SSE: Heartbeat removed {removed} dead connections, {} remaining", connections.len());
+            }
+            last_heartbeat = std::time::Instant::now();
+        }
+        
         // Non-blocking receive to handle multiple message types
         match rx.try_recv() {
             Ok(SseMessage::NewConnection(fd, done_tx)) => {
-                info!("SSE: New connection registered (fd={fd})");
+                info!("SSE: New connection registered (fd={fd}, total={})", connections.len() + 1);
                 // Send current RPM to new client immediately
                 if let Some(rpm) = current_rpm {
                     let msg = format!("data: {{\"rpm\":{rpm}}}\n\n");
@@ -60,16 +93,21 @@ fn sse_manager_task(rx: Receiver<SseMessage>) {
                 current_rpm = Some(rpm);
                 let msg = format!("data: {{\"rpm\":{rpm}}}\n\n");
                 
+                let before = connections.len();
                 // Broadcast to all connections, remove dead ones
                 connections.retain(|(fd, done_tx)| {
                     if write_to_fd(*fd, msg.as_bytes()).is_ok() {
                         true
                     } else {
-                        info!("SSE: Connection closed (fd={fd})");
+                        debug!("SSE: Connection closed (fd={fd})");
                         let _ = done_tx.send(());
                         false
                     }
                 });
+                let removed = before - connections.len();
+                if removed > 0 {
+                    debug!("SSE: Removed {removed} dead connections, {} remaining", connections.len());
+                }
             }
             Err(TryRecvError::Empty) => {
                 // No messages, sleep briefly
@@ -310,17 +348,15 @@ const HTML_INDEX: &str = r#"
         
         <button onclick="addThreshold()">Add Threshold</button>
         
-        <div class="blink-config">
-            <h2>Blink Configuration</h2>
-            <div class="form-group">
-                <label>Blink RPM:</label>
-                <input type="number" id="blinkRpm" value="6000">
-            </div>
-        </div>
-        
         <div class="form-group">
             <label>Total LEDs:</label>
             <input type="number" id="totalLeds" value="8">
+        </div>
+        
+        <div class="form-group">
+            <label>LED GPIO Pin:</label>
+            <input type="number" id="ledGpio" value="48" min="0" max="48">
+            <small style="color: #888;">(requires restart)</small>
         </div>
         
         <button onclick="saveConfig()">Save Configuration</button>
@@ -330,14 +366,18 @@ const HTML_INDEX: &str = r#"
     <script>
         let config = {
             wifi: { ssid: '', password: '' },
-            ip_config: { use_dhcp: true, ip: null, gateway: null, subnet: null, dns: null },
+            ip: { use_dhcp: true, ip: null, gateway: null, subnet: null, dns: null },
             thresholds: [
-                { rpm: 3000, color: { r: 0, g: 255, b: 0 }, num_leds: 2 },
-                { rpm: 4000, color: { r: 255, g: 255, b: 0 }, num_leds: 4 },
-                { rpm: 5000, color: { r: 255, g: 0, b: 0 }, num_leds: 6 }
+                { name: 'Off', rpm: 0, start_led: 0, end_led: 0, color: { r: 0, g: 0, b: 0 }, blink: false, blink_ms: 500 },
+                { name: 'Blue', rpm: 1000, start_led: 0, end_led: 0, color: { r: 0, g: 0, b: 255 }, blink: false, blink_ms: 500 },
+                { name: 'Green', rpm: 1500, start_led: 0, end_led: 0, color: { r: 0, g: 255, b: 0 }, blink: false, blink_ms: 500 },
+                { name: 'Yellow', rpm: 2000, start_led: 0, end_led: 0, color: { r: 255, g: 255, b: 0 }, blink: false, blink_ms: 500 },
+                { name: 'Red', rpm: 2500, start_led: 0, end_led: 0, color: { r: 255, g: 0, b: 0 }, blink: false, blink_ms: 500 },
+                { name: 'Off', rpm: 3000, start_led: 0, end_led: 0, color: { r: 0, g: 0, b: 0 }, blink: false, blink_ms: 500 },
+                { name: 'Shift', rpm: 3000, start_led: 0, end_led: 0, color: { r: 0, g: 0, b: 255 }, blink: true, blink_ms: 500 }
             ],
-            blink_rpm: 6000,
-            total_leds: 8
+            total_leds: 1,
+            led_gpio: 48
         };
 
         function toggleStaticIp() {
@@ -369,19 +409,37 @@ const HTML_INDEX: &str = r#"
             config.thresholds.forEach((threshold, index) => {
                 const div = document.createElement('div');
                 div.className = 'threshold';
-                div.innerHTML = '<h3>Threshold ' + (index + 1) + '</h3>' +
+                div.innerHTML = '<h3>' + (threshold.name || 'Threshold ' + (index + 1)) + '</h3>' +
+                    '<div class="form-group">' +
+                        '<label>Name:</label>' +
+                        '<input type="text" value="' + (threshold.name || '') + '" onchange="updateThreshold(' + index + ', \'name\', this.value)">' +
+                    '</div>' +
                     '<div class="form-group">' +
                         '<label>RPM:</label>' +
                         '<input type="number" value="' + threshold.rpm + '" onchange="updateThreshold(' + index + ', \'rpm\', parseInt(this.value))">' +
+                    '</div>' +
+                    '<div class="form-group">' +
+                        '<label>Start LED:</label>' +
+                        '<input type="number" min="0" value="' + threshold.start_led + '" onchange="updateThreshold(' + index + ', \'start_led\', parseInt(this.value))">' +
+                    '</div>' +
+                    '<div class="form-group">' +
+                        '<label>End LED:</label>' +
+                        '<input type="number" min="0" value="' + threshold.end_led + '" onchange="updateThreshold(' + index + ', \'end_led\', parseInt(this.value))">' +
                     '</div>' +
                     '<div class="form-group">' +
                         '<label>Color:</label>' +
                         '<input type="color" value="' + rgbToHex(threshold.color) + '" onchange="updateThreshold(' + index + ', \'color\', hexToRgb(this.value))">' +
                     '</div>' +
                     '<div class="form-group">' +
-                        '<label>Number of LEDs:</label>' +
-                        '<input type="number" value="' + threshold.num_leds + '" onchange="updateThreshold(' + index + ', \'num_leds\', parseInt(this.value))">' +
+                        '<label>Blink:</label>' +
+                        '<input type="checkbox" ' + (threshold.blink ? 'checked' : '') + ' onchange="updateThreshold(' + index + ', \'blink\', this.checked)">' +
                     '</div>' +
+                    '<div class="form-group">' +
+                        '<label>Blink ms:</label>' +
+                        '<input type="number" min="50" step="50" value="' + (threshold.blink_ms || 500) + '" onchange="updateThreshold(' + index + ', \'blink_ms\', parseInt(this.value))">' +
+                    '</div>' +
+                    '<button onclick="moveThreshold(' + index + ', -1)">▲ Up</button>' +
+                    '<button onclick="moveThreshold(' + index + ', 1)">▼ Down</button>' +
                     '<button onclick="removeThreshold(' + index + ')">Remove</button>';
                 container.appendChild(div);
             });
@@ -389,14 +447,28 @@ const HTML_INDEX: &str = r#"
 
         function updateThreshold(index, field, value) {
             config.thresholds[index][field] = value;
+            if (field === 'name') renderThresholds();
         }
 
         function addThreshold() {
             config.thresholds.push({
+                name: 'New Threshold',
                 rpm: 5000,
+                start_led: 0,
+                end_led: 7,
                 color: { r: 255, g: 0, b: 0 },
-                num_leds: 2
+                blink: false,
+                blink_ms: 500
             });
+            renderThresholds();
+        }
+
+        function moveThreshold(index, direction) {
+            const newIndex = index + direction;
+            if (newIndex < 0 || newIndex >= config.thresholds.length) return;
+            const temp = config.thresholds[index];
+            config.thresholds[index] = config.thresholds[newIndex];
+            config.thresholds[newIndex] = temp;
             renderThresholds();
         }
 
@@ -416,8 +488,8 @@ const HTML_INDEX: &str = r#"
         }
 
         async function saveConfig() {
-            config.blink_rpm = parseInt(document.getElementById('blinkRpm').value);
             config.total_leds = parseInt(document.getElementById('totalLeds').value);
+            config.led_gpio = parseInt(document.getElementById('ledGpio').value);
             
             try {
                 const response = await fetch('/api/config', {
@@ -429,7 +501,12 @@ const HTML_INDEX: &str = r#"
                 });
                 
                 if (response.ok) {
-                    showStatus('Configuration saved successfully!', false);
+                    const result = await response.json().catch(() => ({}));
+                    if (result.restart) {
+                        showStatus('Configuration saved! Restarting device...', false);
+                    } else {
+                        showStatus('Configuration saved successfully!', false);
+                    }
                 } else {
                     showStatus('Failed to save configuration', true);
                 }
@@ -457,7 +534,7 @@ const HTML_INDEX: &str = r#"
             };
             
             config.wifi = { ssid, password: password || null };
-            config.ip_config = ipConfig;
+            config.ip = ipConfig;
             
             try {
                 const response = await fetch('/api/wifi', {
@@ -465,7 +542,7 @@ const HTML_INDEX: &str = r#"
                     headers: {
                         'Content-Type': 'application/json',
                     },
-                    body: JSON.stringify({ ssid, password: password || null, ip_config: ipConfig })
+                    body: JSON.stringify({ ssid, password: password || null, ip: ipConfig })
                 });
                 
                 if (response.ok) {
@@ -511,13 +588,13 @@ const HTML_INDEX: &str = r#"
                 const response = await fetch('/api/config');
                 if (response.ok) {
                     config = await response.json();
-                    document.getElementById('blinkRpm').value = config.blink_rpm;
                     document.getElementById('totalLeds').value = config.total_leds;
+                    document.getElementById('ledGpio').value = config.led_gpio || 48;
                     document.getElementById('wifiSsid').value = config.wifi?.ssid || '';
                     document.getElementById('wifiPassword').value = config.wifi?.password || '';
                     
                     // IP config
-                    const ipConfig = config.ip_config || { use_dhcp: true };
+                    const ipConfig = config.ip || { use_dhcp: true };
                     document.getElementById('ipMode').value = ipConfig.use_dhcp ? 'dhcp' : 'static';
                     document.getElementById('staticIp').value = ipConfig.ip || '';
                     document.getElementById('staticGateway').value = ipConfig.gateway || '';
@@ -611,10 +688,10 @@ const HTML_CAPTIVE_PORTAL: &str = r#"
 <html>
 <head>
     <title>TachTalk Setup</title>
-    <meta http-equiv="refresh" content="0;url=http://192.168.4.1/">
+    <meta http-equiv="refresh" content="0;url=http://192.168.71.1/">
 </head>
 <body>
-    <p>Redirecting to <a href="http://192.168.4.1/">TachTalk Setup</a>...</p>
+    <p>Redirecting to <a href="http://192.168.71.1/">TachTalk Setup</a>...</p>
 </body>
 </html>
 "#;
@@ -625,8 +702,18 @@ pub fn start_server(
     wifi_mode: Arc<Mutex<WifiMode>>,
     wifi: Arc<Mutex<BlockingWifi<EspWifi<'static>>>>,
     sse_tx: SseSender,
+    ap_hostname: Option<String>,
 ) -> Result<()> {
-    let server_config = Configuration::default();
+    info!("Web server starting...");
+    
+    let mut server_config = Configuration::default();
+    // Enable wildcard URI matching for captive portal fallback handler
+    server_config.uri_match_wildcard = true;
+    // Enable LRU purge to handle abrupt disconnections from captive portal browsers
+    // LWIP max is 16 sockets; leave room for DNS, OBD2, mDNS
+    server_config.max_open_sockets = 10;
+    server_config.session_timeout = core::time::Duration::from_secs(2);
+    server_config.lru_purge_enable = true;
     let mut server = EspHttpServer::new(&server_config)?;
 
     // Serve the main HTML page
@@ -636,37 +723,15 @@ pub fn start_server(
         Ok(())
     })?;
 
-    // Captive portal handlers - redirect common captive portal detection URLs
-    let captive_urls = [
-        "/generate_204",           // Android
-        "/gen_204",                // Android
-        "/hotspot-detect.html",    // Apple
-        "/library/test/success.html", // Apple
-        "/ncsi.txt",               // Windows
-        "/connecttest.txt",        // Windows
-        "/redirect",               // Various
-        "/canonical.html",         // Firefox
-        "/success.txt",            // Various
-    ];
-
-    for url in captive_urls {
-        server.fn_handler(url, Method::Get, |req| -> Result<(), esp_idf_svc::io::EspIOError> {
-            let mut response = req.into_response(302, Some("Found"), &[
-                ("Location", "http://192.168.4.1/"),
-                ("Cache-Control", "no-cache"),
-            ])?;
-            response.write_all(HTML_CAPTIVE_PORTAL.as_bytes())?;
-            Ok(())
-        })?;
-    }
-
     // GET mode endpoint
     let mode_clone = wifi_mode.clone();
     server.fn_handler("/api/mode", Method::Get, move |req| -> Result<(), esp_idf_svc::io::EspIOError> {
+        info!("HTTP: GET /api/mode");
         let mode = mode_clone.lock().unwrap();
         let mode_str = match *mode {
             WifiMode::AccessPoint => "ap",
             WifiMode::Client => "client",
+            WifiMode::Mixed => "mixed",
         };
         let json = format!(r#"{{"mode":"{mode_str}"}}"#);
         
@@ -678,6 +743,7 @@ pub fn start_server(
     // GET config endpoint
     let config_clone = config.clone();
     server.fn_handler("/api/config", Method::Get, move |req| -> Result<(), esp_idf_svc::io::EspIOError> {
+        info!("HTTP: GET /api/config");
         let cfg = config_clone.lock().unwrap();
         let json = serde_json::to_string(&*cfg).unwrap();
         
@@ -689,16 +755,40 @@ pub fn start_server(
     // POST config endpoint
     let config_clone = config.clone();
     server.fn_handler("/api/config", Method::Post, move |mut req| -> Result<(), esp_idf_svc::io::EspIOError> {
+        info!("HTTP: POST /api/config");
         let mut buf = vec![0u8; 2048];
         let bytes_read = req.read(&mut buf)?;
         
         if let Ok(new_config) = serde_json::from_slice::<Config>(&buf[..bytes_read]) {
-            let mut cfg = config_clone.lock().unwrap();
-            *cfg = new_config;
-            let _ = cfg.save();
+            debug!("Config update: {} thresholds, log_level={:?}", 
+                   new_config.thresholds.len(), new_config.log_level);
             
-            req.into_ok_response()?;
+            let needs_restart = {
+                let cfg = config_clone.lock().unwrap();
+                cfg.led_gpio != new_config.led_gpio
+            };
+            
+            {
+                let mut cfg = config_clone.lock().unwrap();
+                *cfg = new_config;
+                if let Err(e) = cfg.save() {
+                    warn!("Failed to save config: {e}");
+                }
+            }
+            
+            if needs_restart {
+                info!("LED GPIO changed, restarting in 2 seconds...");
+                let mut response = req.into_ok_response()?;
+                response.write_all(b"{\"restart\":true}")?;
+                std::thread::spawn(|| {
+                    std::thread::sleep(std::time::Duration::from_secs(2));
+                    unsafe { esp_idf_svc::sys::esp_restart(); }
+                });
+            } else {
+                req.into_ok_response()?;
+            }
         } else {
+            warn!("Invalid config JSON received");
             req.into_status_response(400)?;
         }
         
@@ -708,6 +798,7 @@ pub fn start_server(
     // POST wifi endpoint - save wifi and restart
     let config_clone = config.clone();
     server.fn_handler("/api/wifi", Method::Post, move |mut req| -> Result<(), esp_idf_svc::io::EspIOError> {
+        info!("HTTP: POST /api/wifi");
         let mut buf = vec![0u8; 1024];
         let bytes_read = req.read(&mut buf)?;
         
@@ -724,21 +815,23 @@ pub fn start_server(
         struct WifiRequest {
             ssid: String,
             password: Option<String>,
-            ip_config: Option<IpConfigRequest>,
+            ip: Option<IpConfigRequest>,
         }
         
         if let Ok(wifi_req) = serde_json::from_slice::<WifiRequest>(&buf[..bytes_read]) {
+            info!("WiFi config update: ssid={:?}, dhcp={:?}", 
+                  wifi_req.ssid, wifi_req.ip.as_ref().map(|i| i.use_dhcp));
             let mut cfg = config_clone.lock().unwrap();
             cfg.wifi.ssid = wifi_req.ssid;
             cfg.wifi.password = wifi_req.password.filter(|p| !p.is_empty());
             
             // Update IP config if provided
-            if let Some(ip_cfg) = wifi_req.ip_config {
-                cfg.ip_config.use_dhcp = ip_cfg.use_dhcp;
-                cfg.ip_config.ip = ip_cfg.ip.filter(|s| !s.is_empty());
-                cfg.ip_config.gateway = ip_cfg.gateway.filter(|s| !s.is_empty());
-                cfg.ip_config.subnet = ip_cfg.subnet.filter(|s| !s.is_empty());
-                cfg.ip_config.dns = ip_cfg.dns.filter(|s| !s.is_empty());
+            if let Some(ip_cfg) = wifi_req.ip {
+                cfg.ip.use_dhcp = ip_cfg.use_dhcp;
+                cfg.ip.ip = ip_cfg.ip.filter(|s| !s.is_empty());
+                cfg.ip.gateway = ip_cfg.gateway.filter(|s| !s.is_empty());
+                cfg.ip.subnet = ip_cfg.subnet.filter(|s| !s.is_empty());
+                cfg.ip.dns = ip_cfg.dns.filter(|s| !s.is_empty());
             }
             
             if let Err(e) = cfg.save() {
@@ -767,6 +860,7 @@ pub fn start_server(
     // GET wifi scan endpoint
     let wifi_clone = wifi.clone();
     server.fn_handler("/api/wifi/scan", Method::Get, move |req| -> Result<(), esp_idf_svc::io::EspIOError> {
+        info!("HTTP: GET /api/wifi/scan");
         let mut wifi = wifi_clone.lock().unwrap();
         
         #[derive(serde::Serialize)]
@@ -776,13 +870,16 @@ pub fn start_server(
         }
         
         let networks: Vec<Network> = match wifi.scan() {
-            Ok(aps) => aps
-                .into_iter()
-                .map(|ap| Network {
-                    ssid: ap.ssid.to_string(),
-                    rssi: ap.signal_strength,
-                })
-                .collect(),
+            Ok(aps) => {
+                debug!("WiFi scan found {} networks", aps.len());
+                aps
+                    .into_iter()
+                    .map(|ap| Network {
+                        ssid: ap.ssid.to_string(),
+                        rssi: ap.signal_strength,
+                    })
+                    .collect()
+            }
             Err(e) => {
                 error!("WiFi scan failed: {e:?}");
                 Vec::new()
@@ -799,6 +896,7 @@ pub fn start_server(
     // GET network status endpoint
     let wifi_clone = wifi.clone();
     server.fn_handler("/api/network", Method::Get, move |req| -> Result<(), esp_idf_svc::io::EspIOError> {
+        info!("HTTP: GET /api/network");
         let wifi = wifi_clone.lock().unwrap();
         
         #[derive(serde::Serialize)]
@@ -837,6 +935,7 @@ pub fn start_server(
 
     // GET RPM endpoint (fallback for non-SSE clients)
     server.fn_handler("/api/rpm", Method::Get, |req| -> Result<(), esp_idf_svc::io::EspIOError> {
+        info!("HTTP: GET /api/rpm");
         // This is just a fallback, real updates come via SSE
         let json = r#"{"rpm":null}"#;
         let mut response = req.into_ok_response()?;
@@ -847,6 +946,7 @@ pub fn start_server(
     // SSE endpoint for RPM streaming
     let sse_tx_clone = sse_tx.clone();
     server.fn_handler("/api/rpm/stream", Method::Get, move |req| -> Result<(), esp_idf_svc::io::EspIOError> {
+        info!("HTTP: GET /api/rpm/stream (SSE)");
         // Send SSE headers
         let mut response = req.into_response(200, Some("OK"), &[
             ("Content-Type", "text/event-stream"),
@@ -879,6 +979,44 @@ pub fn start_server(
         
         Ok(())
     })?;
+
+    // Captive portal fallback handler - redirect requests with wrong Host header
+    // Must be registered last as it's a wildcard that matches everything
+    if let Some(hostname) = ap_hostname {
+        let valid_hosts: Vec<String> = vec![
+            hostname.clone(),
+            format!("{hostname}.local"),
+            "192.168.71.1".to_string(),
+        ];
+        
+        info!("Captive portal enabled for hostname: {hostname}");
+        
+        server.fn_handler("/*", Method::Get, move |req| -> Result<(), esp_idf_svc::io::EspIOError> {
+            // Check Host header
+            let host = req.header("Host").unwrap_or("");
+            let host_lower = host.to_lowercase();
+            // Strip port if present
+            let host_without_port = host_lower.split(':').next().unwrap_or("");
+            
+            let is_valid_host = valid_hosts.iter().any(|h| h == host_without_port);
+            
+            if is_valid_host {
+                // Valid host but unknown path - return 404
+                info!("HTTP: GET {} -> 404 (host: {})", req.uri(), host);
+                req.into_status_response(404)?;
+            } else {
+                // Wrong host - redirect to captive portal
+                info!("HTTP: GET {} -> 302 captive (host: {})", req.uri(), host);
+                let mut response = req.into_response(302, Some("Found"), &[
+                    ("Location", "http://192.168.71.1/"),
+                    ("Cache-Control", "no-cache"),
+                    ("Connection", "close"),
+                ])?;
+                response.write_all(HTML_CAPTIVE_PORTAL.as_bytes())?;
+            }
+            Ok(())
+        })?;
+    }
 
     info!("Web server started on http://0.0.0.0:80");
     
