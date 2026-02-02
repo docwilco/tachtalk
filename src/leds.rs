@@ -2,7 +2,7 @@ use anyhow::Result;
 use esp_idf_hal::gpio::OutputPin;
 use esp_idf_hal::peripheral::Peripheral;
 use esp_idf_hal::rmt::config::TransmitConfig;
-use esp_idf_hal::rmt::{PinState, Pulse, RmtChannel, TxRmtDriver};
+use esp_idf_hal::rmt::{PinState, Pulse, RmtChannel, TxRmtDriver, VariableLengthSignal};
 use smart_leds::RGB8;
 use std::time::{Duration, Instant};
 
@@ -15,7 +15,7 @@ const WS2812_T1L: u32 = 350;  // ns
 
 pub struct LedController {
     driver: TxRmtDriver<'static>,
-    num_leds: usize,
+    _num_leds: usize,
     last_blink_time: Instant,
     blink_state: bool,
 }
@@ -30,7 +30,7 @@ impl LedController {
 
         Ok(Self {
             driver,
-            num_leds: 8,
+            _num_leds: 8,
             last_blink_time: Instant::now(),
             blink_state: false,
         })
@@ -89,7 +89,8 @@ impl LedController {
         let t1h = Pulse::new_with_duration(ticks_hz, PinState::High, &Duration::from_nanos(WS2812_T1H as u64))?;
         let t1l = Pulse::new_with_duration(ticks_hz, PinState::Low, &Duration::from_nanos(WS2812_T1L as u64))?;
         
-        let mut signal = Vec::new();
+        // 24 bits per LED (8 bits each for G, R, B) * 2 pulses per bit + 1 reset pulse
+        let mut signal = VariableLengthSignal::new();
         
         for led in leds {
             // WS2812B expects GRB order
@@ -98,11 +99,9 @@ impl LedController {
                 for bit in (0..8).rev() {
                     let bit_set = (byte >> bit) & 1 == 1;
                     if bit_set {
-                        signal.push(t1h);
-                        signal.push(t1l);
+                        signal.push(&[t1h, t1l])?;
                     } else {
-                        signal.push(t0h);
-                        signal.push(t0l);
+                        signal.push(&[t0h, t0l])?;
                     }
                 }
             }
@@ -110,7 +109,8 @@ impl LedController {
 
         // Add reset signal (low for at least 50us)
         let reset = Pulse::new_with_duration(ticks_hz, PinState::Low, &Duration::from_micros(50))?;
-        signal.push(reset);
+        let zero = Pulse::zero();
+        signal.push(&[reset, zero])?;
 
         self.driver.start_blocking(&signal)?;
         

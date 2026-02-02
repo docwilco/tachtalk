@@ -1,0 +1,801 @@
+   Compiling tachtalk v0.1.0 (/home/drwilco/tachtalk)
+    Checking rgb v0.8.52
+    Checking memchr v2.7.6
+    Checking itoa v1.0.17
+    Checking zmij v1.0.19
+    Checking anyhow v1.0.100
+    Checking ws2812-esp32-rmt-driver v0.13.1
+    Checking esp-idf-svc v0.51.0
+    Checking smart-leds-trait v0.3.2
+    Checking serde_json v1.0.149
+    Checking smart-leds v0.4.0
+warning: binding's name is too similar to existing binding
+  --> src/leds.rs:88:13
+   |
+88 |         let t0l = Pulse::new_with_duration(ticks_hz, PinState::Low, &Duration::from_nanos(WS2812_T0L as u64))?;
+   |             ^^^
+   |
+note: existing binding defined here
+  --> src/leds.rs:87:13
+   |
+87 |         let t0h = Pulse::new_with_duration(ticks_hz, PinState::High, &Duration::from_nanos(WS2812_T0H as u64))?;
+   |             ^^^
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#similar_names
+   = note: `-W clippy::similar-names` implied by `-W clippy::pedantic`
+   = help: to override `-W clippy::pedantic` add `#[allow(clippy::similar_names)]`
+
+warning: binding's name is too similar to existing binding
+  --> src/leds.rs:90:13
+   |
+90 |         let t1l = Pulse::new_with_duration(ticks_hz, PinState::Low, &Duration::from_nanos(WS2812_T1L as u64))?;
+   |             ^^^
+   |
+note: existing binding defined here
+  --> src/leds.rs:87:13
+   |
+87 |         let t0h = Pulse::new_with_duration(ticks_hz, PinState::High, &Duration::from_nanos(WS2812_T0H as u64))?;
+   |             ^^^
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#similar_names
+
+warning: usage of wildcard import
+  --> src/main.rs:10:5
+   |
+10 | use log::*;
+   |     ^^^^^^ help: try: `log::{info, warn, error}`
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#wildcard_imports
+   = note: `-W clippy::wildcard-imports` implied by `-W clippy::pedantic`
+   = help: to override `-W clippy::pedantic` add `#[allow(clippy::wildcard_imports)]`
+
+warning: field name ends with the struct's name
+  --> src/config.rs:94:5
+   |
+94 |     pub ip_config: IpConfig,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#struct_field_names
+   = note: `-W clippy::struct-field-names` implied by `-W clippy::pedantic`
+   = help: to override `-W clippy::pedantic` add `#[allow(clippy::struct_field_names)]`
+
+warning: the loop variable `i` is only used to index `leds`
+  --> src/leds.rs:72:22
+   |
+72 |             for i in 0..threshold.num_leds.min(config.total_leds) {
+   |                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#needless_range_loop
+   = note: `#[warn(clippy::needless_range_loop)]` on by default
+help: consider using an iterator
+   |
+72 -             for i in 0..threshold.num_leds.min(config.total_leds) {
+72 +             for <item> in leds.iter_mut().take(threshold.num_leds.min(config.total_leds)) {
+   |
+
+warning: casts from `u32` to `u64` can be expressed infallibly using `From`
+  --> src/leds.rs:87:92
+   |
+87 |         let t0h = Pulse::new_with_duration(ticks_hz, PinState::High, &Duration::from_nanos(WS2812_T0H as u64))?;
+   |                                                                                            ^^^^^^^^^^^^^^^^^
+   |
+   = help: an `as` cast can become silently lossy if the types change in the future
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#cast_lossless
+   = note: `-W clippy::cast-lossless` implied by `-W clippy::pedantic`
+   = help: to override `-W clippy::pedantic` add `#[allow(clippy::cast_lossless)]`
+help: use `u64::from` instead
+   |
+87 -         let t0h = Pulse::new_with_duration(ticks_hz, PinState::High, &Duration::from_nanos(WS2812_T0H as u64))?;
+87 +         let t0h = Pulse::new_with_duration(ticks_hz, PinState::High, &Duration::from_nanos(u64::from(WS2812_T0H)))?;
+   |
+
+warning: casts from `u32` to `u64` can be expressed infallibly using `From`
+  --> src/leds.rs:88:91
+   |
+88 |         let t0l = Pulse::new_with_duration(ticks_hz, PinState::Low, &Duration::from_nanos(WS2812_T0L as u64))?;
+   |                                                                                           ^^^^^^^^^^^^^^^^^
+   |
+   = help: an `as` cast can become silently lossy if the types change in the future
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#cast_lossless
+help: use `u64::from` instead
+   |
+88 -         let t0l = Pulse::new_with_duration(ticks_hz, PinState::Low, &Duration::from_nanos(WS2812_T0L as u64))?;
+88 +         let t0l = Pulse::new_with_duration(ticks_hz, PinState::Low, &Duration::from_nanos(u64::from(WS2812_T0L)))?;
+   |
+
+warning: casts from `u32` to `u64` can be expressed infallibly using `From`
+  --> src/leds.rs:89:92
+   |
+89 |         let t1h = Pulse::new_with_duration(ticks_hz, PinState::High, &Duration::from_nanos(WS2812_T1H as u64))?;
+   |                                                                                            ^^^^^^^^^^^^^^^^^
+   |
+   = help: an `as` cast can become silently lossy if the types change in the future
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#cast_lossless
+help: use `u64::from` instead
+   |
+89 -         let t1h = Pulse::new_with_duration(ticks_hz, PinState::High, &Duration::from_nanos(WS2812_T1H as u64))?;
+89 +         let t1h = Pulse::new_with_duration(ticks_hz, PinState::High, &Duration::from_nanos(u64::from(WS2812_T1H)))?;
+   |
+
+warning: casts from `u32` to `u64` can be expressed infallibly using `From`
+  --> src/leds.rs:90:91
+   |
+90 |         let t1l = Pulse::new_with_duration(ticks_hz, PinState::Low, &Duration::from_nanos(WS2812_T1L as u64))?;
+   |                                                                                           ^^^^^^^^^^^^^^^^^
+   |
+   = help: an `as` cast can become silently lossy if the types change in the future
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#cast_lossless
+help: use `u64::from` instead
+   |
+90 -         let t1l = Pulse::new_with_duration(ticks_hz, PinState::Low, &Duration::from_nanos(WS2812_T1L as u64))?;
+90 +         let t1l = Pulse::new_with_duration(ticks_hz, PinState::Low, &Duration::from_nanos(u64::from(WS2812_T1L)))?;
+   |
+
+warning: usage of wildcard import
+ --> src/obd2.rs:2:5
+  |
+2 | use log::*;
+  |     ^^^^^^ help: try: `log::{info, error}`
+  |
+  = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#wildcard_imports
+
+warning: this function's return value is unnecessarily wrapped by `Result`
+  --> src/obd2.rs:25:5
+   |
+25 | /     pub fn new(
+26 | |         config: Arc<Mutex<Config>>,
+27 | |         led_controller: Arc<Mutex<LedController>>,
+28 | |         sse_tx: SseSender,
+29 | |     ) -> Result<Self> {
+   | |_____________________^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#unnecessary_wraps
+   = note: `-W clippy::unnecessary-wraps` implied by `-W clippy::pedantic`
+   = help: to override `-W clippy::pedantic` add `#[allow(clippy::unnecessary_wraps)]`
+help: remove `Result` from the return type...
+   |
+29 -     ) -> Result<Self> {
+29 +     ) -> obd2::Obd2Proxy {
+   |
+help: ...and then remove the surrounding `Ok()` from returning expressions
+   |
+30 ~         Self {
+31 +             config,
+32 +             led_controller,
+33 +             last_request_time: Arc::new(Mutex::new(Instant::now())),
+34 +             sse_tx,
+35 +         }
+   |
+
+warning: variables can be used directly in the `format!` string
+  --> src/obd2.rs:50:42
+   |
+50 |         let listener = TcpListener::bind(format!("0.0.0.0:{}", OBD2_PORT))?;
+   |                                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#uninlined_format_args
+   = note: `-W clippy::uninlined-format-args` implied by `-W clippy::pedantic`
+   = help: to override `-W clippy::pedantic` add `#[allow(clippy::uninlined_format_args)]`
+help: change this to
+   |
+50 -         let listener = TcpListener::bind(format!("0.0.0.0:{}", OBD2_PORT))?;
+50 +         let listener = TcpListener::bind(format!("0.0.0.0:{OBD2_PORT}"))?;
+   |
+
+warning: variables can be used directly in the `format!` string
+  --> src/obd2.rs:51:9
+   |
+51 |         info!("OBD2 proxy listening on port {}", OBD2_PORT);
+   |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#uninlined_format_args
+help: change this to
+   |
+51 -         info!("OBD2 proxy listening on port {}", OBD2_PORT);
+51 +         info!("OBD2 proxy listening on port {OBD2_PORT}");
+   |
+
+warning: variables can be used directly in the `format!` string
+  --> src/obd2.rs:63:29
+   |
+63 | ...                   error!("Error handling client: {:?}", e);
+   |                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#uninlined_format_args
+help: change this to
+   |
+63 -                             error!("Error handling client: {:?}", e);
+63 +                             error!("Error handling client: {e:?}");
+   |
+
+warning: variables can be used directly in the `format!` string
+  --> src/obd2.rs:68:21
+   |
+68 |                     error!("Error accepting connection: {:?}", e);
+   |                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#uninlined_format_args
+help: change this to
+   |
+68 -                     error!("Error accepting connection: {:?}", e);
+68 +                     error!("Error accepting connection: {e:?}");
+   |
+
+warning: this argument is passed by value, but not consumed in the function body
+  --> src/obd2.rs:77:17
+   |
+77 |         config: Arc<Mutex<Config>>,
+   |                 ^^^^^^^^^^^^^^^^^^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#needless_pass_by_value
+   = note: `-W clippy::needless-pass-by-value` implied by `-W clippy::pedantic`
+   = help: to override `-W clippy::pedantic` add `#[allow(clippy::needless_pass_by_value)]`
+help: consider taking a reference instead
+   |
+77 |         config: &Arc<Mutex<Config>>,
+   |                 +
+
+warning: this argument is passed by value, but not consumed in the function body
+  --> src/obd2.rs:78:25
+   |
+78 |         led_controller: Arc<Mutex<LedController>>,
+   |                         ^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#needless_pass_by_value
+help: consider taking a reference instead
+   |
+78 |         led_controller: &Arc<Mutex<LedController>>,
+   |                         +
+
+warning: this argument is passed by value, but not consumed in the function body
+  --> src/obd2.rs:79:28
+   |
+79 |         last_request_time: Arc<Mutex<Instant>>,
+   |                            ^^^^^^^^^^^^^^^^^^^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#needless_pass_by_value
+help: consider taking a reference instead
+   |
+79 |         last_request_time: &Arc<Mutex<Instant>>,
+   |                            +
+
+warning: this argument is passed by value, but not consumed in the function body
+  --> src/obd2.rs:80:17
+   |
+80 |         sse_tx: SseSender,
+   |                 ^^^^^^^^^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#needless_pass_by_value
+help: consider taking a reference instead
+   |
+80 |         sse_tx: &SseSender,
+   |                 +
+
+warning: casts from `u64` to `u128` can be expressed infallibly using `From`
+  --> src/obd2.rs:88:51
+   |
+88 |                 last_time.elapsed().as_millis() > IDLE_POLL_INTERVAL_MS as u128
+   |                                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: an `as` cast can become silently lossy if the types change in the future
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#cast_lossless
+help: use `u128::from` instead
+   |
+88 -                 last_time.elapsed().as_millis() > IDLE_POLL_INTERVAL_MS as u128
+88 +                 last_time.elapsed().as_millis() > u128::from(IDLE_POLL_INTERVAL_MS)
+   |
+
+warning: this argument is passed by value, but not consumed in the function body
+   --> src/obd2.rs:109:17
+    |
+109 |         config: Arc<Mutex<Config>>,
+    |                 ^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#needless_pass_by_value
+help: consider taking a reference instead
+    |
+109 |         config: &Arc<Mutex<Config>>,
+    |                 +
+
+warning: this argument is passed by value, but not consumed in the function body
+   --> src/obd2.rs:110:25
+    |
+110 |         led_controller: Arc<Mutex<LedController>>,
+    |                         ^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#needless_pass_by_value
+help: consider taking a reference instead
+    |
+110 |         led_controller: &Arc<Mutex<LedController>>,
+    |                         +
+
+warning: this argument is passed by value, but not consumed in the function body
+   --> src/obd2.rs:111:28
+    |
+111 |         last_request_time: Arc<Mutex<Instant>>,
+    |                            ^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#needless_pass_by_value
+help: consider taking a reference instead
+    |
+111 |         last_request_time: &Arc<Mutex<Instant>>,
+    |                            +
+
+warning: this argument is passed by value, but not consumed in the function body
+   --> src/obd2.rs:112:17
+    |
+112 |         sse_tx: SseSender,
+    |                 ^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#needless_pass_by_value
+help: consider taking a reference instead
+    |
+112 |         sse_tx: &SseSender,
+    |                 +
+
+warning: variables can be used directly in the `format!` string
+   --> src/obd2.rs:117:52
+    |
+117 |         let mut dongle_stream = TcpStream::connect(format!("{}:{}", DONGLE_IP, DONGLE_PORT))
+    |                                                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#uninlined_format_args
+help: change this to
+    |
+117 -         let mut dongle_stream = TcpStream::connect(format!("{}:{}", DONGLE_IP, DONGLE_PORT))
+117 +         let mut dongle_stream = TcpStream::connect(format!("{DONGLE_IP}:{DONGLE_PORT}"))
+    |
+
+warning: variables can be used directly in the `format!` string
+   --> src/obd2.rs:140:25
+    |
+140 |                         info!("Extracted RPM from request: {}", rpm);
+    |                         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#uninlined_format_args
+help: change this to
+    |
+140 -                         info!("Extracted RPM from request: {}", rpm);
+140 +                         info!("Extracted RPM from request: {rpm}");
+    |
+
+warning: variables can be used directly in the `format!` string
+   --> src/obd2.rs:161:33
+    |
+161 | ...                   info!("Extracted RPM from response: {}", rpm);
+    |                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#uninlined_format_args
+help: change this to
+    |
+161 -                                 info!("Extracted RPM from response: {}", rpm);
+161 +                                 info!("Extracted RPM from response: {rpm}");
+    |
+
+warning: variables can be used directly in the `format!` string
+   --> src/obd2.rs:176:29
+    |
+176 | ...                   error!("Error reading from dongle: {:?}", e);
+    |                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#uninlined_format_args
+help: change this to
+    |
+176 -                             error!("Error reading from dongle: {:?}", e);
+176 +                             error!("Error reading from dongle: {e:?}");
+    |
+
+warning: variables can be used directly in the `format!` string
+   --> src/obd2.rs:182:21
+    |
+182 |                     error!("Error reading from client: {:?}", e);
+    |                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#uninlined_format_args
+help: change this to
+    |
+182 -                     error!("Error reading from client: {:?}", e);
+182 +                     error!("Error reading from client: {e:?}");
+    |
+
+warning: variables can be used directly in the `format!` string
+   --> src/obd2.rs:192:45
+    |
+192 |         let mut stream = TcpStream::connect(format!("{}:{}", DONGLE_IP, DONGLE_PORT))?;
+    |                                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#uninlined_format_args
+help: change this to
+    |
+192 -         let mut stream = TcpStream::connect(format!("{}:{}", DONGLE_IP, DONGLE_PORT))?;
+192 +         let mut stream = TcpStream::connect(format!("{DONGLE_IP}:{DONGLE_PORT}"))?;
+    |
+
+warning: usage of wildcard import
+ --> src/web_server.rs:6:5
+  |
+6 | use log::*;
+  |     ^^^^^^ help: try: `log::{info, error}`
+  |
+  = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#wildcard_imports
+
+warning: this argument is passed by value, but not consumed in the function body
+  --> src/web_server.rs:38:25
+   |
+38 | fn sse_manager_task(rx: Receiver<SseMessage>) {
+   |                         ^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#needless_pass_by_value
+help: consider taking a reference instead
+   |
+38 | fn sse_manager_task(rx: &Receiver<SseMessage>) {
+   |                         +
+
+warning: variables can be used directly in the `format!` string
+  --> src/web_server.rs:47:17
+   |
+47 |                 info!("SSE: New connection registered (fd={})", fd);
+   |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#uninlined_format_args
+help: change this to
+   |
+47 -                 info!("SSE: New connection registered (fd={})", fd);
+47 +                 info!("SSE: New connection registered (fd={fd})");
+   |
+
+warning: variables can be used directly in the `format!` string
+  --> src/web_server.rs:50:31
+   |
+50 |                     let msg = format!("data: {{\"rpm\":{}}}\n\n", rpm);
+   |                               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#uninlined_format_args
+help: change this to
+   |
+50 -                     let msg = format!("data: {{\"rpm\":{}}}\n\n", rpm);
+50 +                     let msg = format!("data: {{\"rpm\":{rpm}}}\n\n");
+   |
+
+warning: variables can be used directly in the `format!` string
+  --> src/web_server.rs:61:27
+   |
+61 |                 let msg = format!("data: {{\"rpm\":{}}}\n\n", rpm);
+   |                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#uninlined_format_args
+help: change this to
+   |
+61 -                 let msg = format!("data: {{\"rpm\":{}}}\n\n", rpm);
+61 +                 let msg = format!("data: {{\"rpm\":{rpm}}}\n\n");
+   |
+
+warning: variables can be used directly in the `format!` string
+  --> src/web_server.rs:68:25
+   |
+68 |                         info!("SSE: Connection closed (fd={})", fd);
+   |                         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#uninlined_format_args
+help: change this to
+   |
+68 -                         info!("SSE: Connection closed (fd={})", fd);
+68 +                         info!("SSE: Connection closed (fd={fd})");
+   |
+
+warning: `as` casting between raw pointers without changing their constness
+  --> src/web_server.rs:89:37
+   |
+89 |         esp_idf_svc::sys::write(fd, data.as_ptr() as *const _, data.len())
+   |                                     ^^^^^^^^^^^^^^^^^^^^^^^^^ help: try `pointer::cast`, a safer alternative: `data.as_ptr().cast()`
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#ptr_as_ptr
+   = note: `-W clippy::ptr-as-ptr` implied by `-W clippy::pedantic`
+   = help: to override `-W clippy::pedantic` add `#[allow(clippy::ptr_as_ptr)]`
+
+warning: this function has too many lines (194/100)
+   --> src/web_server.rs:622:1
+    |
+622 | / pub fn start_server(
+623 | |     config: Arc<Mutex<Config>>,
+624 | |     _led_controller: Arc<Mutex<LedController>>,
+625 | |     wifi_mode: Arc<Mutex<WifiMode>>,
+...   |
+888 | |     Ok(())
+889 | | }
+    | |_^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#too_many_lines
+    = note: `-W clippy::too-many-lines` implied by `-W clippy::pedantic`
+    = help: to override `-W clippy::pedantic` add `#[allow(clippy::too_many_lines)]`
+
+warning: this argument is passed by value, but not consumed in the function body
+   --> src/web_server.rs:623:13
+    |
+623 |     config: Arc<Mutex<Config>>,
+    |             ^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#needless_pass_by_value
+help: consider taking a reference instead
+    |
+623 |     config: &Arc<Mutex<Config>>,
+    |             +
+
+warning: this argument is passed by value, but not consumed in the function body
+   --> src/web_server.rs:625:16
+    |
+625 |     wifi_mode: Arc<Mutex<WifiMode>>,
+    |                ^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#needless_pass_by_value
+help: consider taking a reference instead
+    |
+625 |     wifi_mode: &Arc<Mutex<WifiMode>>,
+    |                +
+
+warning: this argument is passed by value, but not consumed in the function body
+   --> src/web_server.rs:626:11
+    |
+626 |     wifi: Arc<Mutex<BlockingWifi<EspWifi<'static>>>>,
+    |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#needless_pass_by_value
+help: consider taking a reference instead
+    |
+626 |     wifi: &Arc<Mutex<BlockingWifi<EspWifi<'static>>>>,
+    |           +
+
+warning: this argument is passed by value, but not consumed in the function body
+   --> src/web_server.rs:627:13
+    |
+627 |     sse_tx: SseSender,
+    |             ^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#needless_pass_by_value
+help: consider taking a reference instead
+    |
+627 |     sse_tx: &SseSender,
+    |             +
+
+warning: variables can be used directly in the `format!` string
+   --> src/web_server.rs:671:20
+    |
+671 |         let json = format!(r#"{{"mode":"{}"}}"#, mode_str);
+    |                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#uninlined_format_args
+help: change this to
+    |
+671 -         let json = format!(r#"{{"mode":"{}"}}"#, mode_str);
+671 +         let json = format!(r#"{{"mode":"{mode_str}"}}"#);
+    |
+
+warning: adding items after statements is confusing, since items exist from the start of the scope
+   --> src/web_server.rs:715:9
+    |
+715 | /         struct IpConfigRequest {
+716 | |             use_dhcp: bool,
+717 | |             ip: Option<String>,
+718 | |             gateway: Option<String>,
+719 | |             subnet: Option<String>,
+720 | |             dns: Option<String>,
+721 | |         }
+    | |_________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#items_after_statements
+    = note: `-W clippy::items-after-statements` implied by `-W clippy::pedantic`
+    = help: to override `-W clippy::pedantic` add `#[allow(clippy::items_after_statements)]`
+
+warning: variables can be used directly in the `format!` string
+   --> src/web_server.rs:745:17
+    |
+745 |                 error!("Failed to save config: {:?}", e);
+    |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#uninlined_format_args
+help: change this to
+    |
+745 -                 error!("Failed to save config: {:?}", e);
+745 +                 error!("Failed to save config: {e:?}");
+    |
+
+warning: adding items after statements is confusing, since items exist from the start of the scope
+   --> src/web_server.rs:773:9
+    |
+773 | /         struct Network {
+774 | |             ssid: String,
+775 | |             rssi: i8,
+776 | |         }
+    | |_________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#items_after_statements
+
+warning: variables can be used directly in the `format!` string
+   --> src/web_server.rs:787:17
+    |
+787 |                 error!("WiFi scan failed: {:?}", e);
+    |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#uninlined_format_args
+help: change this to
+    |
+787 -                 error!("WiFi scan failed: {:?}", e);
+787 +                 error!("WiFi scan failed: {e:?}");
+    |
+
+warning: adding items after statements is confusing, since items exist from the start of the scope
+   --> src/web_server.rs:805:9
+    |
+805 | /         struct NetworkStatus {
+806 | |             ip: Option<String>,
+807 | |             gateway: Option<String>,
+808 | |             subnet: Option<String>,
+...   |
+811 | |             rssi: Option<i8>,
+812 | |         }
+    | |_________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#items_after_statements
+
+warning: variables can be used directly in the `format!` string
+   --> src/web_server.rs:826:62
+    |
+826 |             dns: ip_info.as_ref().and_then(|i| i.dns.map(|d| format!("{}", d))),
+    |                                                              ^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#uninlined_format_args
+help: change this to
+    |
+826 -             dns: ip_info.as_ref().and_then(|i| i.dns.map(|d| format!("{}", d))),
+826 +             dns: ip_info.as_ref().and_then(|i| i.dns.map(|d| format!("{d}"))),
+    |
+
+warning: adding items after statements is confusing, since items exist from the start of the scope
+   --> src/web_server.rs:865:9
+    |
+865 |         use esp_idf_svc::handle::RawHandle;
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#items_after_statements
+
+warning: item in documentation is missing backticks
+  --> src/main.rs:24:5
+   |
+24 | /// WiFi mode the device is running in
+   |     ^^^^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#doc_markdown
+   = note: `-W clippy::doc-markdown` implied by `-W clippy::pedantic`
+   = help: to override `-W clippy::pedantic` add `#[allow(clippy::doc_markdown)]`
+help: try
+   |
+24 - /// WiFi mode the device is running in
+24 + /// `WiFi` mode the device is running in
+   |
+
+warning: variables can be used directly in the `format!` string
+  --> src/main.rs:79:9
+   |
+79 |         info!("Attempting to connect to WiFi: {}", ssid);
+   |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#uninlined_format_args
+help: change this to
+   |
+79 -         info!("Attempting to connect to WiFi: {}", ssid);
+79 +         info!("Attempting to connect to WiFi: {ssid}");
+   |
+
+warning: matching over `()` is more explicit
+  --> src/main.rs:90:16
+   |
+90 |             Ok(_) => {
+   |                ^ help: use `()` instead of `_`: `()`
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#ignored_unit_patterns
+   = note: `-W clippy::ignored-unit-patterns` implied by `-W clippy::pedantic`
+   = help: to override `-W clippy::pedantic` add `#[allow(clippy::ignored_unit_patterns)]`
+
+warning: variables can be used directly in the `format!` string
+  --> src/main.rs:93:21
+   |
+93 |                     warn!("Failed to get IP: {:?}, falling back to AP mode", e);
+   |                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#uninlined_format_args
+help: change this to
+   |
+93 -                     warn!("Failed to get IP: {:?}, falling back to AP mode", e);
+93 +                     warn!("Failed to get IP: {e:?}, falling back to AP mode");
+   |
+
+warning: variables can be used directly in the `format!` string
+  --> src/main.rs:98:21
+   |
+98 |                     info!("WiFi IP Info: {:?}", ip_info);
+   |                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#uninlined_format_args
+help: change this to
+   |
+98 -                     info!("WiFi IP Info: {:?}", ip_info);
+98 +                     info!("WiFi IP Info: {ip_info:?}");
+   |
+
+warning: variables can be used directly in the `format!` string
+   --> src/main.rs:103:17
+    |
+103 |                 warn!("WiFi connection failed: {:?}, starting AP mode", e);
+    |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#uninlined_format_args
+help: change this to
+    |
+103 -                 warn!("WiFi connection failed: {:?}, starting AP mode", e);
+103 +                 warn!("WiFi connection failed: {e:?}, starting AP mode");
+    |
+
+warning: variables can be used directly in the `format!` string
+   --> src/main.rs:130:13
+    |
+130 |             error!("Web server error: {:?}", e);
+    |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#uninlined_format_args
+help: change this to
+    |
+130 -             error!("Web server error: {:?}", e);
+130 +             error!("Web server error: {e:?}");
+    |
+
+warning: variables can be used directly in the `format!` string
+   --> src/main.rs:143:17
+    |
+143 |                 error!("OBD2 proxy error: {:?}", e);
+    |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#uninlined_format_args
+help: change this to
+    |
+143 -                 error!("OBD2 proxy error: {:?}", e);
+143 +                 error!("OBD2 proxy error: {e:?}");
+    |
+
+warning: this argument is passed by value, but not consumed in the function body
+   --> src/main.rs:158:74
+    |
+158 | fn start_ap_mode(wifi: &mut BlockingWifi<EspWifi<'static>>, ap_password: Option<String>) -> Result<WifiMode> {
+    |                                                                          ^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#needless_pass_by_value
+help: consider taking a reference instead
+    |
+158 | fn start_ap_mode(wifi: &mut BlockingWifi<EspWifi<'static>>, ap_password: Option<&String>) -> Result<WifiMode> {
+    |                                                                                 +
+
+warning: variables can be used directly in the `format!` string
+   --> src/main.rs:166:13
+    |
+166 |             format!("password: {}", pw),
+    |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#uninlined_format_args
+help: change this to
+    |
+166 -             format!("password: {}", pw),
+166 +             format!("password: {pw}"),
+    |
+
+warning: variables can be used directly in the `format!` string
+   --> src/main.rs:172:5
+    |
+172 |     info!("Starting Access Point: {} ({})", ssid, password_display);
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#uninlined_format_args
+help: change this to
+    |
+172 -     info!("Starting Access Point: {} ({})", ssid, password_display);
+172 +     info!("Starting Access Point: {ssid} ({password_display})");
+    |
+
+warning: `tachtalk` (bin "tachtalk") generated 61 warnings (run `cargo clippy --fix --bin "tachtalk"` to apply 37 suggestions)
+    Finished `dev` profile [optimized + debuginfo] target(s) in 3.34s
