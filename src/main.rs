@@ -7,7 +7,7 @@ use esp_idf_svc::wifi::{
     AccessPointConfiguration, AuthMethod, BlockingWifi, ClientConfiguration, Configuration,
     EspWifi,
 };
-use log::*;
+use log::{info, warn, error};
 use std::sync::{Arc, Mutex};
 
 mod config;
@@ -21,7 +21,7 @@ use obd2::Obd2Proxy;
 
 const AP_SSID_PREFIX: &str = "TachTalk-";
 
-/// WiFi mode the device is running in
+/// `WiFi` mode the device is running in
 #[derive(Clone, Copy, PartialEq)]
 pub enum WifiMode {
     /// Connected to a configured network as a client
@@ -76,7 +76,7 @@ fn main() -> Result<()> {
             (cfg.wifi.ssid.clone(), cfg.wifi.password.clone().unwrap_or_default())
         };
 
-        info!("Attempting to connect to WiFi: {}", ssid);
+        info!("Attempting to connect to WiFi: {ssid}");
 
         wifi.set_configuration(&Configuration::Client(ClientConfiguration {
             ssid: ssid.as_str().try_into().unwrap_or_default(),
@@ -87,20 +87,20 @@ fn main() -> Result<()> {
         wifi.start()?;
 
         match wifi.connect() {
-            Ok(_) => {
+            Ok(()) => {
                 info!("WiFi connected");
                 if let Err(e) = wifi.wait_netif_up() {
-                    warn!("Failed to get IP: {:?}, falling back to AP mode", e);
+                    warn!("Failed to get IP: {e:?}, falling back to AP mode");
                     let ap_password = config.lock().unwrap().ap_password.clone();
                     start_ap_mode(&mut wifi, ap_password)?
                 } else {
                     let ip_info = wifi.wifi().sta_netif().get_ip_info()?;
-                    info!("WiFi IP Info: {:?}", ip_info);
+                    info!("WiFi IP Info: {ip_info:?}");
                     WifiMode::Client
                 }
             }
             Err(e) => {
-                warn!("WiFi connection failed: {:?}, starting AP mode", e);
+                warn!("WiFi connection failed: {e:?}, starting AP mode");
                 let ap_password = config.lock().unwrap().ap_password.clone();
                 start_ap_mode(&mut wifi, ap_password)?
             }
@@ -127,7 +127,7 @@ fn main() -> Result<()> {
 
     std::thread::spawn(move || {
         if let Err(e) = web_server::start_server(config_clone, led_clone, mode_clone, wifi_clone, sse_tx_clone) {
-            error!("Web server error: {:?}", e);
+            error!("Web server error: {e:?}");
         }
     });
 
@@ -140,7 +140,7 @@ fn main() -> Result<()> {
 
         std::thread::spawn(move || {
             if let Err(e) = proxy.run() {
-                error!("OBD2 proxy error: {:?}", e);
+                error!("OBD2 proxy error: {e:?}");
             }
         });
     } else {
@@ -163,13 +163,13 @@ fn start_ap_mode(wifi: &mut BlockingWifi<EspWifi<'static>>, ap_password: Option<
     let (auth_method, password_display, password) = match ap_password {
         Some(ref pw) if !pw.is_empty() => (
             AuthMethod::WPA2Personal,
-            format!("password: {}", pw),
+            format!("password: {pw}"),
             pw.as_str(),
         ),
         _ => (AuthMethod::None, "open network".to_string(), ""),
     };
     
-    info!("Starting Access Point: {} ({})", ssid, password_display);
+    info!("Starting Access Point: {ssid} ({password_display})");
 
     wifi.set_configuration(&Configuration::AccessPoint(AccessPointConfiguration {
         ssid: ssid.as_str().try_into().unwrap(),

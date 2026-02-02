@@ -3,7 +3,7 @@ use embedded_svc::http::Method;
 use embedded_svc::io::Write;
 use esp_idf_svc::http::server::{Configuration, EspHttpServer};
 use esp_idf_svc::wifi::{BlockingWifi, EspWifi};
-use log::*;
+use log::{info, error};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::os::unix::io::RawFd;
@@ -44,10 +44,10 @@ fn sse_manager_task(rx: Receiver<SseMessage>) {
         // Non-blocking receive to handle multiple message types
         match rx.try_recv() {
             Ok(SseMessage::NewConnection(fd, done_tx)) => {
-                info!("SSE: New connection registered (fd={})", fd);
+                info!("SSE: New connection registered (fd={fd})");
                 // Send current RPM to new client immediately
                 if let Some(rpm) = current_rpm {
-                    let msg = format!("data: {{\"rpm\":{}}}\n\n", rpm);
+                    let msg = format!("data: {{\"rpm\":{rpm}}}\n\n");
                     if write_to_fd(fd, msg.as_bytes()).is_err() {
                         // Connection already dead, signal done
                         let _ = done_tx.send(());
@@ -58,14 +58,14 @@ fn sse_manager_task(rx: Receiver<SseMessage>) {
             }
             Ok(SseMessage::RpmUpdate(rpm)) => {
                 current_rpm = Some(rpm);
-                let msg = format!("data: {{\"rpm\":{}}}\n\n", rpm);
+                let msg = format!("data: {{\"rpm\":{rpm}}}\n\n");
                 
                 // Broadcast to all connections, remove dead ones
                 connections.retain(|(fd, done_tx)| {
                     if write_to_fd(*fd, msg.as_bytes()).is_ok() {
                         true
                     } else {
-                        info!("SSE: Connection closed (fd={})", fd);
+                        info!("SSE: Connection closed (fd={fd})");
                         let _ = done_tx.send(());
                         false
                     }
@@ -86,7 +86,7 @@ fn sse_manager_task(rx: Receiver<SseMessage>) {
 /// Write data to a raw file descriptor
 fn write_to_fd(fd: RawFd, data: &[u8]) -> std::io::Result<()> {
     let written = unsafe {
-        esp_idf_svc::sys::write(fd, data.as_ptr() as *const _, data.len())
+        esp_idf_svc::sys::write(fd, data.as_ptr().cast(), data.len())
     };
     if written < 0 {
         Err(std::io::Error::last_os_error())
@@ -668,7 +668,7 @@ pub fn start_server(
             WifiMode::AccessPoint => "ap",
             WifiMode::Client => "client",
         };
-        let json = format!(r#"{{"mode":"{}"}}"#, mode_str);
+        let json = format!(r#"{{"mode":"{mode_str}"}}"#);
         
         let mut response = req.into_ok_response()?;
         response.write_all(json.as_bytes())?;
@@ -742,7 +742,7 @@ pub fn start_server(
             }
             
             if let Err(e) = cfg.save() {
-                error!("Failed to save config: {:?}", e);
+                error!("Failed to save config: {e:?}");
                 req.into_status_response(500)?;
                 return Ok(());
             }
@@ -784,7 +784,7 @@ pub fn start_server(
                 })
                 .collect(),
             Err(e) => {
-                error!("WiFi scan failed: {:?}", e);
+                error!("WiFi scan failed: {e:?}");
                 Vec::new()
             }
         };
@@ -823,7 +823,7 @@ pub fn start_server(
             ip: ip_info.as_ref().map(|i| format!("{}", i.ip)),
             gateway: ip_info.as_ref().map(|i| format!("{}", i.subnet.gateway)),
             subnet: ip_info.as_ref().map(|i| format!("{}", i.subnet.mask)),
-            dns: ip_info.as_ref().and_then(|i| i.dns.map(|d| format!("{}", d))),
+            dns: ip_info.as_ref().and_then(|i| i.dns.map(|d| format!("{d}"))),
             mac,
             rssi: None, // TODO: Get RSSI from wifi driver
         };

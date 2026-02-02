@@ -1,5 +1,5 @@
 use anyhow::{Result, Context};
-use log::*;
+use log::{info, error};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
@@ -47,8 +47,8 @@ impl Obd2Proxy {
         });
 
         // Start proxy server
-        let listener = TcpListener::bind(format!("0.0.0.0:{}", OBD2_PORT))?;
-        info!("OBD2 proxy listening on port {}", OBD2_PORT);
+        let listener = TcpListener::bind(format!("0.0.0.0:{OBD2_PORT}"))?;
+        info!("OBD2 proxy listening on port {OBD2_PORT}");
 
         for stream in listener.incoming() {
             match stream {
@@ -60,12 +60,12 @@ impl Obd2Proxy {
                     
                     std::thread::spawn(move || {
                         if let Err(e) = Self::handle_client(stream, config, led_controller, last_request, sse_tx) {
-                            error!("Error handling client: {:?}", e);
+                            error!("Error handling client: {e:?}");
                         }
                     });
                 }
                 Err(e) => {
-                    error!("Error accepting connection: {:?}", e);
+                    error!("Error accepting connection: {e:?}");
                 }
             }
         }
@@ -85,7 +85,7 @@ impl Obd2Proxy {
             // Check if we need to poll (no recent requests)
             let should_poll = {
                 let last_time = last_request_time.lock().unwrap();
-                last_time.elapsed().as_millis() > IDLE_POLL_INTERVAL_MS as u128
+                last_time.elapsed().as_millis() > u128::from(IDLE_POLL_INTERVAL_MS)
             };
 
             if should_poll {
@@ -114,7 +114,7 @@ impl Obd2Proxy {
         info!("Client connected: {:?}", client_stream.peer_addr()?);
 
         // Connect to OBD2 dongle
-        let mut dongle_stream = TcpStream::connect(format!("{}:{}", DONGLE_IP, DONGLE_PORT))
+        let mut dongle_stream = TcpStream::connect(format!("{DONGLE_IP}:{DONGLE_PORT}"))
             .context("Failed to connect to OBD2 dongle")?;
         
         dongle_stream.set_read_timeout(Some(Duration::from_secs(5)))?;
@@ -137,7 +137,7 @@ impl Obd2Proxy {
                     
                     // Check if this is an RPM request and extract it
                     if let Some(rpm) = Self::extract_rpm_from_request(request) {
-                        info!("Extracted RPM from request: {}", rpm);
+                        info!("Extracted RPM from request: {rpm}");
                         // Send to SSE clients
                         let _ = sse_tx.send(SseMessage::RpmUpdate(rpm));
                         
@@ -158,7 +158,7 @@ impl Obd2Proxy {
                             
                             // Extract RPM from response if present
                             if let Some(rpm) = Self::extract_rpm_from_response(response) {
-                                info!("Extracted RPM from response: {}", rpm);
+                                info!("Extracted RPM from response: {rpm}");
                                 // Send to SSE clients
                                 let _ = sse_tx.send(SseMessage::RpmUpdate(rpm));
                                 
@@ -173,13 +173,13 @@ impl Obd2Proxy {
                             client_stream.write_all(response)?;
                         }
                         Err(e) => {
-                            error!("Error reading from dongle: {:?}", e);
+                            error!("Error reading from dongle: {e:?}");
                             break;
                         }
                     }
                 }
                 Err(e) => {
-                    error!("Error reading from client: {:?}", e);
+                    error!("Error reading from client: {e:?}");
                     break;
                 }
             }
@@ -189,7 +189,7 @@ impl Obd2Proxy {
     }
 
     fn request_rpm() -> Result<u32> {
-        let mut stream = TcpStream::connect(format!("{}:{}", DONGLE_IP, DONGLE_PORT))?;
+        let mut stream = TcpStream::connect(format!("{DONGLE_IP}:{DONGLE_PORT}"))?;
         stream.set_read_timeout(Some(Duration::from_secs(1)))?;
         
         // OBD2 command for RPM: "010C\r"
