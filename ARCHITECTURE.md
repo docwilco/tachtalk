@@ -153,4 +153,4 @@ cargo run --release
 - [ ] Alternative display modes (progress bar, etc.)
 - [ ] Support for additional OBD2 parameters
 - [ ] Bluetooth support for configuration
-- [ ] mDNS/Bonjour for easy discovery
+- [x] mDNS/Bonjour for easy discovery (tachtalk.local in client mode)

@@ -237,7 +237,7 @@ To build this project, you need:
 While not in the current scope, potential additions:
 
 - [ ] NVS storage for persistent configuration
-- [ ] mDNS/Bonjour for easy device discovery
+- [x] mDNS/Bonjour for easy device discovery (tachtalk.local in client mode)
 - [ ] Bluetooth configuration option
 - [ ] Multiple LED zones/patterns
 - [ ] Additional OBD2 parameters (coolant temp, speed, etc.)
