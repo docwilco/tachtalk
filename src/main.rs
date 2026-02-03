@@ -157,6 +157,13 @@ fn start_wifi_sta_connection(
     // Determine AP password for mixed mode config
     let ap_pw = ap_password.as_deref().unwrap_or("");
 
+    // Determine STA auth method based on password
+    let sta_auth_method = if sta_password.is_empty() {
+        AuthMethod::None
+    } else {
+        AuthMethod::WPA2Personal
+    };
+
     // Switch to Mixed mode so we can try STA while keeping AP running
     {
         let mut wifi = wifi.lock().unwrap();
@@ -164,6 +171,7 @@ fn start_wifi_sta_connection(
             ClientConfiguration {
                 ssid: sta_ssid.as_str().try_into().unwrap_or_default(),
                 password: sta_password.as_str().try_into().unwrap_or_default(),
+                auth_method: sta_auth_method,
                 ..Default::default()
             },
             AccessPointConfiguration {
@@ -367,6 +375,11 @@ fn wifi_connection_manager(
     ap_auth_method: AuthMethod,
 ) {
     let ap_pw = ap_password.unwrap_or_default();
+    let sta_auth_method = if sta_password.is_empty() {
+        AuthMethod::None
+    } else {
+        AuthMethod::WPA2Personal
+    };
 
     loop {
         let current_mode = *wifi_mode.lock().unwrap();
@@ -406,6 +419,7 @@ fn wifi_connection_manager(
                     if let Err(e) = wifi.set_configuration(&Configuration::Client(ClientConfiguration {
                         ssid: sta_ssid.try_into().unwrap_or_default(),
                         password: sta_password.try_into().unwrap_or_default(),
+                        auth_method: sta_auth_method,
                         ..Default::default()
                     })) {
                         warn!("Failed to switch to STA-only mode: {e:?}");
@@ -437,6 +451,7 @@ fn wifi_connection_manager(
                         ClientConfiguration {
                             ssid: sta_ssid.try_into().unwrap_or_default(),
                             password: sta_password.try_into().unwrap_or_default(),
+                            auth_method: sta_auth_method,
                             ..Default::default()
                         },
                         AccessPointConfiguration {
