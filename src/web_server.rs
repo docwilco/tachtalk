@@ -4,6 +4,7 @@ use embedded_svc::io::Write;
 use esp_idf_svc::http::server::{Configuration, EspHttpServer};
 use esp_idf_svc::wifi::{BlockingWifi, EspWifi};
 use log::{debug, error, info, warn};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use esp_idf_svc::sys::{esp_get_free_heap_size, esp_get_minimum_free_heap_size};
@@ -12,6 +13,50 @@ use crate::config::Config;
 use crate::obd2::AtCommandLog;
 use crate::sse_server::SSE_PORT;
 use crate::WifiMode;
+
+/// IP configuration for WiFi request
+#[derive(serde::Deserialize)]
+struct IpConfigRequest {
+    use_dhcp: bool,
+    ip: Option<String>,
+    gateway: Option<String>,
+    subnet: Option<String>,
+    dns: Option<String>,
+}
+
+/// WiFi configuration request from web UI
+#[derive(serde::Deserialize)]
+struct WifiRequest {
+    ssid: String,
+    password: Option<String>,
+    ip: Option<IpConfigRequest>,
+}
+
+/// WiFi network scan result
+#[derive(serde::Serialize)]
+struct Network {
+    ssid: String,
+    rssi: i8,
+}
+
+/// Network status response
+#[derive(serde::Serialize)]
+struct NetworkStatus {
+    ip: Option<String>,
+    gateway: Option<String>,
+    subnet: Option<String>,
+    dns: Option<String>,
+    mac: String,
+    rssi: Option<i8>,
+}
+
+/// Debug info response
+#[derive(serde::Serialize)]
+struct DebugInfo {
+    at_commands: Vec<String>,
+    free_heap: u32,
+    min_free_heap: u32,
+}
 
 // HTML split into two parts to inject SSE_PORT without runtime allocation
 const HTML_INDEX_START: &str = r#"
@@ -197,6 +242,41 @@ const HTML_INDEX_END: &str = r#";</script>
             color: #8f8;
             word-break: break-all;
         }
+        .password-wrapper {
+            display: inline-flex;
+            align-items: center;
+            gap: 5px;
+        }
+        .toggle-password {
+            background-color: #444;
+            color: #fff;
+            padding: 5px 10px;
+            border: 1px solid #444;
+            border-radius: 3px;
+            cursor: pointer;
+            font-size: 0.9em;
+        }
+        .toggle-password:hover {
+            background-color: #555;
+        }
+        .spinner {
+            display: inline-block;
+            width: 14px;
+            height: 14px;
+            border: 2px solid rgba(0, 0, 0, 0.3);
+            border-top-color: #000;
+            border-radius: 50%;
+            animation: spin 0.8s linear infinite;
+            margin-right: 6px;
+            vertical-align: middle;
+        }
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+        button:disabled {
+            opacity: 0.7;
+            cursor: not-allowed;
+        }
     </style>
 </head>
 <body>
@@ -241,7 +321,10 @@ const HTML_INDEX_END: &str = r#";</script>
             </div>
             <div class="form-group">
                 <label>Password:</label>
-                <input type="password" id="wifiPassword" placeholder="WiFi password">
+                <span class="password-wrapper">
+                    <input type="password" id="wifiPassword" placeholder="WiFi password">
+                    <button type="button" class="toggle-password" onclick="togglePasswordVisibility()">Show</button>
+                </span>
             </div>
             <div class="form-group">
                 <label>IP Mode:</label>
@@ -268,8 +351,8 @@ const HTML_INDEX_END: &str = r#";</script>
                     <input type="text" id="staticDns" placeholder="8.8.8.8">
                 </div>
             </div>
-            <button onclick="saveWifi()">Save & Connect</button>
-            <button onclick="scanWifi()">Scan Networks</button>
+            <button id="btnSaveWifi" onclick="saveWifi()">Save & Connect</button>
+            <button id="btnScanWifi" onclick="scanWifi()">Scan Networks</button>
             <div id="wifiNetworks" style="margin-top: 10px;"></div>
         </div>
         
@@ -289,11 +372,24 @@ const HTML_INDEX_END: &str = r#";</script>
             <small style="color: #888;">(requires restart)</small>
         </div>
         
-        <button onclick="saveConfig()">Save Configuration</button>
-        <button onclick="loadConfig()">Reload</button>
+        <button id="btnSaveConfig" onclick="saveConfig()">Save Configuration</button>
+        <button id="btnReload" onclick="loadConfig()">Reload</button>
     </div>
 
     <script>
+        function setButtonLoading(btnId, loading, loadingText) {
+            const btn = document.getElementById(btnId);
+            if (!btn) return;
+            if (loading) {
+                btn.dataset.originalText = btn.textContent;
+                btn.innerHTML = '<span class="spinner"></span>' + (loadingText || btn.textContent);
+                btn.disabled = true;
+            } else {
+                btn.innerHTML = btn.dataset.originalText || btn.textContent.replace(/<[^>]*>/g, '');
+                btn.disabled = false;
+            }
+        }
+
         let config = {
             wifi: { ssid: '', password: '' },
             ip: { use_dhcp: true, ip: null, gateway: null, subnet: null, dns: null },
@@ -314,6 +410,18 @@ const HTML_INDEX_END: &str = r#";</script>
             const mode = document.getElementById('ipMode').value;
             const fields = document.getElementById('staticIpFields');
             fields.className = mode === 'static' ? '' : 'hidden';
+        }
+
+        function togglePasswordVisibility() {
+            const input = document.getElementById('wifiPassword');
+            const button = event.target;
+            if (input.type === 'password') {
+                input.type = 'text';
+                button.textContent = 'Hide';
+            } else {
+                input.type = 'password';
+                button.textContent = 'Show';
+            }
         }
 
         function rgbToHex(color) {
@@ -421,6 +529,7 @@ const HTML_INDEX_END: &str = r#";</script>
             config.total_leds = parseInt(document.getElementById('totalLeds').value);
             config.led_gpio = parseInt(document.getElementById('ledGpio').value);
             
+            setButtonLoading('btnSaveConfig', true, 'Saving...');
             try {
                 const response = await fetch('/api/config', {
                     method: 'POST',
@@ -442,6 +551,8 @@ const HTML_INDEX_END: &str = r#";</script>
                 }
             } catch (error) {
                 showStatus('Error: ' + error.message, true);
+            } finally {
+                setButtonLoading('btnSaveConfig', false);
             }
         }
 
@@ -466,6 +577,7 @@ const HTML_INDEX_END: &str = r#";</script>
             config.wifi = { ssid, password: password || null };
             config.ip = ipConfig;
             
+            setButtonLoading('btnSaveWifi', true, 'Connecting...');
             try {
                 const response = await fetch('/api/wifi', {
                     method: 'POST',
@@ -485,11 +597,13 @@ const HTML_INDEX_END: &str = r#";</script>
                 }
             } catch (error) {
                 showStatus('Error: ' + error.message, true);
+            } finally {
+                setButtonLoading('btnSaveWifi', false);
             }
         }
 
         async function scanWifi() {
-            showStatus('Scanning for networks...', false);
+            setButtonLoading('btnScanWifi', true, 'Scanning...');
             try {
                 const response = await fetch('/api/wifi/scan');
                 if (response.ok) {
@@ -501,7 +615,7 @@ const HTML_INDEX_END: &str = r#";</script>
                         container.innerHTML = '<p>Available networks (click to select):</p>' +
                             networks.map(n => 
                                 '<button onclick="document.getElementById(\'wifiSsid\').value=\'' + n.ssid + '\'" style="margin: 2px; padding: 5px 10px;">' +
-                                    n.ssid + ' (' + n.rssi + ' dBm)' +
+                                    n.ssid +
                                 '</button>'
                             ).join('');
                     }
@@ -510,10 +624,13 @@ const HTML_INDEX_END: &str = r#";</script>
                 }
             } catch (error) {
                 showStatus('Error: ' + error.message, true);
+            } finally {
+                setButtonLoading('btnScanWifi', false);
             }
         }
 
         async function loadConfig() {
+            setButtonLoading('btnReload', true, 'Loading...');
             try {
                 const response = await fetch('/api/config');
                 if (response.ok) {
@@ -539,6 +656,8 @@ const HTML_INDEX_END: &str = r#";</script>
                 }
             } catch (error) {
                 showStatus('Error: ' + error.message, true);
+            } finally {
+                setButtonLoading('btnReload', false);
             }
         }
 
@@ -773,22 +892,6 @@ pub fn start_server(
         let mut buf = vec![0u8; 1024];
         let bytes_read = req.read(&mut buf)?;
         
-        #[derive(serde::Deserialize)]
-        struct IpConfigRequest {
-            use_dhcp: bool,
-            ip: Option<String>,
-            gateway: Option<String>,
-            subnet: Option<String>,
-            dns: Option<String>,
-        }
-        
-        #[derive(serde::Deserialize)]
-        struct WifiRequest {
-            ssid: String,
-            password: Option<String>,
-            ip: Option<IpConfigRequest>,
-        }
-        
         if let Ok(wifi_req) = serde_json::from_slice::<WifiRequest>(&buf[..bytes_read]) {
             info!("WiFi config update: ssid={:?}, dhcp={:?}", 
                   wifi_req.ssid, wifi_req.ip.as_ref().map(|i| i.use_dhcp));
@@ -834,22 +937,28 @@ pub fn start_server(
         info!("HTTP: GET /api/wifi/scan");
         let mut wifi = wifi_clone.lock().unwrap();
         
-        #[derive(serde::Serialize)]
-        struct Network {
-            ssid: String,
-            rssi: i8,
-        }
-        
         let networks: Vec<Network> = match wifi.scan() {
             Ok(aps) => {
                 debug!("WiFi scan found {} networks", aps.len());
-                aps
+                // Deduplicate by SSID, keeping strongest signal
+                let mut best_by_ssid: HashMap<String, i8> = HashMap::new();
+                for ap in &aps {
+                    let ssid = ap.ssid.to_string();
+                    if ssid.is_empty() {
+                        continue;
+                    }
+                    best_by_ssid
+                        .entry(ssid)
+                        .and_modify(|rssi| *rssi = (*rssi).max(ap.signal_strength))
+                        .or_insert(ap.signal_strength);
+                }
+                // Convert to vec and sort by signal strength (strongest first)
+                let mut networks: Vec<Network> = best_by_ssid
                     .into_iter()
-                    .map(|ap| Network {
-                        ssid: ap.ssid.to_string(),
-                        rssi: ap.signal_strength,
-                    })
-                    .collect()
+                    .map(|(ssid, rssi)| Network { ssid, rssi })
+                    .collect();
+                networks.sort_by(|a, b| b.rssi.cmp(&a.rssi));
+                networks
             }
             Err(e) => {
                 error!("WiFi scan failed: {e:?}");
@@ -869,16 +978,6 @@ pub fn start_server(
     server.fn_handler("/api/network", Method::Get, move |req| -> Result<(), esp_idf_svc::io::EspIOError> {
         info!("HTTP: GET /api/network");
         let wifi = wifi_clone.lock().unwrap();
-        
-        #[derive(serde::Serialize)]
-        struct NetworkStatus {
-            ip: Option<String>,
-            gateway: Option<String>,
-            subnet: Option<String>,
-            dns: Option<String>,
-            mac: String,
-            rssi: Option<i8>,
-        }
         
         let sta_netif = wifi.wifi().sta_netif();
         let ip_info = sta_netif.get_ip_info().ok();
@@ -930,13 +1029,6 @@ pub fn start_server(
         // SAFETY: These are simple C functions that return u32 values
         let free_heap = unsafe { esp_get_free_heap_size() };
         let min_free_heap = unsafe { esp_get_minimum_free_heap_size() };
-        
-        #[derive(serde::Serialize)]
-        struct DebugInfo {
-            at_commands: Vec<String>,
-            free_heap: u32,
-            min_free_heap: u32,
-        }
         
         let info = DebugInfo {
             at_commands,

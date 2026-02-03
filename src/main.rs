@@ -50,7 +50,7 @@ fn subnet_mask_to_cidr(mask_str: &str) -> Result<u8> {
             "Invalid subnet mask '{mask_str}': not a valid mask (expected contiguous 1s)"
         ));
     }
-    Ok(leading_ones as u8)
+    Ok(u8::try_from(leading_ones).unwrap())
 }
 
 /// `WiFi` mode the device is running in
@@ -60,6 +60,140 @@ pub enum WifiMode {
     AccessPoint,
     /// Connected to a configured network as a client (AP disabled)
     Client,
+}
+
+/// Create STA network interface with static IP or DHCP based on config
+fn create_sta_netif(config: &Config) -> Result<EspNetif> {
+    if config.ip.use_dhcp {
+        info!("STA netif: DHCP mode");
+        Ok(EspNetif::new(NetifStack::Sta)?)
+    } else {
+        // Parse static IP configuration
+        let ip_str = config.ip.effective_ip().unwrap();
+        let gateway_str = config.ip.effective_gateway().unwrap();
+        let subnet_str = config.ip.effective_subnet().unwrap();
+
+        let ip: Ipv4Addr = ip_str.parse().map_err(|e| {
+            anyhow::anyhow!("Invalid static IP '{ip_str}': {e}")
+        })?;
+        let gateway: Ipv4Addr = gateway_str.parse().map_err(|e| {
+            anyhow::anyhow!("Invalid gateway '{gateway_str}': {e}")
+        })?;
+        let mask = subnet_mask_to_cidr(subnet_str)?;
+
+        // Parse optional DNS
+        let dns = config.ip.dns.as_ref().and_then(|s| s.parse().ok());
+
+        info!("STA netif: Static IP {ip} gateway {gateway}/{mask} dns {dns:?}");
+
+        let mut sta_config = NetifConfiguration::wifi_default_client();
+        sta_config.ip_configuration = Some(IpConfiguration::Client(
+            IpClientConfiguration::Fixed(IpClientSettings {
+                ip,
+                subnet: Subnet {
+                    gateway,
+                    mask: Mask(mask),
+                },
+                dns,
+                secondary_dns: None,
+            }),
+        ));
+        Ok(EspNetif::new_with_conf(&sta_config)?)
+    }
+}
+
+/// Create AP network interface with captive portal DNS configuration
+fn create_ap_netif() -> Result<EspNetif> {
+    // Custom router config that uses our IP as DNS
+    // (default uses 8.8.8.8 which bypasses our captive portal DNS)
+    let ap_router_config = ipv4::RouterConfiguration {
+        subnet: ipv4::Subnet {
+            gateway: Ipv4Addr::new(192, 168, 71, 1),
+            mask: ipv4::Mask(24),
+        },
+        dhcp_enabled: true,
+        dns: Some(Ipv4Addr::new(192, 168, 71, 1)),           // Point to our DNS server
+        secondary_dns: Some(Ipv4Addr::new(192, 168, 71, 1)), // Also use our DNS
+    };
+
+    let mut ap_netif_config = NetifConfiguration::wifi_default_router();
+    ap_netif_config.ip_configuration = Some(ipv4::Configuration::Router(ap_router_config));
+    Ok(EspNetif::new_with_conf(&ap_netif_config)?)
+}
+
+/// Initialize mDNS for local discovery (tachtalk.local)
+fn setup_mdns() -> Option<EspMdns> {
+    match EspMdns::take() {
+        Ok(mut m) => {
+            let _ = m.set_hostname("tachtalk");
+            let _ = m.set_instance_name("TachTalk Tachometer");
+            let _ = m.add_service(None, "_http", "_tcp", 80, &[]);
+            info!("mDNS started: tachtalk.local");
+            Some(m)
+        }
+        Err(e) => {
+            warn!("Failed to start mDNS: {e:?}");
+            None
+        }
+    }
+}
+
+/// Start WiFi STA connection if configured, switching to Mixed mode
+fn start_wifi_sta_connection(
+    config: &Arc<Mutex<Config>>,
+    wifi: &Arc<Mutex<BlockingWifi<EspWifi<'static>>>>,
+    wifi_mode: &Arc<Mutex<WifiMode>>,
+    ap_ssid: &str,
+    ap_password: Option<String>,
+    auth_method: AuthMethod,
+) -> Result<()> {
+    let (sta_ssid, sta_password) = {
+        let cfg = config.lock().unwrap();
+        (cfg.wifi.ssid.clone(), cfg.wifi.password.clone().unwrap_or_default())
+    };
+
+    info!("WiFi configured for '{sta_ssid}' - switching to Mixed mode");
+
+    // Determine AP password for mixed mode config
+    let ap_pw = ap_password.as_deref().unwrap_or("");
+
+    // Switch to Mixed mode so we can try STA while keeping AP running
+    {
+        let mut wifi = wifi.lock().unwrap();
+        wifi.set_configuration(&Configuration::Mixed(
+            ClientConfiguration {
+                ssid: sta_ssid.as_str().try_into().unwrap_or_default(),
+                password: sta_password.as_str().try_into().unwrap_or_default(),
+                ..Default::default()
+            },
+            AccessPointConfiguration {
+                ssid: ap_ssid.try_into().unwrap(),
+                password: ap_pw.try_into().unwrap_or_default(),
+                auth_method,
+                channel: 1,
+                ..Default::default()
+            },
+        ))?;
+    }
+
+    // Spawn background task to manage WiFi connection
+    let wifi_clone = wifi.clone();
+    let wifi_mode_clone = wifi_mode.clone();
+    let ap_ssid = ap_ssid.to_string();
+
+    std::thread::spawn(move || {
+        wifi_connection_manager(
+            &wifi_clone,
+            &wifi_mode_clone,
+            &sta_ssid,
+            &sta_password,
+            &ap_ssid,
+            ap_password,
+            auth_method,
+        );
+    });
+
+    Ok(())
 }
 
 fn main() -> Result<()> {
@@ -115,61 +249,10 @@ fn main() -> Result<()> {
     let wifi_driver = WifiDriver::new(peripherals.modem, sys_loop.clone(), Some(nvs.clone()))?;
     
     // Create STA netif - static IP or DHCP based on config
-    let sta_netif = {
-        let cfg = config.lock().unwrap();
-        if cfg.ip.use_dhcp {
-            info!("STA netif: DHCP mode");
-            EspNetif::new(NetifStack::Sta)?
-        } else {
-            // Parse static IP configuration
-            let ip_str = cfg.ip.effective_ip().unwrap();
-            let gateway_str = cfg.ip.effective_gateway().unwrap();
-            let subnet_str = cfg.ip.effective_subnet().unwrap();
-            
-            let ip: Ipv4Addr = ip_str.parse().map_err(|e| {
-                anyhow::anyhow!("Invalid static IP '{ip_str}': {e}")
-            })?;
-            let gateway: Ipv4Addr = gateway_str.parse().map_err(|e| {
-                anyhow::anyhow!("Invalid gateway '{gateway_str}': {e}")
-            })?;
-            let mask = subnet_mask_to_cidr(subnet_str)?;
-            
-            // Parse optional DNS
-            let dns = cfg.ip.dns.as_ref().and_then(|s| s.parse().ok());
-            
-            info!("STA netif: Static IP {ip} gateway {gateway}/{mask} dns {dns:?}");
-            
-            let mut sta_config = NetifConfiguration::wifi_default_client();
-            sta_config.ip_configuration = Some(IpConfiguration::Client(
-                IpClientConfiguration::Fixed(IpClientSettings {
-                    ip,
-                    subnet: Subnet {
-                        gateway,
-                        mask: Mask(mask),
-                    },
-                    dns,
-                    secondary_dns: None,
-                }),
-            ));
-            EspNetif::new_with_conf(&sta_config)?
-        }
-    };
+    let sta_netif = create_sta_netif(&config.lock().unwrap())?;
     
-    // Create AP netif with custom router config that uses our IP as DNS
-    // (default uses 8.8.8.8 which bypasses our captive portal DNS)
-    let ap_router_config = ipv4::RouterConfiguration {
-        subnet: ipv4::Subnet {
-            gateway: Ipv4Addr::new(192, 168, 71, 1),
-            mask: ipv4::Mask(24),
-        },
-        dhcp_enabled: true,
-        dns: Some(Ipv4Addr::new(192, 168, 71, 1)),           // Point to our DNS server
-        secondary_dns: Some(Ipv4Addr::new(192, 168, 71, 1)), // Also use our DNS
-    };
-    
-    let mut ap_netif_config = NetifConfiguration::wifi_default_router();
-    ap_netif_config.ip_configuration = Some(ipv4::Configuration::Router(ap_router_config));
-    let ap_netif = EspNetif::new_with_conf(&ap_netif_config)?;
+    // Create AP netif with captive portal DNS
+    let ap_netif = create_ap_netif()?;
     
     let wifi = EspWifi::wrap_all(wifi_driver, sta_netif, ap_netif)?;
     let mut wifi = BlockingWifi::wrap(wifi, sys_loop)?;
@@ -228,19 +311,7 @@ fn main() -> Result<()> {
     info!("Web server started - configuration available at http://{}", ap_ip_info.ip);
 
     // Start mDNS for local discovery (tachtalk.local)
-    let _mdns = match EspMdns::take() {
-        Ok(mut m) => {
-            let _ = m.set_hostname("tachtalk");
-            let _ = m.set_instance_name("TachTalk Tachometer");
-            let _ = m.add_service(None, "_http", "_tcp", 80, &[]);
-            info!("mDNS started: tachtalk.local");
-            Some(m)
-        }
-        Err(e) => {
-            warn!("Failed to start mDNS: {e:?}");
-            None
-        }
-    };
+    let _mdns = setup_mdns();
 
     // Start OBD2 proxy and RPM/LED task
     let dongle_tx = obd2::start_dongle_task(config.clone());
@@ -270,47 +341,7 @@ fn main() -> Result<()> {
     };
 
     if wifi_configured {
-        let (sta_ssid, sta_password) = {
-            let cfg = config.lock().unwrap();
-            (cfg.wifi.ssid.clone(), cfg.wifi.password.clone().unwrap_or_default())
-        };
-
-        info!("WiFi configured for '{sta_ssid}' - switching to Mixed mode");
-
-        // Switch to Mixed mode so we can try STA while keeping AP running
-        {
-            let mut wifi = wifi.lock().unwrap();
-            wifi.set_configuration(&Configuration::Mixed(
-                ClientConfiguration {
-                    ssid: sta_ssid.as_str().try_into().unwrap_or_default(),
-                    password: sta_password.as_str().try_into().unwrap_or_default(),
-                    ..Default::default()
-                },
-                AccessPointConfiguration {
-                    ssid: ap_ssid.as_str().try_into().unwrap(),
-                    password: ap_pw.try_into().unwrap_or_default(),
-                    auth_method,
-                    channel: 1,
-                    ..Default::default()
-                },
-            ))?;
-        }
-
-        // Spawn background task to manage WiFi connection
-        let wifi_clone = wifi.clone();
-        let wifi_mode_clone = wifi_mode.clone();
-
-        std::thread::spawn(move || {
-            wifi_connection_manager(
-                &wifi_clone,
-                &wifi_mode_clone,
-                &sta_ssid,
-                &sta_password,
-                &ap_ssid,
-                ap_password,
-                auth_method,
-            );
-        });
+        start_wifi_sta_connection(&config, &wifi, &wifi_mode, &ap_ssid, ap_password, auth_method)?;
     } else {
         info!("No WiFi configured - AP mode only. Configure WiFi via web UI.");
     }

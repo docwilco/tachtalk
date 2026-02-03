@@ -58,6 +58,14 @@ struct ClientState {
     headers_enabled: bool,
 }
 
+/// Shared context for processing OBD2 commands (reduces parameter count)
+struct CommandContext<'a> {
+    config: &'a Arc<Mutex<Config>>,
+    rpm_tx: &'a RpmSender,
+    dongle_tx: &'a DongleSender,
+    at_command_log: &'a AtCommandLog,
+}
+
 impl Default for ClientState {
     fn default() -> Self {
         Self {
@@ -371,9 +379,8 @@ pub fn start_rpm_led_task(
         info!("RPM/LED task started");
 
         let mut current_rpm: Option<u32> = None;
-        let now = Instant::now();
-        let mut last_client_rpm = now - CLIENT_ACTIVITY_BACKOFF; // Allow immediate poll
-        let mut last_poll = now - Duration::from_millis(IDLE_POLL_INTERVAL_MS);
+        let mut last_client_rpm: Option<Instant> = None;
+        let mut last_poll: Option<Instant> = None;
 
         loop {
             watchdog.feed();
@@ -385,16 +392,16 @@ pub fn start_rpm_led_task(
                 let cfg = config.lock().unwrap();
                 
                 // Time until we should poll again
-                let time_since_poll = last_poll.elapsed();
                 let poll_interval = Duration::from_millis(IDLE_POLL_INTERVAL_MS);
-                let time_until_poll = poll_interval.saturating_sub(time_since_poll);
+                let time_until_poll = last_poll
+                    .map_or(Duration::ZERO, |t| poll_interval.saturating_sub(t.elapsed()));
 
                 // Time until next blink (find active blinking threshold)
                 let blink_interval = if let Some(rpm) = current_rpm {
                     cfg.thresholds
                         .iter()
                         .filter(|t| rpm >= t.rpm && t.blink)
-                        .last()
+                        .next_back()
                         .map(|t| Duration::from_millis(u64::from(t.blink_ms)))
                 } else {
                     None
@@ -410,16 +417,18 @@ pub fn start_rpm_led_task(
             // Wait for RPM from client or timeout
             match rpm_rx.recv_timeout(timeout) {
                 Ok(rpm) => {
-                    last_client_rpm = Instant::now();
+                    last_client_rpm = Some(Instant::now());
                     current_rpm = Some(rpm);
                     debug!("Received client RPM: {rpm}");
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                     // Check if we should poll the dongle
-                    if last_client_rpm.elapsed() >= CLIENT_ACTIVITY_BACKOFF
-                        && last_poll.elapsed() >= Duration::from_millis(IDLE_POLL_INTERVAL_MS)
-                    {
-                        last_poll = Instant::now();
+                    let client_idle = last_client_rpm
+                        .map_or(true, |t| t.elapsed() >= CLIENT_ACTIVITY_BACKOFF);
+                    let poll_due = last_poll
+                        .map_or(true, |t| t.elapsed() >= Duration::from_millis(IDLE_POLL_INTERVAL_MS));
+                    if client_idle && poll_due {
+                        last_poll = Some(Instant::now());
                         let timeout = Duration::from_millis(
                             config.lock().unwrap().obd2_timeout_ms
                         );
@@ -582,15 +591,18 @@ impl Obd2Proxy {
                         
                         if !command.is_empty() {
                             debug!("OBD2 client command: {command:?}");
+                            let ctx = CommandContext {
+                                config,
+                                rpm_tx,
+                                dongle_tx,
+                                at_command_log,
+                            };
                             Self::process_command(
                                 command,
                                 &cmd_buffer,
                                 &mut writer,
                                 &mut state,
-                                config,
-                                rpm_tx,
-                                dongle_tx,
-                                at_command_log,
+                                &ctx,
                             )?;
                         }
                         
@@ -618,17 +630,14 @@ impl Obd2Proxy {
         raw_command: &[u8],
         writer: &mut &TcpStream,
         state: &mut ClientState,
-        config: &Arc<Mutex<Config>>,
-        rpm_tx: &RpmSender,
-        dongle_tx: &DongleSender,
-        at_command_log: &AtCommandLog,
+        ctx: &CommandContext<'_>,
     ) -> Result<()> {
         // Check if this is an AT command (handle locally)
         if command.to_uppercase().starts_with("AT") {
             debug!("Handling AT command locally");
             
             // Record unique AT commands (store uppercase for dedup)
-            if let Ok(mut log) = at_command_log.lock() {
+            if let Ok(mut log) = ctx.at_command_log.lock() {
                 log.insert(command.to_uppercase());
             }
             
@@ -640,15 +649,15 @@ impl Obd2Proxy {
         }
 
         // Get timeout from config
-        let timeout = Duration::from_millis(config.lock().unwrap().obd2_timeout_ms);
+        let timeout = Duration::from_millis(ctx.config.lock().unwrap().obd2_timeout_ms);
 
         // Forward OBD2 command to dongle task
-        match send_command(dongle_tx, raw_command, timeout) {
+        match send_command(ctx.dongle_tx, raw_command, timeout) {
             Ok(response) => {
                 // Extract RPM if this was an RPM request - send to RPM/LED task
                 if let Some(rpm) = Self::extract_rpm_from_response(&response) {
                     debug!("Client RPM request: {rpm}");
-                    let _ = rpm_tx.send(rpm);
+                    let _ = ctx.rpm_tx.send(rpm);
                 }
 
                 // Format and send dongle response (echo already sent character-by-character)
