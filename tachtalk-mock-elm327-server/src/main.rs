@@ -12,6 +12,7 @@ use tachtalk_elm327_lib::ClientState;
 
 fn main() {
     let quiet = env::args().any(|arg| arg == "-q" || arg == "--quiet");
+    let start_time = Instant::now();
 
     println!("Mock ELM327 starting on 0.0.0.0:35000...");
     let listener = TcpListener::bind("0.0.0.0:35000").expect("Failed to bind");
@@ -21,17 +22,16 @@ fn main() {
         match stream {
             Ok(stream) => {
                 println!("Client connected: {:?}", stream.peer_addr());
-                std::thread::spawn(move || handle_client(stream, quiet));
+                std::thread::spawn(move || handle_client(stream, quiet, start_time));
             }
             Err(e) => eprintln!("Connection error: {e}"),
         }
     }
 }
 
-fn handle_client(mut stream: TcpStream, quiet: bool) {
+fn handle_client(mut stream: TcpStream, quiet: bool, start_time: Instant) {
     let mut buffer = Vec::new();
     let mut byte = [0u8; 1];
-    let start_time = Instant::now();
     let mut state = ClientState::new();
 
     loop {
@@ -84,21 +84,50 @@ fn handle_client(mut stream: TcpStream, quiet: bool) {
 fn get_rpm_value(start_time: &Instant) -> u32 {
     const MIN_RPM: f64 = 800.0;
     const MAX_RPM: f64 = 3500.0;
+    const BLIP_RPM: f64 = 2500.0;
     const RAMP_TIME: f64 = 4.0;
     const HOLD_TIME: f64 = 3.0;
-    const CYCLE_TIME: f64 = 2.0 * (RAMP_TIME + HOLD_TIME);
+    const BLIP_TIME: f64 = 0.4; // Time for each half of a blip (up or down)
+    // Cycle: ramp up (4s) + hold max (3s) + ramp down (4s) + blip1 (0.8s) + blip2 (0.8s) + hold min (1.4s)
+    const CYCLE_TIME: f64 = 2.0 * RAMP_TIME + HOLD_TIME + 4.0 * BLIP_TIME + 1.4;
 
     let elapsed = start_time.elapsed().as_secs_f64();
     let phase = elapsed % CYCLE_TIME;
 
+    let ramp_down_end = 2.0 * RAMP_TIME + HOLD_TIME; // 11s
+    let blip1_up_end = ramp_down_end + BLIP_TIME;     // 11.4s
+    let blip1_down_end = blip1_up_end + BLIP_TIME;    // 11.8s
+    let blip2_up_end = blip1_down_end + BLIP_TIME;    // 12.2s
+    let blip2_down_end = blip2_up_end + BLIP_TIME;    // 12.6s
+
     let rpm = if phase < RAMP_TIME {
+        // Slow ramp up
         MIN_RPM + (MAX_RPM - MIN_RPM) * (phase / RAMP_TIME)
     } else if phase < RAMP_TIME + HOLD_TIME {
+        // Hold at max
         MAX_RPM
-    } else if phase < 2.0 * RAMP_TIME + HOLD_TIME {
+    } else if phase < ramp_down_end {
+        // Slow ramp down
         let ramp_phase = phase - RAMP_TIME - HOLD_TIME;
         MAX_RPM - (MAX_RPM - MIN_RPM) * (ramp_phase / RAMP_TIME)
+    } else if phase < blip1_up_end {
+        // Blip 1 up
+        let blip_phase = phase - ramp_down_end;
+        MIN_RPM + (BLIP_RPM - MIN_RPM) * (blip_phase / BLIP_TIME)
+    } else if phase < blip1_down_end {
+        // Blip 1 down
+        let blip_phase = phase - blip1_up_end;
+        BLIP_RPM - (BLIP_RPM - MIN_RPM) * (blip_phase / BLIP_TIME)
+    } else if phase < blip2_up_end {
+        // Blip 2 up
+        let blip_phase = phase - blip1_down_end;
+        MIN_RPM + (BLIP_RPM - MIN_RPM) * (blip_phase / BLIP_TIME)
+    } else if phase < blip2_down_end {
+        // Blip 2 down
+        let blip_phase = phase - blip2_up_end;
+        BLIP_RPM - (BLIP_RPM - MIN_RPM) * (blip_phase / BLIP_TIME)
     } else {
+        // Hold at min before next cycle
         MIN_RPM
     };
 
