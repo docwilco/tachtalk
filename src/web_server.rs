@@ -384,6 +384,9 @@ const HTML_INDEX_END: &str = r#";</script>
                     <option value="debug">Debug</option>
                 </select>
             </div>
+            <div class="form-group">
+                <button id="btnReboot" onclick="rebootDevice()" style="background-color: #ff5500;">🔄 Reboot Device</button>
+            </div>
         </div>
         
         <h2>RPM Thresholds</h2>
@@ -667,6 +670,31 @@ const HTML_INDEX_END: &str = r#";</script>
             }
         }
 
+        async function rebootDevice() {
+            if (!confirm('Are you sure you want to reboot the device?')) {
+                return;
+            }
+            
+            setButtonLoading('btnReboot', true, 'Rebooting...');
+            try {
+                const response = await fetch('/api/reboot', {
+                    method: 'POST'
+                });
+                
+                if (response.ok) {
+                    showStatus('Device is rebooting...', false);
+                    // Disable the button since device is restarting
+                    document.getElementById('btnReboot').disabled = true;
+                } else {
+                    showStatus('Failed to reboot device', true);
+                    setButtonLoading('btnReboot', false);
+                }
+            } catch (error) {
+                // Expected to fail as device disconnects
+                showStatus('Device is rebooting...', false);
+            }
+        }
+
         async function loadConfig() {
             setButtonLoading('btnReload', true, 'Loading...');
             try {
@@ -751,18 +779,25 @@ const HTML_INDEX_END: &str = r#";</script>
             // RPM is now handled via SSE, this is just a fallback
         }
 
+        let rpmEventSource = null;
+
         function setupRpmEventSource() {
+            // Close existing connection if any
+            if (rpmEventSource) {
+                rpmEventSource.close();
+                rpmEventSource = null;
+            }
+
             // SSE runs on a separate port to avoid blocking the HTTP server
             const sseUrl = `http://${window.location.hostname}:${SSE_PORT}/`;
-            const evtSource = new EventSource(sseUrl);
-            evtSource.onmessage = function(event) {
+            rpmEventSource = new EventSource(sseUrl);
+            rpmEventSource.onmessage = function(event) {
                 const data = JSON.parse(event.data);
                 document.getElementById('currentRpm').textContent = data.rpm !== null ? data.rpm : '---';
             };
-            evtSource.onerror = function() {
+            rpmEventSource.onerror = function() {
                 document.getElementById('currentRpm').textContent = '---';
-                // Reconnect after 2 seconds
-                setTimeout(setupRpmEventSource, 2000);
+                // EventSource will automatically reconnect, no need to manually reconnect
             };
         }
 
@@ -1088,6 +1123,24 @@ pub fn start_server(
         
         let mut response = req.into_ok_response()?;
         response.write_all(json.as_bytes())?;
+        Ok(())
+    })?;
+
+    // POST reboot endpoint
+    server.fn_handler("/api/reboot", Method::Post, |req| -> Result<(), esp_idf_svc::io::EspIOError> {
+        info!("HTTP: POST /api/reboot - Device reboot requested");
+        
+        req.into_ok_response()?;
+        
+        // Schedule restart after response is sent
+        std::thread::spawn(|| {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            info!("Rebooting device now...");
+            unsafe {
+                esp_idf_svc::sys::esp_restart();
+            }
+        });
+        
         Ok(())
     })?;
 

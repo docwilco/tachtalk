@@ -4,6 +4,7 @@
 //! Browsers can connect via EventSource with CORS.
 
 use log::{debug, error, info, warn};
+use smallvec::SmallVec;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
@@ -14,6 +15,7 @@ use crate::watchdog::WatchdogHandle;
 /// Port for the SSE server (separate from main HTTP server)
 pub const SSE_PORT: u16 = 8081;
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
+const MAX_SSE_CLIENTS: usize = 3;
 
 /// Message types for SSE server
 pub enum SseMessage {
@@ -48,7 +50,7 @@ fn run_sse_server(rx: &Receiver<SseMessage>) -> std::io::Result<()> {
 
     info!("SSE server started on port {SSE_PORT}");
 
-    let mut clients: Vec<TcpStream> = Vec::new();
+    let mut clients: SmallVec<[TcpStream; MAX_SSE_CLIENTS]> = SmallVec::new();
     let mut current_rpm: Option<u32> = None;
     let mut last_heartbeat = Instant::now();
 
@@ -59,13 +61,22 @@ fn run_sse_server(rx: &Receiver<SseMessage>) -> std::io::Result<()> {
         match listener.accept() {
             Ok((stream, addr)) => {
                 info!("SSE: New connection from {addr}");
-                if let Some(client) = handle_new_connection(stream) {
+                if let Some(client_stream) = handle_new_connection(stream) {
+                    // Enforce max client limit - close oldest if at capacity
+                    if clients.len() >= MAX_SSE_CLIENTS {
+                        if let Some(oldest) = clients.first() {
+                            info!("SSE: Max clients reached ({}), closing oldest connection", MAX_SSE_CLIENTS);
+                            let _ = oldest.shutdown(std::net::Shutdown::Both);
+                        }
+                        clients.remove(0);
+                    }
+
                     // Send current RPM to new client
                     if let Some(rpm) = current_rpm {
                         let msg = format!("data: {{\"rpm\":{rpm}}}\n\n");
-                        let _ = send_to_client(&client, msg.as_bytes());
+                        let _ = send_to_client(&client_stream, msg.as_bytes());
                     }
-                    clients.push(client);
+                    clients.push(client_stream);
                     info!("SSE: Client connected (total={})", clients.len());
                 }
             }
