@@ -781,6 +781,7 @@ const HTML_CAPTIVE_PORTAL: &str = r#"
 </html>
 "#;
 
+#[allow(clippy::too_many_lines)] // Route registration function - length is proportional to endpoints
 pub fn start_server(
     config: &Arc<Mutex<Config>>,
     wifi_mode: &Arc<Mutex<WifiMode>>,
