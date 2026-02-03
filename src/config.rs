@@ -145,8 +145,11 @@ const fn default_led_gpio() -> u8 {
     48
 }
 
+/// Maximum OBD2 timeout to avoid triggering watchdog in dongle task
+pub const MAX_OBD2_TIMEOUT_MS: u64 = 4500;
+
 const fn default_obd2_timeout_ms() -> u64 {
-    5000
+    MAX_OBD2_TIMEOUT_MS
 }
 
 impl Default for Config {
@@ -223,16 +226,25 @@ impl Default for Config {
             ],
             total_leds: 1,
             led_gpio: 48,
-            obd2_timeout_ms: 5000,
+            obd2_timeout_ms: MAX_OBD2_TIMEOUT_MS,
         }
     }
 }
 
 impl Config {
+    /// Clamp values to valid ranges (e.g., timeout limits)
+    pub fn validate(&mut self) {
+        if self.obd2_timeout_ms > MAX_OBD2_TIMEOUT_MS {
+            warn!("Clamping obd2_timeout_ms from {} to {}", self.obd2_timeout_ms, MAX_OBD2_TIMEOUT_MS);
+            self.obd2_timeout_ms = MAX_OBD2_TIMEOUT_MS;
+        }
+    }
+
     pub fn load_or_default() -> Self {
         match Self::load() {
-            Ok(config) => {
+            Ok(mut config) => {
                 info!("Loaded config from NVS");
+                config.validate();
                 config
             }
             Err(e) => {

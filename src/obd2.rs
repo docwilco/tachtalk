@@ -9,7 +9,8 @@
 use anyhow::{Context, Result};
 use log::{debug, error, info, warn};
 use smallvec::SmallVec;
-use std::io::{Read, Write};
+use std::collections::HashSet;
+use std::io::{BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
@@ -28,6 +29,9 @@ const IDLE_POLL_INTERVAL_MS: u64 = 100;
 const CLIENT_ACTIVITY_BACKOFF: Duration = Duration::from_millis(500);
 const RECONNECT_DELAY: Duration = Duration::from_secs(1);
 
+/// Shared log of unique AT commands received from clients (for debugging)
+pub type AtCommandLog = Arc<Mutex<HashSet<String>>>;
+
 /// Type alias for small OBD2 command/response buffers
 pub type Obd2Buffer = SmallVec<[u8; 12]>;
 
@@ -37,6 +41,69 @@ pub struct DongleRequest {
     pub command: Obd2Buffer,
     /// Channel to send the response back
     pub response_tx: oneshot::Sender<Result<Obd2Buffer, DongleError>>,
+}
+
+/// Per-connection client state (ELM327 settings)
+#[derive(Debug, Clone)]
+struct ClientState {
+    /// Echo received characters back (ATE0/ATE1)
+    echo_enabled: bool,
+    /// Add linefeeds after carriage returns (ATL0/ATL1)
+    linefeeds_enabled: bool,
+    /// Print spaces between response bytes (ATS0/ATS1)
+    spaces_enabled: bool,
+    /// Show header bytes in responses (ATH0/ATH1)
+    headers_enabled: bool,
+}
+
+impl Default for ClientState {
+    fn default() -> Self {
+        Self {
+            echo_enabled: true,
+            linefeeds_enabled: true,
+            spaces_enabled: true,
+            headers_enabled: false,
+        }
+    }
+}
+
+impl ClientState {
+    /// Format a line ending based on current settings
+    fn line_ending(&self) -> &'static str {
+        if self.linefeeds_enabled { "\r\n" } else { "\r" }
+    }
+
+    /// Format a dongle response according to client settings
+    /// The dongle sends compact hex (no spaces), so we add spaces if enabled
+    fn format_response(&self, response: &[u8]) -> Vec<u8> {
+        if !self.spaces_enabled {
+            // No formatting needed, return as-is
+            return response.to_vec();
+        }
+
+        let mut result = Vec::with_capacity(response.len() * 3 / 2);
+        let mut hex_count = 0;
+
+        for &byte in response {
+            // Check if this is a hex digit
+            let is_hex = byte.is_ascii_hexdigit();
+
+            if is_hex {
+                // Add space before every pair of hex digits (except the first)
+                if hex_count > 0 && hex_count % 2 == 0 {
+                    result.push(b' ');
+                }
+                hex_count += 1;
+            } else {
+                // Reset hex count on non-hex (line endings, prompt, etc.)
+                hex_count = 0;
+            }
+
+            result.push(byte);
+        }
+
+        result
+    }
 }
 
 /// Errors from the dongle task
@@ -60,6 +127,18 @@ impl std::fmt::Display for DongleError {
 }
 
 impl std::error::Error for DongleError {}
+
+impl DongleError {
+    /// Convert to ELM327-style error message
+    fn to_elm327_error(&self) -> &'static str {
+        match self {
+            Self::NotConnected => "UNABLE TO CONNECT",
+            Self::Timeout => "NO DATA",
+            Self::Disconnected => "CAN ERROR",
+            Self::IoError(_) => "BUS ERROR",
+        }
+    }
+}
 
 pub type DongleSender = Sender<DongleRequest>;
 
@@ -252,6 +331,8 @@ pub struct Obd2Proxy {
     dongle_tx: DongleSender,
     /// When the last RPM was proxied from a client (not background poller)
     last_proxied_rpm: Arc<Mutex<Option<Instant>>>,
+    /// Unique AT commands seen from clients (for debugging/web UI)
+    at_command_log: AtCommandLog,
 }
 
 impl Obd2Proxy {
@@ -260,6 +341,7 @@ impl Obd2Proxy {
         led_controller: Arc<Mutex<LedController>>,
         sse_tx: SseSender,
         dongle_tx: DongleSender,
+        at_command_log: AtCommandLog,
     ) -> Self {
         Self {
             config,
@@ -267,6 +349,7 @@ impl Obd2Proxy {
             sse_tx,
             dongle_tx,
             last_proxied_rpm: Arc::new(Mutex::new(None)),
+            at_command_log,
         }
     }
 
@@ -307,10 +390,11 @@ impl Obd2Proxy {
                     let sse_tx = self.sse_tx.clone();
                     let dongle_tx = self.dongle_tx.clone();
                     let last_proxied_rpm = self.last_proxied_rpm.clone();
+                    let at_command_log = self.at_command_log.clone();
 
                     std::thread::spawn(move || {
                         if let Err(e) =
-                            Self::handle_client(stream, config, led_controller, sse_tx, dongle_tx, last_proxied_rpm)
+                            Self::handle_client(stream, config, led_controller, sse_tx, dongle_tx, last_proxied_rpm, at_command_log)
                         {
                             error!("Error handling client: {e:?}");
                         }
@@ -377,88 +461,72 @@ impl Obd2Proxy {
     }
 
     fn handle_client(
-        mut client_stream: TcpStream,
+        client_stream: TcpStream,
         config: Arc<Mutex<Config>>,
         led_controller: Arc<Mutex<LedController>>,
         sse_tx: SseSender,
         dongle_tx: DongleSender,
         last_proxied_rpm: Arc<Mutex<Option<Instant>>>,
+        at_command_log: AtCommandLog,
     ) -> Result<()> {
         let peer = client_stream.peer_addr()?;
         info!("OBD2 client connected: {peer}");
 
         client_stream.set_read_timeout(Some(Duration::from_secs(30)))?;
 
-        // Track client's echo setting (local to this connection)
-        let mut echo_enabled = true;
+        // Use BufReader for efficient reading, but keep reference to stream for writing
+        let mut reader = BufReader::new(&client_stream);
+        let mut writer = &client_stream;
 
-        let mut buffer = [0u8; 1024];
+        // Track per-connection ELM327 state
+        let mut state = ClientState::default();
+
+        // Command buffer for accumulating characters
+        let mut cmd_buffer = Vec::with_capacity(64);
 
         loop {
-            match client_stream.read(&mut buffer) {
+            // Read one byte at a time for character-by-character echo
+            // BufReader batches actual reads internally for efficiency
+            let mut byte = [0u8; 1];
+            match reader.read(&mut byte) {
                 Ok(0) => {
                     info!("OBD2 client disconnected: {peer}");
                     break;
                 }
-                Ok(n) => {
-                    let request = &buffer[..n];
-                    let request_str = String::from_utf8_lossy(request);
-                    let command = request_str.trim();
-                    debug!("OBD2 client command: {command:?}");
-
-                    // Check if this is an AT command (handle locally)
-                    if command.to_uppercase().starts_with("AT") {
-                        debug!("Handling AT command locally");
-                        let response = Self::handle_at_command(command, &mut echo_enabled);
-                        client_stream
-                            .write_all(response.as_bytes())
-                            .context("Failed to write AT response")?;
-                        continue;
+                Ok(_) => {
+                    let ch = byte[0];
+                    
+                    // Echo character immediately if enabled
+                    if state.echo_enabled {
+                        writer.write_all(&byte)?;
                     }
-
-                    // Get timeout from config
-                    let timeout = Duration::from_millis(config.lock().unwrap().obd2_timeout_ms);
-
-                    // Forward OBD2 command to dongle task
-                    match send_command(&dongle_tx, request, timeout) {
-                        Ok(response) => {
-                            // Extract RPM if this was an RPM request
-                            if let Some(rpm) = Self::extract_rpm_from_response(&response) {
-                                debug!("Client RPM request: {rpm}");
-                                
-                                // Record that client provided an RPM update
-                                *last_proxied_rpm.lock().unwrap() = Some(Instant::now());
-                                
-                                let _ = sse_tx.send(SseMessage::RpmUpdate(rpm));
-
-                                if let Ok(mut led) = led_controller.lock() {
-                                    if let Ok(cfg) = config.lock() {
-                                        let _ = led.update(rpm, &cfg);
-                                    }
-                                }
-                            }
-
-                            // Build response for client
-                            let mut client_response = Vec::new();
-                            if echo_enabled {
-                                client_response.extend_from_slice(request);
-                            }
-                            client_response.extend_from_slice(&response);
-
-                            client_stream
-                                .write_all(&client_response)
-                                .context("Failed to write response")?;
+                    
+                    // CR is command terminator
+                    if ch == b'\r' {
+                        // Process the accumulated command
+                        let command = String::from_utf8_lossy(&cmd_buffer);
+                        let command = command.trim();
+                        
+                        if !command.is_empty() {
+                            debug!("OBD2 client command: {command:?}");
+                            Self::process_command(
+                                command,
+                                &cmd_buffer,
+                                &mut writer,
+                                &mut state,
+                                &config,
+                                &led_controller,
+                                &sse_tx,
+                                &dongle_tx,
+                                &last_proxied_rpm,
+                                &at_command_log,
+                            )?;
                         }
-                        Err(e) => {
-                            error!("Dongle error: {e}");
-                            // Send error response to client
-                            let error_response = if echo_enabled {
-                                format!("{command}\r\n?\r\n>")
-                            } else {
-                                "?\r\n>".to_string()
-                            };
-                            client_stream.write_all(error_response.as_bytes())?;
-                        }
+                        
+                        cmd_buffer.clear();
+                    } else if ch != b'\n' {
+                        // Accumulate non-LF characters (ignore LF per ELM327 spec)
+                        cmd_buffer.push(ch);
                     }
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
@@ -475,35 +543,135 @@ impl Obd2Proxy {
         Ok(())
     }
 
+    fn process_command(
+        command: &str,
+        raw_command: &[u8],
+        writer: &mut &TcpStream,
+        state: &mut ClientState,
+        config: &Arc<Mutex<Config>>,
+        led_controller: &Arc<Mutex<LedController>>,
+        sse_tx: &SseSender,
+        dongle_tx: &DongleSender,
+        last_proxied_rpm: &Arc<Mutex<Option<Instant>>>,
+        at_command_log: &AtCommandLog,
+    ) -> Result<()> {
+        // Check if this is an AT command (handle locally)
+        if command.to_uppercase().starts_with("AT") {
+            debug!("Handling AT command locally");
+            
+            // Record unique AT commands (store uppercase for dedup)
+            if let Ok(mut log) = at_command_log.lock() {
+                log.insert(command.to_uppercase());
+            }
+            
+            let response = Self::handle_at_command(command, state);
+            writer
+                .write_all(response.as_bytes())
+                .context("Failed to write AT response")?;
+            return Ok(());
+        }
+
+        // Get timeout from config
+        let timeout = Duration::from_millis(config.lock().unwrap().obd2_timeout_ms);
+
+        // Forward OBD2 command to dongle task
+        match send_command(dongle_tx, raw_command, timeout) {
+            Ok(response) => {
+                // Extract RPM if this was an RPM request
+                if let Some(rpm) = Self::extract_rpm_from_response(&response) {
+                    debug!("Client RPM request: {rpm}");
+                    
+                    // Record that client provided an RPM update
+                    *last_proxied_rpm.lock().unwrap() = Some(Instant::now());
+                    
+                    let _ = sse_tx.send(SseMessage::RpmUpdate(rpm));
+
+                    if let Ok(mut led) = led_controller.lock() {
+                        if let Ok(cfg) = config.lock() {
+                            let _ = led.update(rpm, &cfg);
+                        }
+                    }
+                }
+
+                // Format and send dongle response (echo already sent character-by-character)
+                let formatted = state.format_response(&response);
+                writer
+                    .write_all(&formatted)
+                    .context("Failed to write response")?;
+            }
+            Err(e) => {
+                error!("Dongle error: {e}");
+                // Send proper ELM327 error response (echo already sent)
+                let le = state.line_ending();
+                let error_msg = e.to_elm327_error();
+                let error_response = format!("{le}{error_msg}{le}>");
+                writer.write_all(error_response.as_bytes())?;
+            }
+        }
+
+        Ok(())
+    }
+
     /// Handle AT commands locally (per-connection state)
-    fn handle_at_command(command: &str, echo_enabled: &mut bool) -> String {
+    /// Echo has already been sent character-by-character, so responses don't include it
+    fn handle_at_command(command: &str, state: &mut ClientState) -> String {
         let cmd = command.to_uppercase();
-        let response = match cmd.as_str() {
-            "ATZ" => "ELM327 v1.5\r\n",
+        let le = state.line_ending();
+        
+        // Determine response content (without line endings)
+        let response_text = match cmd.as_str() {
+            "ATZ" => {
+                // Reset all settings to defaults
+                *state = ClientState::default();
+                // Use new state's line ending for response
+                let le = state.line_ending();
+                return format!("{le}ELM327 v1.5{le}>");
+            }
             "ATE0" => {
-                *echo_enabled = false;
-                "OK\r\n"
+                state.echo_enabled = false;
+                "OK"
             }
             "ATE1" => {
-                *echo_enabled = true;
-                "OK\r\n"
+                state.echo_enabled = true;
+                "OK"
             }
-            "ATL0" | "ATL1" | "ATS0" | "ATS1" | "ATH0" | "ATH1" | "ATSP0" | "ATAT1" | "ATAT2" => {
-                "OK\r\n"
+            "ATL0" => {
+                state.linefeeds_enabled = false;
+                "OK"
             }
-            _ if cmd.starts_with("ATSP") => "OK\r\n",
-            _ if cmd.starts_with("ATST") => "OK\r\n",
-            _ if cmd.starts_with("ATAT") => "OK\r\n",
-            "ATI" => "ELM327 v1.5\r\n",
-            "AT@1" => "TachTalk OBD2 Proxy\r\n",
-            _ => "?\r\n",
+            "ATL1" => {
+                state.linefeeds_enabled = true;
+                "OK"
+            }
+            "ATS0" => {
+                state.spaces_enabled = false;
+                "OK"
+            }
+            "ATS1" => {
+                state.spaces_enabled = true;
+                "OK"
+            }
+            "ATH0" => {
+                state.headers_enabled = false;
+                "OK"
+            }
+            "ATH1" => {
+                state.headers_enabled = true;
+                "OK"
+            }
+            "ATSP0" | "ATAT1" | "ATAT2" => "OK",
+            _ if cmd.starts_with("ATSP") => "OK",
+            _ if cmd.starts_with("ATST") => "OK",
+            _ if cmd.starts_with("ATAT") => "OK",
+            "ATI" => "ELM327 v1.5",
+            "AT@1" => "TachTalk OBD2 Proxy",
+            _ => "?",
         };
 
-        if *echo_enabled {
-            format!("{command}\r\n{response}>")
-        } else {
-            format!("{response}>")
-        }
+        // Build response with proper line endings (echo already sent)
+        // Note: for commands that change linefeed setting, we use the OLD setting
+        // since le was captured before the match
+        format!("{le}{response_text}{le}>")
     }
 
     fn extract_rpm_from_response(data: &[u8]) -> Option<u32> {

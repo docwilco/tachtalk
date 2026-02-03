@@ -12,6 +12,7 @@ use esp_idf_svc::wifi::{
 };
 use esp_idf_svc::ipv4::{self, Ipv4Addr};
 use log::{debug, info, warn, error};
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
 mod config;
@@ -24,7 +25,7 @@ mod web_server;
 
 use config::Config;
 use leds::LedController;
-use obd2::Obd2Proxy;
+use obd2::{AtCommandLog, Obd2Proxy};
 
 const AP_SSID_PREFIX: &str = "TachTalk-";
 
@@ -149,6 +150,9 @@ fn main() -> Result<()> {
     // Start SSE server for RPM streaming (on port 8081)
     let sse_tx = sse_server::start_sse_server();
 
+    // Create shared log for tracking AT commands (for debugging via web UI)
+    let at_command_log: AtCommandLog = Arc::new(Mutex::new(HashSet::new()));
+
     // Start web server immediately
     let wifi = Arc::new(Mutex::new(wifi));
     {
@@ -157,9 +161,10 @@ fn main() -> Result<()> {
         let mode_clone = wifi_mode.clone();
         let wifi_clone = wifi.clone();
         let ap_hostname_clone = ap_hostname.clone();
+        let at_cmd_log_clone = at_command_log.clone();
 
         std::thread::spawn(move || {
-            if let Err(e) = web_server::start_server(config_clone, led_clone, mode_clone, wifi_clone, Some(ap_hostname_clone)) {
+            if let Err(e) = web_server::start_server(config_clone, led_clone, mode_clone, wifi_clone, Some(ap_hostname_clone), at_cmd_log_clone) {
                 error!("Web server error: {e:?}");
             }
         });
@@ -188,9 +193,10 @@ fn main() -> Result<()> {
         let config_clone = config.clone();
         let led_clone = led_controller.clone();
         let sse_tx_clone = sse_tx.clone();
+        let at_cmd_log_clone = at_command_log.clone();
         
         std::thread::spawn(move || {
-            let proxy = Obd2Proxy::new(config_clone, led_clone, sse_tx_clone, dongle_tx);
+            let proxy = Obd2Proxy::new(config_clone, led_clone, sse_tx_clone, dongle_tx, at_cmd_log_clone);
             if let Err(e) = proxy.run() {
                 error!("OBD2 proxy error: {e:?}");
             }

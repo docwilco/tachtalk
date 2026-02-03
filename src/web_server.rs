@@ -6,8 +6,11 @@ use esp_idf_svc::wifi::{BlockingWifi, EspWifi};
 use log::{debug, error, info, warn};
 use std::sync::{Arc, Mutex};
 
+use esp_idf_svc::sys::{esp_get_free_heap_size, esp_get_minimum_free_heap_size};
+
 use crate::config::Config;
 use crate::leds::LedController;
+use crate::obd2::AtCommandLog;
 use crate::sse_server::SSE_PORT;
 use crate::WifiMode;
 
@@ -160,6 +163,41 @@ const HTML_INDEX_END: &str = r#";</script>
         .hidden {
             display: none;
         }
+        .debug-section {
+            background-color: #2a2a3a;
+            padding: 10px 15px;
+            margin: 20px 0;
+            border-radius: 5px;
+            border-left: 4px solid #888;
+        }
+        .debug-section summary {
+            cursor: pointer;
+            font-weight: bold;
+            color: #888;
+        }
+        .debug-section[open] summary {
+            margin-bottom: 10px;
+        }
+        .debug-content {
+            padding: 10px 0;
+        }
+        .debug-content h3 {
+            margin: 10px 0 10px 0;
+            font-size: 1em;
+            color: #aaa;
+        }
+        .debug-row {
+            display: flex;
+            justify-content: space-between;
+            padding: 3px 0;
+            font-size: 0.9em;
+        }
+        .at-commands {
+            font-family: monospace;
+            font-size: 0.85em;
+            color: #8f8;
+            word-break: break-all;
+        }
     </style>
 </head>
 <body>
@@ -185,6 +223,16 @@ const HTML_INDEX_END: &str = r#";</script>
             <div class="info-row"><span>MAC Address:</span><span id="netMac">---</span></div>
             <div class="info-row"><span>RSSI:</span><span id="netRssi">---</span></div>
         </div>
+        
+        <details class="debug-section">
+            <summary>🔧 Debug Info</summary>
+            <div class="debug-content">
+                <div class="debug-row"><span>Free Heap:</span><span id="freeHeap">---</span></div>
+                <div class="debug-row"><span>Min Free Heap:</span><span id="minFreeHeap">---</span></div>
+                <h3>AT Commands Received</h3>
+                <div id="atCommands" class="at-commands">Loading...</div>
+            </div>
+        </details>
         
         <div class="wifi-config">
             <h2>📶 WiFi Configuration</h2>
@@ -553,15 +601,48 @@ const HTML_INDEX_END: &str = r#";</script>
             };
         }
 
+        function formatBytes(bytes) {
+            if (bytes < 1024) return bytes + ' B';
+            if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
+            return (bytes / (1024 * 1024)).toFixed(2) + ' MB';
+        }
+
+        async function loadDebugInfo() {
+            try {
+                const response = await fetch('/api/debug_info');
+                const info = await response.json();
+                
+                document.getElementById('freeHeap').textContent = formatBytes(info.free_heap);
+                document.getElementById('minFreeHeap').textContent = formatBytes(info.min_free_heap);
+                
+                const el = document.getElementById('atCommands');
+                if (info.at_commands.length === 0) {
+                    el.textContent = '(none yet)';
+                } else {
+                    el.textContent = info.at_commands.join(', ');
+                }
+            } catch (e) {
+                document.getElementById('atCommands').textContent = '(error)';
+                document.getElementById('freeHeap').textContent = '---';
+                document.getElementById('minFreeHeap').textContent = '---';
+            }
+        }
+
         // Initialize
         renderThresholds();
         loadConfig();
         loadMode();
         loadNetworkStatus();
         setupRpmEventSource();
+        loadDebugInfo();
         
         // Poll network status (RPM uses SSE now)
         setInterval(loadNetworkStatus, 5000);
+        // Poll debug info every second (only when debug section is open)
+        setInterval(() => {
+            const details = document.querySelector('.debug-section');
+            if (details && details.open) loadDebugInfo();
+        }, 1000);
     </script>
 </body>
 </html>
@@ -588,6 +669,7 @@ pub fn start_server(
     wifi_mode: Arc<Mutex<WifiMode>>,
     wifi: Arc<Mutex<BlockingWifi<EspWifi<'static>>>>,
     ap_hostname: Option<String>,
+    at_command_log: AtCommandLog,
 ) -> Result<()> {
     info!("Web server starting...");
     
@@ -645,7 +727,10 @@ pub fn start_server(
         let mut buf = vec![0u8; 2048];
         let bytes_read = req.read(&mut buf)?;
         
-        if let Ok(new_config) = serde_json::from_slice::<Config>(&buf[..bytes_read]) {
+        if let Ok(mut new_config) = serde_json::from_slice::<Config>(&buf[..bytes_read]) {
+            // Validate/clamp values to safe ranges
+            new_config.validate();
+            
             debug!("Config update: {} thresholds, log_level={:?}", 
                    new_config.thresholds.len(), new_config.log_level);
             
@@ -824,6 +909,43 @@ pub fn start_server(
         info!("HTTP: GET /api/rpm");
         // This is just a fallback, real updates come via SSE on port 8081
         let json = r#"{"rpm":null}"#;
+        let mut response = req.into_ok_response()?;
+        response.write_all(json.as_bytes())?;
+        Ok(())
+    })?;
+
+    // GET debug info endpoint (AT commands, memory stats, etc.)
+    server.fn_handler("/api/debug_info", Method::Get, move |req| -> Result<(), esp_idf_svc::io::EspIOError> {
+        debug!("HTTP: GET /api/debug_info");
+        
+        let at_commands: Vec<String> = at_command_log
+            .lock()
+            .map(|log| {
+                let mut cmds: Vec<String> = log.iter().cloned().collect();
+                cmds.sort();
+                cmds
+            })
+            .unwrap_or_default();
+        
+        // SAFETY: These are simple C functions that return u32 values
+        let free_heap = unsafe { esp_get_free_heap_size() };
+        let min_free_heap = unsafe { esp_get_minimum_free_heap_size() };
+        
+        #[derive(serde::Serialize)]
+        struct DebugInfo {
+            at_commands: Vec<String>,
+            free_heap: u32,
+            min_free_heap: u32,
+        }
+        
+        let info = DebugInfo {
+            at_commands,
+            free_heap,
+            min_free_heap,
+        };
+        
+        let json = serde_json::to_string(&info).unwrap_or_else(|_| r#"{"at_commands":[],"free_heap":0,"min_free_heap":0}"#.to_string());
+        
         let mut response = req.into_ok_response()?;
         response.write_all(json.as_bytes())?;
         Ok(())
