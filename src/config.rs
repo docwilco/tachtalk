@@ -124,11 +124,71 @@ impl Default for IpConfig {
     }
 }
 
+impl IpConfig {
+    /// Default static IP when not using DHCP on the dongle network
+    pub const DEFAULT_STATIC_IP: &'static str = "192.168.0.20";
+    pub const DEFAULT_GATEWAY: &'static str = "192.168.0.1";
+    pub const DEFAULT_SUBNET: &'static str = "255.255.255.0";
+
+    /// Get IP address, using default static IP if static mode but no IP configured
+    #[must_use]
+    pub fn effective_ip(&self) -> Option<&str> {
+        if self.use_dhcp {
+            None
+        } else {
+            Some(self.ip.as_deref().unwrap_or(Self::DEFAULT_STATIC_IP))
+        }
+    }
+
+    /// Get gateway, using default if static mode but not configured
+    #[must_use]
+    pub fn effective_gateway(&self) -> Option<&str> {
+        if self.use_dhcp {
+            None
+        } else {
+            Some(self.gateway.as_deref().unwrap_or(Self::DEFAULT_GATEWAY))
+        }
+    }
+
+    /// Get subnet mask, using default if static mode but not configured
+    #[must_use]
+    pub fn effective_subnet(&self) -> Option<&str> {
+        if self.use_dhcp {
+            None
+        } else {
+            Some(self.subnet.as_deref().unwrap_or(Self::DEFAULT_SUBNET))
+        }
+    }
+}
+
+/// OBD2 network configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Obd2Config {
+    /// IP address of the OBD2 dongle
+    pub dongle_ip: String,
+    /// Port of the OBD2 dongle
+    pub dongle_port: u16,
+    /// Port to listen on for OBD2 clients
+    pub listen_port: u16,
+}
+
+impl Default for Obd2Config {
+    fn default() -> Self {
+        Self {
+            dongle_ip: "192.168.0.10".to_string(),
+            dongle_port: 35000,
+            listen_port: 35000,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     pub wifi: WifiConfig,
     #[serde(default)]
     pub ip: IpConfig,
+    #[serde(default)]
+    pub obd2: Obd2Config,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ap_password: Option<String>,
     #[serde(default)]
@@ -157,6 +217,7 @@ impl Default for Config {
         Self {
             wifi: WifiConfig::new_default(),
             ip: IpConfig::default(),
+            obd2: Obd2Config::default(),
             ap_password: None,
             log_level: LogLevel::default(),
             thresholds: vec![

@@ -29,7 +29,7 @@ pub fn start_sse_server() -> SseSender {
     let (tx, rx) = mpsc::channel::<SseMessage>();
 
     std::thread::spawn(move || {
-        if let Err(e) = run_sse_server(rx) {
+        if let Err(e) = run_sse_server(&rx) {
             error!("SSE server error: {e}");
         }
     });
@@ -38,7 +38,7 @@ pub fn start_sse_server() -> SseSender {
 }
 
 /// SSE server main loop
-fn run_sse_server(rx: Receiver<SseMessage>) -> std::io::Result<()> {
+fn run_sse_server(rx: &Receiver<SseMessage>) -> std::io::Result<()> {
     info!("SSE server starting on port {SSE_PORT}...");
 
     let listener = TcpListener::bind(("0.0.0.0", SSE_PORT))?;
@@ -53,9 +53,7 @@ fn run_sse_server(rx: Receiver<SseMessage>) -> std::io::Result<()> {
     let mut last_heartbeat = Instant::now();
 
     loop {
-        if let Some(ref wd) = watchdog {
-            wd.feed();
-        }
+        watchdog.feed();
 
         // Accept new connections (non-blocking)
         match listener.accept() {

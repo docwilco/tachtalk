@@ -21,9 +21,6 @@ use crate::leds::LedController;
 use crate::watchdog::WatchdogHandle;
 use crate::sse_server::{SseMessage, SseSender};
 
-pub const OBD2_PORT: u16 = 35000;
-const DONGLE_IP: &str = "192.168.0.10";
-const DONGLE_PORT: u16 = 35000;
 const IDLE_POLL_INTERVAL_MS: u64 = 100;
 /// How long after a client RPM update before background poller resumes
 const CLIENT_ACTIVITY_BACKOFF: Duration = Duration::from_millis(500);
@@ -146,13 +143,13 @@ pub type DongleSender = Sender<DongleRequest>;
 pub fn start_dongle_task(config: Arc<Mutex<Config>>) -> DongleSender {
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
-        dongle_task(rx, config);
+        dongle_task(&rx, &config);
     });
     tx
 }
 
 /// The dongle task - owns the connection and processes requests
-fn dongle_task(rx: Receiver<DongleRequest>, config: Arc<Mutex<Config>>) {
+fn dongle_task(rx: &Receiver<DongleRequest>, config: &Arc<Mutex<Config>>) {
     info!("OBD2 dongle task starting...");
     
     let mut connection: Option<TcpStream> = None;
@@ -163,12 +160,17 @@ fn dongle_task(rx: Receiver<DongleRequest>, config: Arc<Mutex<Config>>) {
     info!("OBD2 dongle task started");
 
     loop {
-        if let Some(ref wd) = watchdog {
-            wd.feed();
-        }
+        watchdog.feed();
         
-        // Get timeout from config
-        let timeout = Duration::from_millis(config.lock().unwrap().obd2_timeout_ms);
+        // Get config values
+        let (timeout, dongle_ip, dongle_port) = {
+            let cfg = config.lock().unwrap();
+            (
+                Duration::from_millis(cfg.obd2_timeout_ms),
+                cfg.obd2.dongle_ip.clone(),
+                cfg.obd2.dongle_port,
+            )
+        };
         
         // Try to ensure we have a connection (with reconnect delay)
         if connection.is_none() {
@@ -178,7 +180,7 @@ fn dongle_task(rx: Receiver<DongleRequest>, config: Arc<Mutex<Config>>) {
             };
             if should_try {
                 last_connect_attempt = Some(Instant::now());
-                connection = try_connect(timeout, &watchdog);
+                connection = try_connect(&dongle_ip, dongle_port, timeout, &watchdog);
             }
         }
 
@@ -219,10 +221,10 @@ fn dongle_task(rx: Receiver<DongleRequest>, config: Arc<Mutex<Config>>) {
 }
 
 /// Try to connect to the dongle and initialize it
-fn try_connect(timeout: Duration, watchdog: &Option<WatchdogHandle>) -> Option<TcpStream> {
-    info!("Connecting to OBD2 dongle at {DONGLE_IP}:{DONGLE_PORT} (timeout: {}ms)", timeout.as_millis());
+fn try_connect(dongle_ip: &str, dongle_port: u16, timeout: Duration, watchdog: &WatchdogHandle) -> Option<TcpStream> {
+    info!("Connecting to OBD2 dongle at {dongle_ip}:{dongle_port} (timeout: {}ms)", timeout.as_millis());
 
-    let addr: SocketAddr = format!("{DONGLE_IP}:{DONGLE_PORT}").parse().ok()?;
+    let addr: SocketAddr = format!("{dongle_ip}:{dongle_port}").parse().ok()?;
     let stream = match TcpStream::connect_timeout(&addr, timeout) {
         Ok(s) => s,
         Err(e) => {
@@ -232,9 +234,7 @@ fn try_connect(timeout: Duration, watchdog: &Option<WatchdogHandle>) -> Option<T
     };
     
     // Feed watchdog after potentially long connect timeout
-    if let Some(ref wd) = watchdog {
-        wd.feed();
-    }
+    watchdog.feed();
 
     if let Err(e) = stream.set_read_timeout(Some(timeout)) {
         error!("Failed to set read timeout: {e}");
@@ -376,11 +376,14 @@ impl Obd2Proxy {
         let last_proxied_rpm_clone = self.last_proxied_rpm.clone();
 
         std::thread::spawn(move || {
-            Self::background_poller(config_clone, led_clone, sse_tx_clone, dongle_tx_clone, last_proxied_rpm_clone);
+            Self::background_poller(&config_clone, &led_clone, &sse_tx_clone, &dongle_tx_clone, &last_proxied_rpm_clone);
         });
 
+        // Get listen port from config
+        let listen_port = self.config.lock().unwrap().obd2.listen_port;
+
         // Start proxy server
-        let listener = TcpListener::bind(format!("0.0.0.0:{OBD2_PORT}"))?;
+        let listener = TcpListener::bind(format!("0.0.0.0:{listen_port}"))?;
         
         // Register watchdog for this thread (the proxy accept loop)
         let watchdog = WatchdogHandle::register("obd2_proxy");
@@ -388,12 +391,10 @@ impl Obd2Proxy {
         // Set non-blocking with timeout so we can feed the watchdog
         listener.set_nonblocking(true)?;
         
-        info!("OBD2 proxy started on port {OBD2_PORT}");
+        info!("OBD2 proxy started on port {listen_port}");
 
         loop {
-            if let Some(ref wd) = watchdog {
-                wd.feed();
-            }
+            watchdog.feed();
             
             match listener.accept() {
                 Ok((stream, _)) => {
@@ -406,7 +407,7 @@ impl Obd2Proxy {
 
                     std::thread::spawn(move || {
                         if let Err(e) =
-                            Self::handle_client(stream, config, led_controller, sse_tx, dongle_tx, last_proxied_rpm, at_command_log)
+                            Self::handle_client(stream, &config, &led_controller, &sse_tx, &dongle_tx, &last_proxied_rpm, &at_command_log)
                         {
                             error!("Error handling client: {e:?}");
                         }
@@ -424,11 +425,11 @@ impl Obd2Proxy {
     }
 
     fn background_poller(
-        config: Arc<Mutex<Config>>,
-        led_controller: Arc<Mutex<LedController>>,
-        sse_tx: SseSender,
-        dongle_tx: DongleSender,
-        last_proxied_rpm: Arc<Mutex<Option<Instant>>>,
+        config: &Arc<Mutex<Config>>,
+        led_controller: &Arc<Mutex<LedController>>,
+        sse_tx: &SseSender,
+        dongle_tx: &DongleSender,
+        last_proxied_rpm: &Arc<Mutex<Option<Instant>>>,
     ) {
         info!("Background RPM poller starting...");
         
@@ -437,9 +438,7 @@ impl Obd2Proxy {
         info!("Background RPM poller started");
         
         loop {
-            if let Some(ref wd) = watchdog {
-                wd.feed();
-            }
+            watchdog.feed();
             
             std::thread::sleep(Duration::from_millis(IDLE_POLL_INTERVAL_MS));
 
@@ -455,7 +454,7 @@ impl Obd2Proxy {
             let timeout = Duration::from_millis(config.lock().unwrap().obd2_timeout_ms);
 
             // Request RPM from dongle
-            if let Ok(response) = send_command(&dongle_tx, b"010C", timeout) {
+            if let Ok(response) = send_command(dongle_tx, b"010C", timeout) {
                 if let Some(rpm) = Self::extract_rpm_from_response(&response) {
                     debug!("Polled RPM: {rpm}");
                     
@@ -472,19 +471,26 @@ impl Obd2Proxy {
         }
     }
 
+    #[allow(clippy::needless_pass_by_value)] // TcpStream is consumed by BufReader
     fn handle_client(
         client_stream: TcpStream,
-        config: Arc<Mutex<Config>>,
-        led_controller: Arc<Mutex<LedController>>,
-        sse_tx: SseSender,
-        dongle_tx: DongleSender,
-        last_proxied_rpm: Arc<Mutex<Option<Instant>>>,
-        at_command_log: AtCommandLog,
+        config: &Arc<Mutex<Config>>,
+        led_controller: &Arc<Mutex<LedController>>,
+        sse_tx: &SseSender,
+        dongle_tx: &DongleSender,
+        last_proxied_rpm: &Arc<Mutex<Option<Instant>>>,
+        at_command_log: &AtCommandLog,
     ) -> Result<()> {
         let peer = client_stream.peer_addr()?;
         info!("OBD2 client connected: {peer}");
 
-        client_stream.set_read_timeout(Some(Duration::from_secs(30)))?;
+        // Get timeout from config for socket operations
+        let timeout = Duration::from_millis(config.lock().unwrap().obd2_timeout_ms);
+        client_stream.set_read_timeout(Some(timeout))?;
+        client_stream.set_write_timeout(Some(timeout))?;
+
+        // Register watchdog for this client handler
+        let watchdog = WatchdogHandle::register("obd2_client");
 
         // Use BufReader for efficient reading, but keep reference to stream for writing
         let mut reader = BufReader::new(&client_stream);
@@ -497,6 +503,8 @@ impl Obd2Proxy {
         let mut cmd_buffer = Vec::with_capacity(64);
 
         loop {
+            watchdog.feed();
+
             // Read one byte at a time for character-by-character echo
             // BufReader batches actual reads internally for efficiency
             let mut byte = [0u8; 1];
@@ -526,12 +534,12 @@ impl Obd2Proxy {
                                 &cmd_buffer,
                                 &mut writer,
                                 &mut state,
-                                &config,
-                                &led_controller,
-                                &sse_tx,
-                                &dongle_tx,
-                                &last_proxied_rpm,
-                                &at_command_log,
+                                config,
+                                led_controller,
+                                sse_tx,
+                                dongle_tx,
+                                last_proxied_rpm,
+                                at_command_log,
                             )?;
                         }
                         
@@ -543,7 +551,6 @@ impl Obd2Proxy {
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
                     // Client timeout, keep connection alive
-                    continue;
                 }
                 Err(e) => {
                     error!("Error reading from client: {e:?}");

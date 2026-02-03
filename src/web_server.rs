@@ -664,10 +664,10 @@ const HTML_CAPTIVE_PORTAL: &str = r#"
 "#;
 
 pub fn start_server(
-    config: Arc<Mutex<Config>>,
-    _led_controller: Arc<Mutex<LedController>>,
-    wifi_mode: Arc<Mutex<WifiMode>>,
-    wifi: Arc<Mutex<BlockingWifi<EspWifi<'static>>>>,
+    config: &Arc<Mutex<Config>>,
+    _led_controller: &Arc<Mutex<LedController>>,
+    wifi_mode: &Arc<Mutex<WifiMode>>,
+    wifi: &Arc<Mutex<BlockingWifi<EspWifi<'static>>>>,
     ap_hostname: Option<String>,
     at_command_log: AtCommandLog,
 ) -> Result<()> {

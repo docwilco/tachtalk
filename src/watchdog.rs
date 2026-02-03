@@ -21,23 +21,24 @@ pub struct WatchdogHandle {
 impl WatchdogHandle {
     /// Register a new watchdog user with the given name.
     /// 
-    /// The name should be descriptive (e.g., "web_server", "obd2_proxy").
-    /// Returns None if registration fails.
-    pub fn register(name: &str) -> Option<Self> {
-        let c_name = CString::new(name).ok()?;
+    /// The name should be descriptive (e.g., `web_server`, `obd2_proxy`).
+    /// 
+    /// # Panics
+    /// Panics if registration fails (critical system error).
+    pub fn register(name: &str) -> Self {
+        let c_name = CString::new(name).expect("watchdog name contains NUL byte");
         let mut handle: esp_task_wdt_user_handle_t = std::ptr::null_mut();
         
         let result = unsafe { esp_task_wdt_add_user(c_name.as_ptr(), &mut handle) };
         
         if result == 0 {
             debug!("Watchdog: registered user '{name}'");
-            Some(Self {
+            Self {
                 handle,
                 c_name,
-            })
+            }
         } else {
-            error!("Watchdog: failed to register user '{name}': error code {result}");
-            None
+            panic!("Watchdog: failed to register user '{name}': error code {result}");
         }
     }
     

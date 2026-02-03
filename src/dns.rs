@@ -36,9 +36,7 @@ fn run_dns_server() -> std::io::Result<()> {
     let mut buf = [0u8; 512];
 
     loop {
-        if let Some(ref wd) = watchdog {
-            wd.feed();
-        }
+        watchdog.feed();
         
         let (len, src) = match socket.recv_from(&mut buf) {
             Ok(result) => result,

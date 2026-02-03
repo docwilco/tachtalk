@@ -10,7 +10,10 @@ use esp_idf_svc::wifi::{
     AccessPointConfiguration, AuthMethod, BlockingWifi, ClientConfiguration, Configuration,
     EspWifi, WifiDriver,
 };
-use esp_idf_svc::ipv4::{self, Ipv4Addr};
+use esp_idf_svc::ipv4::{
+    self, ClientConfiguration as IpClientConfiguration, ClientSettings as IpClientSettings,
+    Configuration as IpConfiguration, Ipv4Addr, Mask, Subnet,
+};
 use log::{debug, info, warn, error};
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
@@ -28,6 +31,28 @@ use leds::LedController;
 use obd2::{AtCommandLog, Obd2Proxy};
 
 const AP_SSID_PREFIX: &str = "TachTalk-";
+
+/// Convert a subnet mask string (e.g., "255.255.255.0") to CIDR prefix length (e.g., 24)
+fn subnet_mask_to_cidr(mask_str: &str) -> Result<u8> {
+    let mask: Ipv4Addr = mask_str.parse().map_err(|e| {
+        anyhow::anyhow!("Invalid subnet mask '{}': {}", mask_str, e)
+    })?;
+    let bits = u32::from(mask);
+    // Validate it's a valid mask (all 1s followed by all 0s)
+    let leading_ones = bits.leading_ones();
+    let expected = if leading_ones == 32 {
+        u32::MAX
+    } else {
+        u32::MAX << (32 - leading_ones)
+    };
+    if bits != expected {
+        return Err(anyhow::anyhow!(
+            "Invalid subnet mask '{}': not a valid mask (expected contiguous 1s)",
+            mask_str
+        ));
+    }
+    Ok(leading_ones as u8)
+}
 
 /// `WiFi` mode the device is running in
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -96,8 +121,46 @@ fn main() -> Result<()> {
     // Create WiFi driver
     let wifi_driver = WifiDriver::new(peripherals.modem, sys_loop.clone(), Some(nvs.clone()))?;
     
-    // Create STA netif with default config
-    let sta_netif = EspNetif::new(NetifStack::Sta)?;
+    // Create STA netif - static IP or DHCP based on config
+    let sta_netif = {
+        let cfg = config.lock().unwrap();
+        if cfg.ip.use_dhcp {
+            info!("STA netif: DHCP mode");
+            EspNetif::new(NetifStack::Sta)?
+        } else {
+            // Parse static IP configuration
+            let ip_str = cfg.ip.effective_ip().unwrap();
+            let gateway_str = cfg.ip.effective_gateway().unwrap();
+            let subnet_str = cfg.ip.effective_subnet().unwrap();
+            
+            let ip: Ipv4Addr = ip_str.parse().map_err(|e| {
+                anyhow::anyhow!("Invalid static IP '{}': {}", ip_str, e)
+            })?;
+            let gateway: Ipv4Addr = gateway_str.parse().map_err(|e| {
+                anyhow::anyhow!("Invalid gateway '{}': {}", gateway_str, e)
+            })?;
+            let mask = subnet_mask_to_cidr(subnet_str)?;
+            
+            // Parse optional DNS
+            let dns = cfg.ip.dns.as_ref().and_then(|s| s.parse().ok());
+            
+            info!("STA netif: Static IP {ip} gateway {gateway}/{mask} dns {dns:?}");
+            
+            let mut sta_config = NetifConfiguration::wifi_default_client();
+            sta_config.ip_configuration = Some(IpConfiguration::Client(
+                IpClientConfiguration::Fixed(IpClientSettings {
+                    ip,
+                    subnet: Subnet {
+                        gateway,
+                        mask: Mask(mask),
+                    },
+                    dns,
+                    secondary_dns: None,
+                }),
+            ));
+            EspNetif::new_with_conf(&sta_config)?
+        }
+    };
     
     // Create AP netif with custom router config that uses our IP as DNS
     // (default uses 8.8.8.8 which bypasses our captive portal DNS)
@@ -164,7 +227,7 @@ fn main() -> Result<()> {
         let at_cmd_log_clone = at_command_log.clone();
 
         std::thread::spawn(move || {
-            if let Err(e) = web_server::start_server(config_clone, led_clone, mode_clone, wifi_clone, Some(ap_hostname_clone), at_cmd_log_clone) {
+            if let Err(e) = web_server::start_server(&config_clone, &led_clone, &mode_clone, &wifi_clone, Some(ap_hostname_clone), at_cmd_log_clone) {
                 error!("Web server error: {e:?}");
             }
         });
@@ -243,12 +306,12 @@ fn main() -> Result<()> {
 
         std::thread::spawn(move || {
             wifi_connection_manager(
-                wifi_clone,
-                wifi_mode_clone,
-                sta_ssid,
-                sta_password,
-                ap_ssid.clone(),
-                ap_password.map(|s| s.to_string()),
+                &wifi_clone,
+                &wifi_mode_clone,
+                &sta_ssid,
+                &sta_password,
+                &ap_ssid,
+                ap_password,
                 auth_method,
             );
         });
@@ -268,11 +331,11 @@ fn main() -> Result<()> {
 /// - In Mixed mode: AP running, trying to connect to STA
 /// - In STA mode: Connected to STA, AP disabled
 fn wifi_connection_manager(
-    wifi: Arc<Mutex<BlockingWifi<EspWifi<'static>>>>,
-    wifi_mode: Arc<Mutex<WifiMode>>,
-    sta_ssid: String,
-    sta_password: String,
-    ap_ssid: String,
+    wifi: &Arc<Mutex<BlockingWifi<EspWifi<'static>>>>,
+    wifi_mode: &Arc<Mutex<WifiMode>>,
+    sta_ssid: &str,
+    sta_password: &str,
+    ap_ssid: &str,
     ap_password: Option<String>,
     ap_auth_method: AuthMethod,
 ) {
@@ -314,8 +377,8 @@ fn wifi_connection_manager(
                     // Switch to STA-only mode (disable AP)
                     let mut wifi = wifi.lock().unwrap();
                     if let Err(e) = wifi.set_configuration(&Configuration::Client(ClientConfiguration {
-                        ssid: sta_ssid.as_str().try_into().unwrap_or_default(),
-                        password: sta_password.as_str().try_into().unwrap_or_default(),
+                        ssid: sta_ssid.try_into().unwrap_or_default(),
+                        password: sta_password.try_into().unwrap_or_default(),
                         ..Default::default()
                     })) {
                         warn!("Failed to switch to STA-only mode: {e:?}");
@@ -345,12 +408,12 @@ fn wifi_connection_manager(
                     let mut wifi = wifi.lock().unwrap();
                     if let Err(e) = wifi.set_configuration(&Configuration::Mixed(
                         ClientConfiguration {
-                            ssid: sta_ssid.as_str().try_into().unwrap_or_default(),
-                            password: sta_password.as_str().try_into().unwrap_or_default(),
+                            ssid: sta_ssid.try_into().unwrap_or_default(),
+                            password: sta_password.try_into().unwrap_or_default(),
                             ..Default::default()
                         },
                         AccessPointConfiguration {
-                            ssid: ap_ssid.as_str().try_into().unwrap(),
+                            ssid: ap_ssid.try_into().unwrap(),
                             password: ap_pw.as_str().try_into().unwrap_or_default(),
                             auth_method: ap_auth_method,
                             channel: 1,
