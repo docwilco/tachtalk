@@ -3,142 +3,25 @@ use embedded_svc::http::Method;
 use embedded_svc::io::Write;
 use esp_idf_svc::http::server::{Configuration, EspHttpServer};
 use esp_idf_svc::wifi::{BlockingWifi, EspWifi};
-use log::{debug, info, error, warn};
-use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use log::{debug, error, info, warn};
 use std::sync::{Arc, Mutex};
-use std::os::unix::io::RawFd;
 
 use crate::config::Config;
 use crate::leds::LedController;
-use crate::watchdog::WatchdogHandle;
+use crate::sse_server::SSE_PORT;
 use crate::WifiMode;
 
-/// Message types for SSE manager
-pub enum SseMessage {
-    /// New SSE client connected (socket fd, done signal sender)
-    NewConnection(RawFd, Sender<()>),
-    /// RPM update to broadcast
-    RpmUpdate(u32),
-}
-
-/// Sender for SSE messages (new connections and RPM updates)
-pub type SseSender = Sender<SseMessage>;
-
-/// Create SSE channel and start the manager task
-pub fn start_sse_manager() -> SseSender {
-    let (tx, rx) = mpsc::channel::<SseMessage>();
-    
-    std::thread::spawn(move || {
-        sse_manager_task(rx);
-    });
-    
-    tx
-}
-
-/// SSE manager task - handles all SSE connections in a single thread
-fn sse_manager_task(rx: Receiver<SseMessage>) {
-    info!("SSE manager starting...");
-    
-    // Active connections: (socket fd, done signal sender)
-    let mut connections: Vec<(RawFd, Sender<()>)> = Vec::new();
-    let mut current_rpm: Option<u32> = None;
-    let mut last_heartbeat = std::time::Instant::now();
-    const HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
-    
-    let watchdog = WatchdogHandle::register("sse_manager");
-    
-    info!("SSE manager started");
-    
-    loop {
-        if let Some(ref wd) = watchdog {
-            wd.feed();
-        }
-        
-        // Send periodic heartbeat to detect dead connections
-        if last_heartbeat.elapsed() >= HEARTBEAT_INTERVAL && !connections.is_empty() {
-            let before = connections.len();
-            // SSE comment line as heartbeat (clients ignore lines starting with :)
-            connections.retain(|(fd, done_tx)| {
-                if write_to_fd(*fd, b": heartbeat\n\n").is_ok() {
-                    true
-                } else {
-                    debug!("SSE: Connection closed during heartbeat (fd={fd})");
-                    let _ = done_tx.send(());
-                    false
-                }
-            });
-            let removed = before - connections.len();
-            if removed > 0 {
-                info!("SSE: Heartbeat removed {removed} dead connections, {} remaining", connections.len());
-            }
-            last_heartbeat = std::time::Instant::now();
-        }
-        
-        // Non-blocking receive to handle multiple message types
-        match rx.try_recv() {
-            Ok(SseMessage::NewConnection(fd, done_tx)) => {
-                info!("SSE: New connection registered (fd={fd}, total={})", connections.len() + 1);
-                // Send current RPM to new client immediately
-                if let Some(rpm) = current_rpm {
-                    let msg = format!("data: {{\"rpm\":{rpm}}}\n\n");
-                    if write_to_fd(fd, msg.as_bytes()).is_err() {
-                        // Connection already dead, signal done
-                        let _ = done_tx.send(());
-                        continue;
-                    }
-                }
-                connections.push((fd, done_tx));
-            }
-            Ok(SseMessage::RpmUpdate(rpm)) => {
-                current_rpm = Some(rpm);
-                let msg = format!("data: {{\"rpm\":{rpm}}}\n\n");
-                
-                let before = connections.len();
-                // Broadcast to all connections, remove dead ones
-                connections.retain(|(fd, done_tx)| {
-                    if write_to_fd(*fd, msg.as_bytes()).is_ok() {
-                        true
-                    } else {
-                        debug!("SSE: Connection closed (fd={fd})");
-                        let _ = done_tx.send(());
-                        false
-                    }
-                });
-                let removed = before - connections.len();
-                if removed > 0 {
-                    debug!("SSE: Removed {removed} dead connections, {} remaining", connections.len());
-                }
-            }
-            Err(TryRecvError::Empty) => {
-                // No messages, sleep briefly
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
-            Err(TryRecvError::Disconnected) => {
-                info!("SSE: Manager channel disconnected, exiting");
-                break;
-            }
-        }
-    }
-}
-
-/// Write data to a raw file descriptor
-fn write_to_fd(fd: RawFd, data: &[u8]) -> std::io::Result<()> {
-    let written = unsafe {
-        esp_idf_svc::sys::write(fd, data.as_ptr().cast(), data.len())
-    };
-    if written < 0 {
-        Err(std::io::Error::last_os_error())
-    } else {
-        Ok(())
-    }
-}
-
-const HTML_INDEX: &str = r#"
+// HTML split into two parts to inject SSE_PORT without runtime allocation
+const HTML_INDEX_START: &str = r#"
 <!DOCTYPE html>
 <html>
 <head>
+    <meta charset="UTF-8">
     <title>TachTalk Configuration</title>
     <meta name="viewport" content="width=device-width, initial-scale=1">
+    <script>const SSE_PORT = "#;
+
+const HTML_INDEX_END: &str = r#";</script>
     <style>
         body {
             font-family: Arial, sans-serif;
@@ -656,7 +539,9 @@ const HTML_INDEX: &str = r#"
         }
 
         function setupRpmEventSource() {
-            const evtSource = new EventSource('/api/rpm/stream');
+            // SSE runs on a separate port to avoid blocking the HTTP server
+            const sseUrl = `http://${window.location.hostname}:${SSE_PORT}/`;
+            const evtSource = new EventSource(sseUrl);
             evtSource.onmessage = function(event) {
                 const data = JSON.parse(event.data);
                 document.getElementById('currentRpm').textContent = data.rpm !== null ? data.rpm : '---';
@@ -687,6 +572,7 @@ const HTML_CAPTIVE_PORTAL: &str = r#"
 <!DOCTYPE html>
 <html>
 <head>
+    <meta charset="UTF-8">
     <title>TachTalk Setup</title>
     <meta http-equiv="refresh" content="0;url=http://192.168.71.1/">
 </head>
@@ -701,7 +587,6 @@ pub fn start_server(
     _led_controller: Arc<Mutex<LedController>>,
     wifi_mode: Arc<Mutex<WifiMode>>,
     wifi: Arc<Mutex<BlockingWifi<EspWifi<'static>>>>,
-    sse_tx: SseSender,
     ap_hostname: Option<String>,
 ) -> Result<()> {
     info!("Web server starting...");
@@ -716,10 +601,12 @@ pub fn start_server(
     server_config.lru_purge_enable = true;
     let mut server = EspHttpServer::new(&server_config)?;
 
-    // Serve the main HTML page
+    // Serve the main HTML page (inject SSE port between two static parts)
     server.fn_handler("/", Method::Get, |req| -> Result<(), esp_idf_svc::io::EspIOError> {
         let mut response = req.into_ok_response()?;
-        response.write_all(HTML_INDEX.as_bytes())?;
+        response.write_all(HTML_INDEX_START.as_bytes())?;
+        response.write_all(SSE_PORT.to_string().as_bytes())?;
+        response.write_all(HTML_INDEX_END.as_bytes())?;
         Ok(())
     })?;
 
@@ -731,7 +618,6 @@ pub fn start_server(
         let mode_str = match *mode {
             WifiMode::AccessPoint => "ap",
             WifiMode::Client => "client",
-            WifiMode::Mixed => "mixed",
         };
         let json = format!(r#"{{"mode":"{mode_str}"}}"#);
         
@@ -936,47 +822,10 @@ pub fn start_server(
     // GET RPM endpoint (fallback for non-SSE clients)
     server.fn_handler("/api/rpm", Method::Get, |req| -> Result<(), esp_idf_svc::io::EspIOError> {
         info!("HTTP: GET /api/rpm");
-        // This is just a fallback, real updates come via SSE
+        // This is just a fallback, real updates come via SSE on port 8081
         let json = r#"{"rpm":null}"#;
         let mut response = req.into_ok_response()?;
         response.write_all(json.as_bytes())?;
-        Ok(())
-    })?;
-
-    // SSE endpoint for RPM streaming
-    let sse_tx_clone = sse_tx.clone();
-    server.fn_handler("/api/rpm/stream", Method::Get, move |req| -> Result<(), esp_idf_svc::io::EspIOError> {
-        info!("HTTP: GET /api/rpm/stream (SSE)");
-        // Send SSE headers
-        let mut response = req.into_response(200, Some("OK"), &[
-            ("Content-Type", "text/event-stream"),
-            ("Cache-Control", "no-cache"),
-            ("Connection", "keep-alive"),
-            ("Access-Control-Allow-Origin", "*"),
-        ])?;
-        
-        // Get the raw connection and its file descriptor
-        let conn = response.connection().raw_connection()?;
-        
-        // Send initial message
-        conn.write_all(b"data: {\"rpm\":null}\n\n")?;
-        
-        // Get the socket fd from the raw connection using RawHandle trait
-        use esp_idf_svc::handle::RawHandle;
-        let fd = unsafe { esp_idf_svc::sys::httpd_req_to_sockfd(conn.handle()) };
-        
-        // Create channel to be notified when connection is closed
-        let (done_tx, done_rx) = mpsc::channel::<()>();
-        
-        // Register this connection with the SSE manager
-        if sse_tx_clone.send(SseMessage::NewConnection(fd, done_tx)).is_err() {
-            return Ok(());
-        }
-        
-        // Block until the SSE manager signals that the connection is closed
-        // This keeps the HTTP handler alive so the connection stays open
-        let _ = done_rx.recv();
-        
         Ok(())
     })?;
 

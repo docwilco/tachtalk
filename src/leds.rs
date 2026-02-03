@@ -89,4 +89,28 @@ impl LedController {
         self.driver.write(leds.iter().copied())?;
         Ok(())
     }
+
+    /// Blink the RGB LED purple 3 times (250ms each) as a boot indicator
+    pub fn boot_animation(&mut self, total_leds: usize) -> Result<()> {
+        use std::thread::sleep;
+        use std::time::Duration;
+
+        let purple = RGB8::new(128, 0, 128);
+        let off = RGB8::default();
+        let blink_duration = Duration::from_millis(250);
+
+        for _ in 0..3 {
+            // On
+            let leds = vec![purple; total_leds];
+            self.write_leds(&leds)?;
+            sleep(blink_duration);
+
+            // Off
+            let leds = vec![off; total_leds];
+            self.write_leds(&leds)?;
+            sleep(blink_duration);
+        }
+
+        Ok(())
+    }
 }

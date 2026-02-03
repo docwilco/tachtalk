@@ -137,10 +137,16 @@ pub struct Config {
     pub total_leds: usize,
     #[serde(default = "default_led_gpio")]
     pub led_gpio: u8,
+    #[serde(default = "default_obd2_timeout_ms")]
+    pub obd2_timeout_ms: u64,
 }
 
 const fn default_led_gpio() -> u8 {
     48
+}
+
+const fn default_obd2_timeout_ms() -> u64 {
+    5000
 }
 
 impl Default for Config {
@@ -217,6 +223,7 @@ impl Default for Config {
             ],
             total_leds: 1,
             led_gpio: 48,
+            obd2_timeout_ms: 5000,
         }
     }
 }

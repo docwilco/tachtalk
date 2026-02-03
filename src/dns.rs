@@ -118,7 +118,7 @@ fn build_dns_response(query: &[u8]) -> Option<Vec<u8>> {
         return None;
     }
 
-    let qtype = u16::from_be_bytes([query[pos], query[pos + 1]]);
+    let _qtype = u16::from_be_bytes([query[pos], query[pos + 1]]);
     let qclass = u16::from_be_bytes([query[pos + 2], query[pos + 3]]);
     pos += 4;
 

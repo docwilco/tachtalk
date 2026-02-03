@@ -10,7 +10,7 @@ use anyhow::{Context, Result};
 use log::{debug, error, info, warn};
 use smallvec::SmallVec;
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -18,13 +18,14 @@ use std::time::{Duration, Instant};
 use crate::config::Config;
 use crate::leds::LedController;
 use crate::watchdog::WatchdogHandle;
-use crate::web_server::{SseMessage, SseSender};
+use crate::sse_server::{SseMessage, SseSender};
 
 pub const OBD2_PORT: u16 = 35000;
 const DONGLE_IP: &str = "192.168.0.10";
 const DONGLE_PORT: u16 = 35000;
 const IDLE_POLL_INTERVAL_MS: u64 = 100;
-const DONGLE_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long after a client RPM update before background poller resumes
+const CLIENT_ACTIVITY_BACKOFF: Duration = Duration::from_millis(500);
 const RECONNECT_DELAY: Duration = Duration::from_secs(1);
 
 /// Type alias for small OBD2 command/response buffers
@@ -63,16 +64,16 @@ impl std::error::Error for DongleError {}
 pub type DongleSender = Sender<DongleRequest>;
 
 /// Start the dongle task and return a sender for requests
-pub fn start_dongle_task() -> DongleSender {
+pub fn start_dongle_task(config: Arc<Mutex<Config>>) -> DongleSender {
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
-        dongle_task(rx);
+        dongle_task(rx, config);
     });
     tx
 }
 
 /// The dongle task - owns the connection and processes requests
-fn dongle_task(rx: Receiver<DongleRequest>) {
+fn dongle_task(rx: Receiver<DongleRequest>, config: Arc<Mutex<Config>>) {
     info!("OBD2 dongle task starting...");
     
     let mut connection: Option<TcpStream> = None;
@@ -86,9 +87,12 @@ fn dongle_task(rx: Receiver<DongleRequest>) {
             wd.feed();
         }
         
+        // Get timeout from config
+        let timeout = Duration::from_millis(config.lock().unwrap().obd2_timeout_ms);
+        
         // Try to ensure we have a connection
         if connection.is_none() {
-            connection = try_connect();
+            connection = try_connect(timeout);
         }
 
         // Process requests with a timeout so we can check connection health
@@ -96,7 +100,7 @@ fn dongle_task(rx: Receiver<DongleRequest>) {
             Ok(request) => {
                 debug!("Dongle request: {:?}", String::from_utf8_lossy(&request.command));
                 let result = if let Some(ref mut stream) = connection {
-                    execute_command(stream, &request.command)
+                    execute_command(stream, &request.command, timeout)
                 } else {
                     Err(DongleError::NotConnected)
                 };
@@ -128,10 +132,11 @@ fn dongle_task(rx: Receiver<DongleRequest>) {
 }
 
 /// Try to connect to the dongle and initialize it
-fn try_connect() -> Option<TcpStream> {
-    info!("Connecting to OBD2 dongle at {DONGLE_IP}:{DONGLE_PORT}");
+fn try_connect(timeout: Duration) -> Option<TcpStream> {
+    info!("Connecting to OBD2 dongle at {DONGLE_IP}:{DONGLE_PORT} (timeout: {}ms)", timeout.as_millis());
 
-    let stream = match TcpStream::connect(format!("{DONGLE_IP}:{DONGLE_PORT}")) {
+    let addr: SocketAddr = format!("{DONGLE_IP}:{DONGLE_PORT}").parse().ok()?;
+    let stream = match TcpStream::connect_timeout(&addr, timeout) {
         Ok(s) => s,
         Err(e) => {
             warn!("Failed to connect to dongle: {e}");
@@ -140,11 +145,11 @@ fn try_connect() -> Option<TcpStream> {
         }
     };
 
-    if let Err(e) = stream.set_read_timeout(Some(DONGLE_TIMEOUT)) {
+    if let Err(e) = stream.set_read_timeout(Some(timeout)) {
         error!("Failed to set read timeout: {e}");
         return None;
     }
-    if let Err(e) = stream.set_write_timeout(Some(DONGLE_TIMEOUT)) {
+    if let Err(e) = stream.set_write_timeout(Some(timeout)) {
         error!("Failed to set write timeout: {e}");
         return None;
     }
@@ -177,7 +182,7 @@ fn try_connect() -> Option<TcpStream> {
 }
 
 /// Execute a command on the dongle and return the response
-fn execute_command(stream: &mut TcpStream, command: &[u8]) -> Result<Obd2Buffer, DongleError> {
+fn execute_command(stream: &mut TcpStream, command: &[u8], timeout: Duration) -> Result<Obd2Buffer, DongleError> {
     // Send command with carriage return
     let mut cmd_with_cr: Obd2Buffer = command.into();
     if !cmd_with_cr.ends_with(b"\r") {
@@ -208,7 +213,7 @@ fn execute_command(stream: &mut TcpStream, command: &[u8]) -> Result<Obd2Buffer,
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                if start.elapsed() > DONGLE_TIMEOUT {
+                if start.elapsed() > timeout {
                     return Err(DongleError::Timeout);
                 }
                 std::thread::sleep(Duration::from_millis(10));
@@ -224,7 +229,7 @@ fn execute_command(stream: &mut TcpStream, command: &[u8]) -> Result<Obd2Buffer,
 }
 
 /// Send a command to the dongle and wait for response
-pub fn send_command(dongle_tx: &DongleSender, command: &[u8]) -> Result<Obd2Buffer, DongleError> {
+pub fn send_command(dongle_tx: &DongleSender, command: &[u8], timeout: Duration) -> Result<Obd2Buffer, DongleError> {
     let (response_tx, response_rx) = oneshot::channel();
     let request = DongleRequest {
         command: command.into(),
@@ -236,7 +241,7 @@ pub fn send_command(dongle_tx: &DongleSender, command: &[u8]) -> Result<Obd2Buff
         .map_err(|_| DongleError::NotConnected)?;
 
     response_rx
-        .recv_timeout(DONGLE_TIMEOUT)
+        .recv_timeout(timeout)
         .map_err(|_| DongleError::Timeout)?
 }
 
@@ -245,6 +250,8 @@ pub struct Obd2Proxy {
     led_controller: Arc<Mutex<LedController>>,
     sse_tx: SseSender,
     dongle_tx: DongleSender,
+    /// When the last RPM was proxied from a client (not background poller)
+    last_proxied_rpm: Arc<Mutex<Option<Instant>>>,
 }
 
 impl Obd2Proxy {
@@ -259,6 +266,7 @@ impl Obd2Proxy {
             led_controller,
             sse_tx,
             dongle_tx,
+            last_proxied_rpm: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -270,9 +278,10 @@ impl Obd2Proxy {
         let led_clone = self.led_controller.clone();
         let sse_tx_clone = self.sse_tx.clone();
         let dongle_tx_clone = self.dongle_tx.clone();
+        let last_proxied_rpm_clone = self.last_proxied_rpm.clone();
 
         std::thread::spawn(move || {
-            Self::background_poller(config_clone, led_clone, sse_tx_clone, dongle_tx_clone);
+            Self::background_poller(config_clone, led_clone, sse_tx_clone, dongle_tx_clone, last_proxied_rpm_clone);
         });
 
         // Start proxy server
@@ -297,10 +306,11 @@ impl Obd2Proxy {
                     let led_controller = self.led_controller.clone();
                     let sse_tx = self.sse_tx.clone();
                     let dongle_tx = self.dongle_tx.clone();
+                    let last_proxied_rpm = self.last_proxied_rpm.clone();
 
                     std::thread::spawn(move || {
                         if let Err(e) =
-                            Self::handle_client(stream, config, led_controller, sse_tx, dongle_tx)
+                            Self::handle_client(stream, config, led_controller, sse_tx, dongle_tx, last_proxied_rpm)
                         {
                             error!("Error handling client: {e:?}");
                         }
@@ -322,6 +332,7 @@ impl Obd2Proxy {
         led_controller: Arc<Mutex<LedController>>,
         sse_tx: SseSender,
         dongle_tx: DongleSender,
+        last_proxied_rpm: Arc<Mutex<Option<Instant>>>,
     ) {
         info!("Background RPM poller starting...");
         
@@ -336,10 +347,22 @@ impl Obd2Proxy {
             
             std::thread::sleep(Duration::from_millis(IDLE_POLL_INTERVAL_MS));
 
+            // Check if a client recently provided an RPM update
+            if let Some(last_update) = *last_proxied_rpm.lock().unwrap() {
+                if last_update.elapsed() < CLIENT_ACTIVITY_BACKOFF {
+                    // Client is actively polling, skip background poll
+                    continue;
+                }
+            }
+
+            // Get timeout from config
+            let timeout = Duration::from_millis(config.lock().unwrap().obd2_timeout_ms);
+
             // Request RPM from dongle
-            if let Ok(response) = send_command(&dongle_tx, b"010C") {
+            if let Ok(response) = send_command(&dongle_tx, b"010C", timeout) {
                 if let Some(rpm) = Self::extract_rpm_from_response(&response) {
                     debug!("Polled RPM: {rpm}");
+                    
                     // Send to SSE clients
                     let _ = sse_tx.send(SseMessage::RpmUpdate(rpm));
 
@@ -359,6 +382,7 @@ impl Obd2Proxy {
         led_controller: Arc<Mutex<LedController>>,
         sse_tx: SseSender,
         dongle_tx: DongleSender,
+        last_proxied_rpm: Arc<Mutex<Option<Instant>>>,
     ) -> Result<()> {
         let peer = client_stream.peer_addr()?;
         info!("OBD2 client connected: {peer}");
@@ -392,12 +416,19 @@ impl Obd2Proxy {
                         continue;
                     }
 
+                    // Get timeout from config
+                    let timeout = Duration::from_millis(config.lock().unwrap().obd2_timeout_ms);
+
                     // Forward OBD2 command to dongle task
-                    match send_command(&dongle_tx, request) {
+                    match send_command(&dongle_tx, request, timeout) {
                         Ok(response) => {
                             // Extract RPM if this was an RPM request
                             if let Some(rpm) = Self::extract_rpm_from_response(&response) {
                                 debug!("Client RPM request: {rpm}");
+                                
+                                // Record that client provided an RPM update
+                                *last_proxied_rpm.lock().unwrap() = Some(Instant::now());
+                                
                                 let _ = sse_tx.send(SseMessage::RpmUpdate(rpm));
 
                                 if let Ok(mut led) = led_controller.lock() {

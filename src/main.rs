@@ -11,13 +11,14 @@ use esp_idf_svc::wifi::{
     EspWifi, WifiDriver,
 };
 use esp_idf_svc::ipv4::{self, Ipv4Addr};
-use log::{info, warn, error};
+use log::{debug, info, warn, error};
 use std::sync::{Arc, Mutex};
 
 mod config;
 mod dns;
 mod leds;
 mod obd2;
+mod sse_server;
 mod watchdog;
 mod web_server;
 
@@ -28,14 +29,12 @@ use obd2::Obd2Proxy;
 const AP_SSID_PREFIX: &str = "TachTalk-";
 
 /// `WiFi` mode the device is running in
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 pub enum WifiMode {
-    /// Connected to a configured network as a client
-    Client,
-    /// Running as an access point for configuration
+    /// Running as an access point (no STA configured or STA disconnected)
     AccessPoint,
-    /// Mixed mode: AP running while attempting to connect to configured network
-    Mixed,
+    /// Connected to a configured network as a client (AP disabled)
+    Client,
 }
 
 fn main() -> Result<()> {
@@ -84,6 +83,12 @@ fn main() -> Result<()> {
         peripherals.rmt.channel0,
     )?));
 
+    // Boot animation: blink purple 3 times
+    {
+        let total_leds = config.lock().unwrap().total_leds;
+        led_controller.lock().unwrap().boot_animation(total_leds)?;
+    }
+
     // Initialize WiFi with custom AP configuration for captive portal DNS
     info!("Initializing WiFi...");
     
@@ -112,123 +117,137 @@ fn main() -> Result<()> {
     let wifi = EspWifi::wrap_all(wifi_driver, sta_netif, ap_netif)?;
     let mut wifi = BlockingWifi::wrap(wifi, sys_loop)?;
 
-    // Check if WiFi is configured
+    // Generate AP SSID from MAC address
+    let mac = wifi.wifi().sta_netif().get_mac()?;
+    let ap_ssid = format!("{}{:02X}{:02X}", AP_SSID_PREFIX, mac[4], mac[5]);
+    let ap_hostname = ap_ssid.to_lowercase();
+
+    // Get AP password from config
+    let ap_password = config.lock().unwrap().ap_password.clone();
+    let (auth_method, ap_pw) = match &ap_password {
+        Some(pw) if !pw.is_empty() => (AuthMethod::WPA2Personal, pw.as_str()),
+        _ => (AuthMethod::None, ""),
+    };
+
+    // Start AP immediately so web UI is accessible right away
+    info!("Starting Access Point: {ap_ssid}");
+    wifi.set_configuration(&Configuration::AccessPoint(AccessPointConfiguration {
+        ssid: ap_ssid.as_str().try_into().unwrap(),
+        password: ap_pw.try_into().unwrap_or_default(),
+        auth_method,
+        channel: 1,
+        ..Default::default()
+    }))?;
+    wifi.start()?;
+
+    let ap_ip_info = wifi.wifi().ap_netif().get_ip_info()?;
+    info!("AP started - connect to '{ap_ssid}' and navigate to http://{}", ap_ip_info.ip);
+
+    // Start DNS server for captive portal
+    dns::start_dns_server();
+
+    // Start SSE server for RPM streaming (on port 8081)
+    let sse_tx = sse_server::start_sse_server();
+
+    // Start web server immediately
+    let wifi = Arc::new(Mutex::new(wifi));
+    {
+        let config_clone = config.clone();
+        let led_clone = led_controller.clone();
+        let mode_clone = wifi_mode.clone();
+        let wifi_clone = wifi.clone();
+        let ap_hostname_clone = ap_hostname.clone();
+
+        std::thread::spawn(move || {
+            if let Err(e) = web_server::start_server(config_clone, led_clone, mode_clone, wifi_clone, Some(ap_hostname_clone)) {
+                error!("Web server error: {e:?}");
+            }
+        });
+    }
+
+    info!("Web server started - configuration available at http://{}", ap_ip_info.ip);
+
+    // Start mDNS for local discovery (tachtalk.local)
+    let _mdns = match EspMdns::take() {
+        Ok(mut m) => {
+            let _ = m.set_hostname("tachtalk");
+            let _ = m.set_instance_name("TachTalk Tachometer");
+            let _ = m.add_service(None, "_http", "_tcp", 80, &[]);
+            info!("mDNS started: tachtalk.local");
+            Some(m)
+        }
+        Err(e) => {
+            warn!("Failed to start mDNS: {e:?}");
+            None
+        }
+    };
+
+    // Start OBD2 proxy (handles reconnection internally)
+    let dongle_tx = obd2::start_dongle_task(config.clone());
+    {
+        let config_clone = config.clone();
+        let led_clone = led_controller.clone();
+        let sse_tx_clone = sse_tx.clone();
+        
+        std::thread::spawn(move || {
+            let proxy = Obd2Proxy::new(config_clone, led_clone, sse_tx_clone, dongle_tx);
+            if let Err(e) = proxy.run() {
+                error!("OBD2 proxy error: {e:?}");
+            }
+        });
+    }
+    info!("OBD2 proxy started");
+
+    // Check if WiFi STA is configured and switch to Mixed mode if so
     let wifi_configured = {
         let cfg = config.lock().unwrap();
         cfg.wifi.is_configured()
     };
 
-    let current_mode = if wifi_configured {
-        // Try to connect to configured network
-        let (ssid, password, ap_password) = {
+    if wifi_configured {
+        let (sta_ssid, sta_password) = {
             let cfg = config.lock().unwrap();
-            (cfg.wifi.ssid.clone(), cfg.wifi.password.clone().unwrap_or_default(), cfg.ap_password.clone())
+            (cfg.wifi.ssid.clone(), cfg.wifi.password.clone().unwrap_or_default())
         };
 
-        info!("Attempting to connect to WiFi: {ssid}");
+        info!("WiFi configured for '{sta_ssid}' - switching to Mixed mode");
 
-        wifi.set_configuration(&Configuration::Client(ClientConfiguration {
-            ssid: ssid.as_str().try_into().unwrap_or_default(),
-            password: password.as_str().try_into().unwrap_or_default(),
-            ..Default::default()
-        }))?;
-
-        wifi.start()?;
-
-        match wifi.connect() {
-            Ok(()) => {
-                info!("WiFi connected");
-                if let Err(e) = wifi.wait_netif_up() {
-                    warn!("Failed to get IP: {e:?}, starting mixed mode");
-                    start_mixed_mode(&mut wifi, ap_password, &ssid, &password)?
-                } else {
-                    let ip_info = wifi.wifi().sta_netif().get_ip_info()?;
-                    info!("WiFi IP Info: {ip_info:?}");
-                    WifiMode::Client
-                }
-            }
-            Err(e) => {
-                warn!("WiFi connection failed: {e:?}, starting mixed mode");
-                start_mixed_mode(&mut wifi, ap_password, &ssid, &password)?
-            }
+        // Switch to Mixed mode so we can try STA while keeping AP running
+        {
+            let mut wifi = wifi.lock().unwrap();
+            wifi.set_configuration(&Configuration::Mixed(
+                ClientConfiguration {
+                    ssid: sta_ssid.as_str().try_into().unwrap_or_default(),
+                    password: sta_password.as_str().try_into().unwrap_or_default(),
+                    ..Default::default()
+                },
+                AccessPointConfiguration {
+                    ssid: ap_ssid.as_str().try_into().unwrap(),
+                    password: ap_pw.try_into().unwrap_or_default(),
+                    auth_method,
+                    channel: 1,
+                    ..Default::default()
+                },
+            ))?;
         }
-    } else {
-        info!("No WiFi configured, starting AP mode");
-        let ap_password = config.lock().unwrap().ap_password.clone();
-        start_ap_mode(&mut wifi, ap_password)?
-    };
 
-    *wifi_mode.lock().unwrap() = current_mode;
-
-    // Start mDNS service in client mode for tachtalk.local access
-    let _mdns = if current_mode == WifiMode::Client {
-        match EspMdns::take() {
-            Ok(mut mdns) => {
-                if let Err(e) = mdns.set_hostname("tachtalk") {
-                    warn!("Failed to set mDNS hostname: {e:?}");
-                } else if let Err(e) = mdns.set_instance_name("TachTalk Tachometer") {
-                    warn!("Failed to set mDNS instance name: {e:?}");
-                } else if let Err(e) = mdns.add_service(None, "_http", "_tcp", 80, &[]) {
-                    warn!("Failed to add mDNS HTTP service: {e:?}");
-                } else {
-                    info!("mDNS started: tachtalk.local");
-                }
-                Some(mdns)
-            }
-            Err(e) => {
-                warn!("Failed to initialize mDNS: {e:?}");
-                None
-            }
-        }
-    } else {
-        None
-    };
-
-    // Get the AP hostname for captive portal (used in AP and Mixed modes)
-    let ap_hostname = if current_mode == WifiMode::AccessPoint || current_mode == WifiMode::Mixed {
-        let mac = wifi.wifi().sta_netif().get_mac().unwrap_or([0u8; 6]);
-        let hostname = format!("{}{:02X}{:02X}", AP_SSID_PREFIX, mac[4], mac[5]).to_lowercase();
-        
-        // Start DNS server for captive portal
-        dns::start_dns_server();
-        
-        Some(hostname)
-    } else {
-        None
-    };
-
-    // Start SSE manager for RPM streaming
-    let sse_tx = web_server::start_sse_manager();
-
-    // Start web server
-    let config_clone = config.clone();
-    let led_clone = led_controller.clone();
-    let mode_clone = wifi_mode.clone();
-    let wifi = Arc::new(Mutex::new(wifi));
-    let wifi_clone = wifi.clone();
-    let sse_tx_clone = sse_tx.clone();
-
-    std::thread::spawn(move || {
-        if let Err(e) = web_server::start_server(config_clone, led_clone, mode_clone, wifi_clone, sse_tx_clone, ap_hostname) {
-            error!("Web server error: {e:?}");
-        }
-    });
-
-    // Only start OBD2 proxy in client mode
-    if current_mode == WifiMode::Client {
-        let dongle_tx = obd2::start_dongle_task();
-
-        let config_clone = config.clone();
-        let led_clone = led_controller.clone();
-        let proxy = Obd2Proxy::new(config_clone, led_clone, sse_tx, dongle_tx);
+        // Spawn background task to manage WiFi connection
+        let wifi_clone = wifi.clone();
+        let wifi_mode_clone = wifi_mode.clone();
 
         std::thread::spawn(move || {
-            if let Err(e) = proxy.run() {
-                error!("OBD2 proxy error: {e:?}");
-            }
+            wifi_connection_manager(
+                wifi_clone,
+                wifi_mode_clone,
+                sta_ssid,
+                sta_password,
+                ap_ssid.clone(),
+                ap_password.map(|s| s.to_string()),
+                auth_method,
+            );
         });
     } else {
-        info!("OBD2 proxy disabled in AP mode - configure WiFi first");
+        info!("No WiFi configured - AP mode only. Configure WiFi via web UI.");
     }
 
     info!("All systems running!");
@@ -239,93 +258,106 @@ fn main() -> Result<()> {
     }
 }
 
-fn start_ap_mode(wifi: &mut BlockingWifi<EspWifi<'static>>, ap_password: Option<String>) -> Result<WifiMode> {
-    // Generate SSID from MAC address
-    let mac = wifi.wifi().sta_netif().get_mac()?;
-    let ssid = format!("{}{:02X}{:02X}", AP_SSID_PREFIX, mac[4], mac[5]);
-    
-    let (auth_method, password_display, password) = match ap_password {
-        Some(ref pw) if !pw.is_empty() => (
-            AuthMethod::WPA2Personal,
-            format!("password: {pw}"),
-            pw.as_str(),
-        ),
-        _ => (AuthMethod::None, "open network".to_string(), ""),
-    };
-    
-    info!("Starting Access Point: {ssid} ({password_display})");
-
-    wifi.set_configuration(&Configuration::AccessPoint(AccessPointConfiguration {
-        ssid: ssid.as_str().try_into().unwrap(),
-        password: password.try_into().unwrap_or_default(),
-        auth_method,
-        channel: 1,
-        ..Default::default()
-    }))?;
-
-    wifi.start()?;
-
-    let ip_info = wifi.wifi().ap_netif().get_ip_info()?;
-    info!("AP started - connect to '{}' and navigate to http://{}", ssid, ip_info.ip);
-
-    Ok(WifiMode::AccessPoint)
-}
-
-/// Start mixed mode: AP + STA attempting to connect to configured network
-fn start_mixed_mode(
-    wifi: &mut BlockingWifi<EspWifi<'static>>,
+/// Background task to manage WiFi STA connection
+/// - In Mixed mode: AP running, trying to connect to STA
+/// - In STA mode: Connected to STA, AP disabled
+fn wifi_connection_manager(
+    wifi: Arc<Mutex<BlockingWifi<EspWifi<'static>>>>,
+    wifi_mode: Arc<Mutex<WifiMode>>,
+    sta_ssid: String,
+    sta_password: String,
+    ap_ssid: String,
     ap_password: Option<String>,
-    sta_ssid: &str,
-    sta_password: &str,
-) -> Result<WifiMode> {
-    // Generate AP SSID from MAC address
-    let mac = wifi.wifi().sta_netif().get_mac()?;
-    let ap_ssid = format!("{}{:02X}{:02X}", AP_SSID_PREFIX, mac[4], mac[5]);
-    
-    let (auth_method, password_display, ap_pw) = match ap_password {
-        Some(ref pw) if !pw.is_empty() => (
-            AuthMethod::WPA2Personal,
-            format!("password: {pw}"),
-            pw.as_str(),
-        ),
-        _ => (AuthMethod::None, "open network".to_string(), ""),
-    };
-    
-    info!("Starting Mixed Mode: AP '{ap_ssid}' ({password_display}) + STA connecting to '{sta_ssid}'");
+    ap_auth_method: AuthMethod,
+) {
+    let ap_pw = ap_password.unwrap_or_default();
 
-    wifi.set_configuration(&Configuration::Mixed(
-        ClientConfiguration {
-            ssid: sta_ssid.try_into().unwrap_or_default(),
-            password: sta_password.try_into().unwrap_or_default(),
-            ..Default::default()
-        },
-        AccessPointConfiguration {
-            ssid: ap_ssid.as_str().try_into().unwrap(),
-            password: ap_pw.try_into().unwrap_or_default(),
-            auth_method,
-            channel: 1,
-            ..Default::default()
-        },
-    ))?;
+    loop {
+        let current_mode = *wifi_mode.lock().unwrap();
 
-    wifi.start()?;
+        match current_mode {
+            WifiMode::AccessPoint => {
+                // We're in Mixed mode (AP + trying STA) - try to connect
+                debug!("Attempting STA connection to '{sta_ssid}'");
+                
+                let connected = {
+                    let mut wifi = wifi.lock().unwrap();
+                    
+                    // Just call connect() - don't reconfigure, we're already in Mixed mode
+                    match wifi.connect() {
+                        Ok(()) => {
+                            if wifi.wait_netif_up().is_ok() {
+                                if let Ok(ip_info) = wifi.wifi().sta_netif().get_ip_info() {
+                                    info!("WiFi STA connected to '{sta_ssid}' with IP: {}", ip_info.ip);
+                                    true
+                                } else {
+                                    false
+                                }
+                            } else {
+                                false
+                            }
+                        }
+                        Err(e) => {
+                            debug!("STA connection attempt failed: {e:?}");
+                            false
+                        }
+                    }
+                };
 
-    let ap_ip_info = wifi.wifi().ap_netif().get_ip_info()?;
-    info!("AP started - connect to '{}' and navigate to http://{}", ap_ssid, ap_ip_info.ip);
+                if connected {
+                    // Switch to STA-only mode (disable AP)
+                    let mut wifi = wifi.lock().unwrap();
+                    if let Err(e) = wifi.set_configuration(&Configuration::Client(ClientConfiguration {
+                        ssid: sta_ssid.as_str().try_into().unwrap_or_default(),
+                        password: sta_password.as_str().try_into().unwrap_or_default(),
+                        ..Default::default()
+                    })) {
+                        warn!("Failed to switch to STA-only mode: {e:?}");
+                    } else {
+                        info!("Switched to STA-only mode (AP disabled)");
+                        *wifi_mode.lock().unwrap() = WifiMode::Client;
+                    }
+                } else {
+                    // Still not connected, wait before retrying
+                    FreeRtos::delay_ms(10000);
+                }
+            }
 
-    // Try to connect to STA in background (non-blocking for initial startup)
-    match wifi.connect() {
-        Ok(()) => {
-            info!("WiFi STA connected in mixed mode");
-            if let Ok(()) = wifi.wait_netif_up() {
-                let sta_ip_info = wifi.wifi().sta_netif().get_ip_info()?;
-                info!("WiFi STA IP Info: {sta_ip_info:?}");
+            WifiMode::Client => {
+                // We're in STA-only mode - monitor connection
+                FreeRtos::delay_ms(1000);
+                
+                let connected = {
+                    let wifi = wifi.lock().unwrap();
+                    wifi.is_connected().unwrap_or(false)
+                };
+                
+                if !connected {
+                    warn!("WiFi STA disconnected from '{sta_ssid}' - switching back to Mixed mode");
+                    
+                    // Switch back to Mixed mode (re-enable AP)
+                    let mut wifi = wifi.lock().unwrap();
+                    if let Err(e) = wifi.set_configuration(&Configuration::Mixed(
+                        ClientConfiguration {
+                            ssid: sta_ssid.as_str().try_into().unwrap_or_default(),
+                            password: sta_password.as_str().try_into().unwrap_or_default(),
+                            ..Default::default()
+                        },
+                        AccessPointConfiguration {
+                            ssid: ap_ssid.as_str().try_into().unwrap(),
+                            password: ap_pw.as_str().try_into().unwrap_or_default(),
+                            auth_method: ap_auth_method,
+                            channel: 1,
+                            ..Default::default()
+                        },
+                    )) {
+                        warn!("Failed to switch to Mixed mode: {e:?}");
+                    } else {
+                        info!("Switched to Mixed mode (AP re-enabled)");
+                        *wifi_mode.lock().unwrap() = WifiMode::AccessPoint;
+                    }
+                }
             }
         }
-        Err(e) => {
-            warn!("WiFi STA connection failed in mixed mode: {e:?} - AP still running");
-        }
     }
-
-    Ok(WifiMode::Mixed)
 }
