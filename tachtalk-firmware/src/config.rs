@@ -2,8 +2,10 @@ use anyhow::{anyhow, Result};
 use esp_idf_svc::nvs::{EspNvs, EspNvsPartition, NvsDefault};
 use log::{debug, info, warn, LevelFilter};
 use serde::{Deserialize, Serialize};
-use smart_leds::RGB8;
 use std::sync::Mutex;
+
+// Re-export shift-lights types for use in the firmware
+pub use tachtalk_shift_lights_lib::{RGB8, ThresholdConfig};
 
 /// Configurable log level
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq)]
@@ -42,41 +44,6 @@ pub fn init_nvs(nvs_partition: EspNvsPartition<NvsDefault>) -> Result<()> {
     *NVS.lock().unwrap() = Some(nvs);
     info!("NVS initialized");
     Ok(())
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ThresholdConfig {
-    pub name: String,
-    pub rpm: u32,
-    pub start_led: usize,
-    pub end_led: usize,
-    pub color: RGB8Color,
-    pub blink: bool,
-    #[serde(default = "default_blink_ms")]
-    pub blink_ms: u32,
-}
-
-const fn default_blink_ms() -> u32 {
-    500
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RGB8Color {
-    pub r: u8,
-    pub g: u8,
-    pub b: u8,
-}
-
-impl From<RGB8Color> for RGB8 {
-    fn from(c: RGB8Color) -> Self {
-        RGB8 { r: c.r, g: c.g, b: c.b }
-    }
-}
-
-impl From<RGB8> for RGB8Color {
-    fn from(c: RGB8) -> Self {
-        RGB8Color { r: c.r, g: c.g, b: c.b }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -226,7 +193,7 @@ impl Default for Config {
                     rpm: 0,
                     start_led: 0,
                     end_led: 0,
-                    color: RGB8Color { r: 0, g: 0, b: 0 },
+                    color: RGB8::new(0, 0, 0),
                     blink: false,
                     blink_ms: 500,
                 },
@@ -235,7 +202,7 @@ impl Default for Config {
                     rpm: 1000,
                     start_led: 0,
                     end_led: 0,
-                    color: RGB8Color { r: 0, g: 0, b: 255 },
+                    color: RGB8::new(0, 0, 255),
                     blink: false,
                     blink_ms: 500,
                 },
@@ -244,7 +211,7 @@ impl Default for Config {
                     rpm: 1500,
                     start_led: 0,
                     end_led: 0,
-                    color: RGB8Color { r: 0, g: 255, b: 0 },
+                    color: RGB8::new(0, 255, 0),
                     blink: false,
                     blink_ms: 500,
                 },
@@ -253,7 +220,7 @@ impl Default for Config {
                     rpm: 2000,
                     start_led: 0,
                     end_led: 0,
-                    color: RGB8Color { r: 255, g: 255, b: 0 },
+                    color: RGB8::new(255, 255, 0),
                     blink: false,
                     blink_ms: 500,
                 },
@@ -262,7 +229,7 @@ impl Default for Config {
                     rpm: 2500,
                     start_led: 0,
                     end_led: 0,
-                    color: RGB8Color { r: 255, g: 0, b: 0 },
+                    color: RGB8::new(255, 0, 0),
                     blink: false,
                     blink_ms: 500,
                 },
@@ -271,7 +238,7 @@ impl Default for Config {
                     rpm: 3000,
                     start_led: 0,
                     end_led: 0,
-                    color: RGB8Color { r: 0, g: 0, b: 0 },
+                    color: RGB8::new(0, 0, 0),
                     blink: false,
                     blink_ms: 500,
                 },
@@ -280,7 +247,7 @@ impl Default for Config {
                     rpm: 3000,
                     start_led: 0,
                     end_led: 0,
-                    color: RGB8Color { r: 0, g: 0, b: 255 },
+                    color: RGB8::new(0, 0, 255),
                     blink: true,
                     blink_ms: 500,
                 },

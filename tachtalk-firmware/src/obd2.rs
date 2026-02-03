@@ -4,7 +4,7 @@
 //! - Dongle task: owns the single TCP connection to the OBD2 dongle, handles
 //!   connection setup, reconnection, and processes OBD2 data commands
 //! - Proxy server: accepts client connections, forwards OBD2 commands via channel
-//! - AT commands (ATE0, ATZ, etc.) are handled locally per connection
+//! - AT commands (ATE0, ATZ, etc.) are handled locally per connection using tachtalk_elm327
 
 use anyhow::{Context, Result};
 use log::{debug, error, info, warn};
@@ -15,6 +15,7 @@ use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use tachtalk_elm327_lib::ClientState;
 
 use crate::config::Config;
 use crate::leds::LedController;
@@ -46,21 +47,6 @@ pub struct DongleRequest {
     pub response_tx: oneshot::Sender<Result<Obd2Buffer, DongleError>>,
 }
 
-/// Per-connection client state (ELM327 settings)
-#[derive(Debug, Clone)]
-#[allow(clippy::struct_excessive_bools)] // These are independent ELM327 protocol flags
-struct ClientState {
-    /// Echo received characters back (ATE0/ATE1)
-    echo_enabled: bool,
-    /// Add linefeeds after carriage returns (ATL0/ATL1)
-    linefeeds_enabled: bool,
-    /// Print spaces between response bytes (ATS0/ATS1)
-    spaces_enabled: bool,
-    /// Show header bytes in responses (ATH0/ATH1)
-    // TODO: Actually use this when formatting OBD2 responses
-    headers_enabled: bool,
-}
-
 /// Shared context for processing OBD2 commands (reduces parameter count)
 struct CommandContext<'a> {
     config: &'a Arc<Mutex<Config>>,
@@ -68,56 +54,6 @@ struct CommandContext<'a> {
     dongle_tx: &'a DongleSender,
     at_command_log: &'a AtCommandLog,
     pid_log: &'a PidLog,
-}
-
-impl Default for ClientState {
-    fn default() -> Self {
-        Self {
-            echo_enabled: true,
-            linefeeds_enabled: true,
-            spaces_enabled: true,
-            headers_enabled: false,
-        }
-    }
-}
-
-impl ClientState {
-    /// Format a line ending based on current settings
-    fn line_ending(&self) -> &'static str {
-        if self.linefeeds_enabled { "\r\n" } else { "\r" }
-    }
-
-    /// Format a dongle response according to client settings
-    /// The dongle sends compact hex (no spaces), so we add spaces if enabled
-    fn format_response(&self, response: &[u8]) -> Vec<u8> {
-        if !self.spaces_enabled {
-            // No formatting needed, return as-is
-            return response.to_vec();
-        }
-
-        let mut result = Vec::with_capacity(response.len() * 3 / 2);
-        let mut hex_count = 0;
-
-        for &byte in response {
-            // Check if this is a hex digit
-            let is_hex = byte.is_ascii_hexdigit();
-
-            if is_hex {
-                // Add space before every pair of hex digits (except the first)
-                if hex_count > 0 && hex_count % 2 == 0 {
-                    result.push(b' ');
-                }
-                hex_count += 1;
-            } else {
-                // Reset hex count on non-hex (line endings, prompt, etc.)
-                hex_count = 0;
-            }
-
-            result.push(byte);
-        }
-
-        result
-    }
 }
 
 /// Errors from the dongle task
@@ -438,7 +374,7 @@ pub fn start_rpm_led_task(
                         );
                         
                         if let Ok(response) = send_command(&dongle_tx, b"010C", timeout) {
-                            if let Some(rpm) = extract_rpm_from_response(&response) {
+                            if let Some(rpm) = tachtalk_elm327_lib::extract_rpm_from_response(&response) {
                                 debug!("Polled RPM: {rpm}");
                                 current_rpm = Some(rpm);
                             }
@@ -463,11 +399,6 @@ pub fn start_rpm_led_task(
     });
 
     rpm_tx
-}
-
-/// Extract RPM from an OBD2 response (standalone function for use by the task)
-fn extract_rpm_from_response(response: &[u8]) -> Option<u32> {
-    Obd2Proxy::extract_rpm_from_response(response)
 }
 
 pub struct Obd2Proxy {
@@ -652,7 +583,7 @@ impl Obd2Proxy {
                 log.insert(command.to_uppercase());
             }
             
-            let response = Self::handle_at_command(command, state);
+            let response = state.handle_at_command(command);
             writer
                 .write_all(response.as_bytes())
                 .context("Failed to write AT response")?;
@@ -671,7 +602,7 @@ impl Obd2Proxy {
         match send_command(ctx.dongle_tx, raw_command, timeout) {
             Ok(response) => {
                 // Extract RPM if this was an RPM request - send to RPM/LED task
-                if let Some(rpm) = Self::extract_rpm_from_response(&response) {
+                if let Some(rpm) = tachtalk_elm327_lib::extract_rpm_from_response(&response) {
                     debug!("Client RPM request: {rpm}");
                     let _ = ctx.rpm_tx.send(rpm);
                 }
@@ -693,90 +624,5 @@ impl Obd2Proxy {
         }
 
         Ok(())
-    }
-
-    /// Handle AT commands locally (per-connection state)
-    /// Echo has already been sent character-by-character, so responses don't include it
-    fn handle_at_command(command: &str, state: &mut ClientState) -> String {
-        let cmd = command.to_uppercase();
-        let le = state.line_ending();
-        
-        // Determine response content (without line endings)
-        let response_text = match cmd.as_str() {
-            "ATZ" => {
-                // Reset all settings to defaults
-                *state = ClientState::default();
-                // Use new state's line ending for response
-                let le = state.line_ending();
-                return format!("{le}ELM327 v1.5{le}>");
-            }
-            "ATE0" => {
-                state.echo_enabled = false;
-                "OK"
-            }
-            "ATE1" => {
-                state.echo_enabled = true;
-                "OK"
-            }
-            "ATL0" => {
-                state.linefeeds_enabled = false;
-                "OK"
-            }
-            "ATL1" => {
-                state.linefeeds_enabled = true;
-                "OK"
-            }
-            "ATS0" => {
-                state.spaces_enabled = false;
-                "OK"
-            }
-            "ATS1" => {
-                state.spaces_enabled = true;
-                "OK"
-            }
-            "ATH0" => {
-                state.headers_enabled = false;
-                "OK"
-            }
-            "ATH1" => {
-                state.headers_enabled = true;
-                "OK"
-            }
-            "ATSP0" | "ATAT1" | "ATAT2" => "OK",
-            _ if cmd.starts_with("ATSP") => "OK",
-            _ if cmd.starts_with("ATST") => "OK",
-            _ if cmd.starts_with("ATAT") => "OK",
-            "ATI" => "ELM327 v1.5",
-            "AT@1" => "TachTalk OBD2 Proxy",
-            _ => "?",
-        };
-
-        // Build response with proper line endings (echo already sent)
-        // Note: for commands that change linefeed setting, we use the OLD setting
-        // since le was captured before the match
-        format!("{le}{response_text}{le}>")
-    }
-
-    fn extract_rpm_from_response(data: &[u8]) -> Option<u32> {
-        // OBD2 response format for RPM (PID 0C): "41 0C XX XX" or "410CXX XX"
-        // RPM = ((A * 256) + B) / 4
-        let text = std::str::from_utf8(data).ok()?;
-
-        // Look for "41 0C" or "410C" pattern
-        let text_upper = text.to_uppercase();
-        if let Some(pos) = text_upper.find("410C") {
-            let after = &text_upper[pos + 4..];
-            // Try to parse hex bytes (with or without spaces)
-            let hex_chars: String = after.chars().filter(char::is_ascii_hexdigit).collect();
-
-            if hex_chars.len() >= 4 {
-                let a = u32::from_str_radix(&hex_chars[0..2], 16).ok()?;
-                let b = u32::from_str_radix(&hex_chars[2..4], 16).ok()?;
-                let rpm = ((a * 256) + b) / 4;
-                return Some(rpm);
-            }
-        }
-
-        None
     }
 }

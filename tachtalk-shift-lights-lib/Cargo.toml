@@ -1,0 +1,10 @@
+[package]
+name = "tachtalk-shift-lights-lib"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rgb = { version = "0.8", features = ["serde"] }
+serde = { version = "1.0", features = ["derive"] }

@@ -1,9 +1,16 @@
-[package]
-name = "tachtalk"
+[workspace]
+resolver = "2"
+members = [
+    "tachtalk-elm327-lib",
+    "tachtalk-shift-lights-lib",
+    "tachtalk-firmware",
+    "tachtalk-mock-elm327-server",
+]
+
+[workspace.package]
 version = "0.1.0"
 authors = ["docwilco"]
 edition = "2021"
-resolver = "2"
 rust-version = "1.71"
 
 [profile.release]
@@ -12,24 +19,3 @@ opt-level = "s"
 [profile.dev]
 debug = true    # Symbols are nice and they don't increase the size on Flash
 opt-level = "z"
-
-[dependencies]
-log = { version = "0.4.29", default-features = false }
-esp-idf-svc = { version = "0.51.0" }
-esp-idf-hal = { version = "0.45.2" }
-esp-idf-sys = { version = "0.36.1" }
-embedded-svc = "0.28.1"
-anyhow = "1.0.100"
-serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.149"
-smart-leds = "0.4.0"
-ws2812-esp32-rmt-driver = { version = "0.13.1", features = ["smart-leds-trait"] }
-oneshot = "0.1"
-smallvec = { version = "1.13", features = ["union"] }
-
-[build-dependencies]
-embuild = "0.33.1"
-
-# Add mDNS component from ESP-IDF component registry
-[[package.metadata.esp-idf-sys.extra_components]]
-remote_component = { name = "espressif/mdns", version = "1.8" }

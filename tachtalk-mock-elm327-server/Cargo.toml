@@ -1,0 +1,13 @@
+[package]
+name = "tachtalk-mock-elm327-server"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "tachtalk-mock-elm327"
+path = "src/main.rs"
+
+[dependencies]
+tachtalk-elm327-lib = { path = "../tachtalk-elm327-lib" }

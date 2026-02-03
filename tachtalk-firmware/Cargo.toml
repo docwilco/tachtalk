@@ -1,0 +1,33 @@
+[package]
+name = "tachtalk-firmware"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "tachtalk"
+path = "src/main.rs"
+
+[dependencies]
+tachtalk-elm327-lib = { path = "../tachtalk-elm327-lib" }
+tachtalk-shift-lights-lib = { path = "../tachtalk-shift-lights-lib" }
+log = { version = "0.4.29", default-features = false }
+esp-idf-svc = { version = "0.51.0" }
+esp-idf-hal = { version = "0.45.2" }
+esp-idf-sys = { version = "0.36.1" }
+embedded-svc = "0.28.1"
+anyhow = "1.0.100"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+smart-leds = "0.4.0"
+ws2812-esp32-rmt-driver = { version = "0.13.1", features = ["smart-leds-trait"] }
+oneshot = "0.1"
+smallvec = { version = "1.13", features = ["union"] }
+
+[build-dependencies]
+embuild = "0.33.1"
+
+# Add mDNS component from ESP-IDF component registry
+[[package.metadata.esp-idf-sys.extra_components]]
+remote_component = { name = "espressif/mdns", version = "1.8" }
