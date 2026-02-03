@@ -1,8 +1,9 @@
 //! Mock ELM327 OBD2 adapter for testing TachTalk proxy
 //!
-//! Usage: cargo run -p tachtalk-mock-elm327-server
+//! Usage: cargo run -p tachtalk-mock-elm327-server [--quiet|-q]
 //! Then connect TachTalk proxy to 127.0.0.1:35000
 
+use std::env;
 use std::fmt::Write as _;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -10,6 +11,8 @@ use std::time::Instant;
 use tachtalk_elm327_lib::ClientState;
 
 fn main() {
+    let quiet = env::args().any(|arg| arg == "-q" || arg == "--quiet");
+
     println!("Mock ELM327 starting on 0.0.0.0:35000...");
     let listener = TcpListener::bind("0.0.0.0:35000").expect("Failed to bind");
     println!("Mock ELM327 ready - waiting for connections...");
@@ -18,14 +21,14 @@ fn main() {
         match stream {
             Ok(stream) => {
                 println!("Client connected: {:?}", stream.peer_addr());
-                std::thread::spawn(|| handle_client(stream));
+                std::thread::spawn(move || handle_client(stream, quiet));
             }
             Err(e) => eprintln!("Connection error: {e}"),
         }
     }
 }
 
-fn handle_client(mut stream: TcpStream) {
+fn handle_client(mut stream: TcpStream, quiet: bool) {
     let mut buffer = Vec::new();
     let mut byte = [0u8; 1];
     let start_time = Instant::now();
@@ -50,9 +53,13 @@ fn handle_client(mut stream: TcpStream) {
                     let command = String::from_utf8_lossy(&buffer).trim().to_uppercase();
 
                     if !command.is_empty() {
-                        println!("RX: {command}");
+                        if !quiet {
+                            println!("RX: {command}");
+                        }
                         let response = process_command(&command, &start_time, &mut state);
-                        println!("TX: {}", response.escape_debug());
+                        if !quiet {
+                            println!("TX: {}", response.escape_debug());
+                        }
 
                         if let Err(e) = stream.write_all(response.as_bytes()) {
                             eprintln!("Write error: {e}");
