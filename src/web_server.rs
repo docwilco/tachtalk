@@ -356,6 +356,36 @@ const HTML_INDEX_END: &str = r#";</script>
             <div id="wifiNetworks" style="margin-top: 10px;"></div>
         </div>
         
+        <div class="wifi-config">
+            <h2>🔌 OBD2 Configuration</h2>
+            <div class="form-group">
+                <label>Dongle IP:</label>
+                <input type="text" id="obd2DongleIp" placeholder="192.168.0.10">
+            </div>
+            <div class="form-group">
+                <label>Dongle Port:</label>
+                <input type="number" id="obd2DonglePort" placeholder="35000" min="1" max="65535">
+            </div>
+            <div class="form-group">
+                <label>Proxy Listen Port:</label>
+                <input type="number" id="obd2ListenPort" placeholder="35000" min="1" max="65535">
+            </div>
+        </div>
+        
+        <div class="wifi-config">
+            <h2>⚙️ System Settings</h2>
+            <div class="form-group">
+                <label>Log Level:</label>
+                <select id="logLevel">
+                    <option value="off">Off</option>
+                    <option value="error">Error</option>
+                    <option value="warn">Warn</option>
+                    <option value="info">Info</option>
+                    <option value="debug">Debug</option>
+                </select>
+            </div>
+        </div>
+        
         <h2>RPM Thresholds</h2>
         <div id="thresholds"></div>
         
@@ -393,6 +423,8 @@ const HTML_INDEX_END: &str = r#";</script>
         let config = {
             wifi: { ssid: '', password: '' },
             ip: { use_dhcp: true, ip: null, gateway: null, subnet: null, dns: null },
+            obd2: { dongle_ip: '192.168.0.10', dongle_port: 35000, listen_port: 35000 },
+            log_level: 'info',
             thresholds: [
                 { name: 'Off', rpm: 0, start_led: 0, end_led: 0, color: { r: 0, g: 0, b: 0 }, blink: false, blink_ms: 500 },
                 { name: 'Blue', rpm: 1000, start_led: 0, end_led: 0, color: { r: 0, g: 0, b: 255 }, blink: false, blink_ms: 500 },
@@ -528,6 +560,12 @@ const HTML_INDEX_END: &str = r#";</script>
         async function saveConfig() {
             config.total_leds = parseInt(document.getElementById('totalLeds').value);
             config.led_gpio = parseInt(document.getElementById('ledGpio').value);
+            config.obd2 = {
+                dongle_ip: document.getElementById('obd2DongleIp').value || '192.168.0.10',
+                dongle_port: parseInt(document.getElementById('obd2DonglePort').value) || 35000,
+                listen_port: parseInt(document.getElementById('obd2ListenPort').value) || 35000
+            };
+            config.log_level = document.getElementById('logLevel').value;
             
             setButtonLoading('btnSaveConfig', true, 'Saving...');
             try {
@@ -648,6 +686,15 @@ const HTML_INDEX_END: &str = r#";</script>
                     document.getElementById('staticSubnet').value = ipConfig.subnet || '';
                     document.getElementById('staticDns').value = ipConfig.dns || '';
                     toggleStaticIp();
+                    
+                    // OBD2 config
+                    const obd2Config = config.obd2 || { dongle_ip: '192.168.0.10', dongle_port: 35000, listen_port: 35000 };
+                    document.getElementById('obd2DongleIp').value = obd2Config.dongle_ip || '192.168.0.10';
+                    document.getElementById('obd2DonglePort').value = obd2Config.dongle_port || 35000;
+                    document.getElementById('obd2ListenPort').value = obd2Config.listen_port || 35000;
+                    
+                    // Log level
+                    document.getElementById('logLevel').value = config.log_level || 'info';
                     
                     renderThresholds();
                     showStatus('Configuration loaded!', false);
