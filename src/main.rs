@@ -28,7 +28,7 @@ mod web_server;
 
 use config::Config;
 use leds::LedController;
-use obd2::{AtCommandLog, Obd2Proxy};
+use obd2::{AtCommandLog, Obd2Proxy, start_rpm_led_task};
 
 const AP_SSID_PREFIX: &str = "TachTalk-";
 
@@ -103,16 +103,10 @@ fn main() -> Result<()> {
     info!("Initializing LED controller on GPIO {led_gpio}...");
     // SAFETY: We trust the user-configured GPIO pin number is valid for this board
     let led_pin = unsafe { AnyIOPin::new(i32::from(led_gpio)) };
-    let led_controller = Arc::new(Mutex::new(LedController::new(
+    let led_controller = LedController::new(
         led_pin,
         peripherals.rmt.channel0,
-    )?));
-
-    // Boot animation: blink purple 3 times
-    {
-        let total_leds = config.lock().unwrap().total_leds;
-        led_controller.lock().unwrap().boot_animation(total_leds)?;
-    }
+    )?;
 
     // Initialize WiFi with custom AP configuration for captive portal DNS
     info!("Initializing WiFi...");
@@ -219,14 +213,13 @@ fn main() -> Result<()> {
     let wifi = Arc::new(Mutex::new(wifi));
     {
         let config_clone = config.clone();
-        let led_clone = led_controller.clone();
         let mode_clone = wifi_mode.clone();
         let wifi_clone = wifi.clone();
         let ap_hostname_clone = ap_hostname.clone();
         let at_cmd_log_clone = at_command_log.clone();
 
         std::thread::spawn(move || {
-            if let Err(e) = web_server::start_server(&config_clone, &led_clone, &mode_clone, &wifi_clone, Some(ap_hostname_clone), at_cmd_log_clone) {
+            if let Err(e) = web_server::start_server(&config_clone, &mode_clone, &wifi_clone, Some(ap_hostname_clone), at_cmd_log_clone) {
                 error!("Web server error: {e:?}");
             }
         });
@@ -249,16 +242,20 @@ fn main() -> Result<()> {
         }
     };
 
-    // Start OBD2 proxy (handles reconnection internally)
+    // Start OBD2 proxy and RPM/LED task
     let dongle_tx = obd2::start_dongle_task(config.clone());
+    
+    // Start the combined RPM poller and LED update task
+    // This takes ownership of led_controller (no Arc<Mutex> needed)
+    let rpm_tx = start_rpm_led_task(led_controller, config.clone(), sse_tx.clone(), dongle_tx.clone());
+    
     {
         let config_clone = config.clone();
-        let led_clone = led_controller.clone();
-        let sse_tx_clone = sse_tx.clone();
+        let rpm_tx_clone = rpm_tx.clone();
         let at_cmd_log_clone = at_command_log.clone();
         
         std::thread::spawn(move || {
-            let proxy = Obd2Proxy::new(config_clone, led_clone, sse_tx_clone, dongle_tx, at_cmd_log_clone);
+            let proxy = Obd2Proxy::new(config_clone, rpm_tx_clone, dongle_tx, at_cmd_log_clone);
             if let Err(e) = proxy.run() {
                 error!("OBD2 proxy error: {e:?}");
             }

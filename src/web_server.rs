@@ -9,7 +9,6 @@ use std::sync::{Arc, Mutex};
 use esp_idf_svc::sys::{esp_get_free_heap_size, esp_get_minimum_free_heap_size};
 
 use crate::config::Config;
-use crate::leds::LedController;
 use crate::obd2::AtCommandLog;
 use crate::sse_server::SSE_PORT;
 use crate::WifiMode;
@@ -665,7 +664,6 @@ const HTML_CAPTIVE_PORTAL: &str = r#"
 
 pub fn start_server(
     config: &Arc<Mutex<Config>>,
-    _led_controller: &Arc<Mutex<LedController>>,
     wifi_mode: &Arc<Mutex<WifiMode>>,
     wifi: &Arc<Mutex<BlockingWifi<EspWifi<'static>>>>,
     ap_hostname: Option<String>,
