@@ -156,6 +156,7 @@ fn dongle_task(rx: Receiver<DongleRequest>, config: Arc<Mutex<Config>>) {
     info!("OBD2 dongle task starting...");
     
     let mut connection: Option<TcpStream> = None;
+    let mut last_connect_attempt: Option<Instant> = None;
     
     let watchdog = WatchdogHandle::register("obd2_dongle");
     
@@ -169,9 +170,16 @@ fn dongle_task(rx: Receiver<DongleRequest>, config: Arc<Mutex<Config>>) {
         // Get timeout from config
         let timeout = Duration::from_millis(config.lock().unwrap().obd2_timeout_ms);
         
-        // Try to ensure we have a connection
+        // Try to ensure we have a connection (with reconnect delay)
         if connection.is_none() {
-            connection = try_connect(timeout);
+            let should_try = match last_connect_attempt {
+                Some(t) => t.elapsed() >= RECONNECT_DELAY,
+                None => true,
+            };
+            if should_try {
+                last_connect_attempt = Some(Instant::now());
+                connection = try_connect(timeout, &watchdog);
+            }
         }
 
         // Process requests with a timeout so we can check connection health
@@ -211,7 +219,7 @@ fn dongle_task(rx: Receiver<DongleRequest>, config: Arc<Mutex<Config>>) {
 }
 
 /// Try to connect to the dongle and initialize it
-fn try_connect(timeout: Duration) -> Option<TcpStream> {
+fn try_connect(timeout: Duration, watchdog: &Option<WatchdogHandle>) -> Option<TcpStream> {
     info!("Connecting to OBD2 dongle at {DONGLE_IP}:{DONGLE_PORT} (timeout: {}ms)", timeout.as_millis());
 
     let addr: SocketAddr = format!("{DONGLE_IP}:{DONGLE_PORT}").parse().ok()?;
@@ -219,10 +227,14 @@ fn try_connect(timeout: Duration) -> Option<TcpStream> {
         Ok(s) => s,
         Err(e) => {
             warn!("Failed to connect to dongle: {e}");
-            std::thread::sleep(RECONNECT_DELAY);
             return None;
         }
     };
+    
+    // Feed watchdog after potentially long connect timeout
+    if let Some(ref wd) = watchdog {
+        wd.feed();
+    }
 
     if let Err(e) = stream.set_read_timeout(Some(timeout)) {
         error!("Failed to set read timeout: {e}");
