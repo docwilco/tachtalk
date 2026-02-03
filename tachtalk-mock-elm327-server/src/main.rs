@@ -131,12 +131,12 @@ fn process_command(cmd: &str, start_time: &Instant, state: &mut ClientState) -> 
     }
 
     // Handle OBD2 commands
-    match cmd {
+    let obd_response = match cmd {
         // Mode 03 - Show stored DTCs
-        "03" => format!("4300{le}{le}>"),
+        "03" => Some("4300".to_string()),
 
         // Mode 09 - Vehicle info
-        "0902" => format!("490213455034353637383930{le}{le}>"),
+        "0902" => Some("490213455034353637383930".to_string()),
 
         // Mode 01 - Current data (single or multi-PID)
         c if c.starts_with("01") && c.len() >= 4 => {
@@ -171,13 +171,38 @@ fn process_command(cmd: &str, start_time: &Instant, state: &mut ClientState) -> 
             }
 
             if response.is_empty() {
-                format!("?{le}{le}>")
+                None
             } else {
-                format!("41{response}{le}{le}>")
+                Some(format!("41{response}"))
             }
         }
 
         // Unknown command
-        _ => format!("?{le}{le}>"),
+        _ => None,
+    };
+
+    match obd_response {
+        Some(hex_data) => {
+            // Format the hex data with spaces if enabled
+            let formatted_data = state.format_response(hex_data.as_bytes());
+            let formatted_str = String::from_utf8_lossy(&formatted_data);
+            
+            // Add header if enabled (7E8 is standard ECM response address)
+            let response = if state.headers_enabled {
+                // With headers: "7E8 06 41 00 BE 3F A8 13" (header + length + data)
+                // Header is 3 hex chars, not split. Length is data bytes.
+                let data_bytes = hex_data.len() / 2;
+                if state.spaces_enabled {
+                    format!("7E8 {data_bytes:02X} {formatted_str}")
+                } else {
+                    format!("7E8{data_bytes:02X}{formatted_str}")
+                }
+            } else {
+                formatted_str.to_string()
+            };
+            
+            format!("{response}{le}{le}>")
+        }
+        None => format!("?{le}{le}>"),
     }
 }

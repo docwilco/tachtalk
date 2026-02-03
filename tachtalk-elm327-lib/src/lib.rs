@@ -81,7 +81,8 @@ impl ClientState {
     /// Handle an AT command and return the response
     /// Mutates the state if the command changes settings
     pub fn handle_at_command(&mut self, command: &str) -> String {
-        let cmd = command.to_uppercase();
+        // ELM327 ignores spaces in AT commands
+        let cmd: String = command.to_uppercase().chars().filter(|c| *c != ' ').collect();
         let le = self.line_ending();
 
         // Determine response content (without line endings)
@@ -125,7 +126,19 @@ impl ClientState {
                 self.headers_enabled = true;
                 "OK"
             }
+            "ATRV" => {
+                // Return simulated battery voltage (12.6V)
+                return format!("{le}12.6V{le}>");
+            }
             "ATSP0" | "ATAT1" | "ATAT2" => "OK",
+            "ATDP" => {
+                // Describe protocol
+                return format!("{le}AUTO, ISO 15765-4 (CAN 11/500){le}>");
+            }
+            "ATDPN" => {
+                // Describe protocol number
+                return format!("{le}A6{le}>");
+            }
             _ if cmd.starts_with("ATSP") => "OK",
             _ if cmd.starts_with("ATST") => "OK",
             _ if cmd.starts_with("ATAT") => "OK",
