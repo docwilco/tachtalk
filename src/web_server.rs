@@ -673,14 +673,16 @@ pub fn start_server(
 ) -> Result<()> {
     info!("Web server starting...");
     
-    let mut server_config = Configuration::default();
     // Enable wildcard URI matching for captive portal fallback handler
-    server_config.uri_match_wildcard = true;
     // Enable LRU purge to handle abrupt disconnections from captive portal browsers
     // LWIP max is 16 sockets; leave room for DNS, OBD2, mDNS
-    server_config.max_open_sockets = 10;
-    server_config.session_timeout = core::time::Duration::from_secs(2);
-    server_config.lru_purge_enable = true;
+    let server_config = Configuration {
+        uri_match_wildcard: true,
+        max_open_sockets: 10,
+        session_timeout: core::time::Duration::from_secs(2),
+        lru_purge_enable: true,
+        ..Default::default()
+    };
     let mut server = EspHttpServer::new(&server_config)?;
 
     // Serve the main HTML page (inject SSE port between two static parts)

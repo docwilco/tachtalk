@@ -42,6 +42,7 @@ pub struct DongleRequest {
 
 /// Per-connection client state (ELM327 settings)
 #[derive(Debug, Clone)]
+#[allow(clippy::struct_excessive_bools)] // These are independent ELM327 protocol flags
 struct ClientState {
     /// Echo received characters back (ATE0/ATE1)
     echo_enabled: bool,
@@ -50,6 +51,7 @@ struct ClientState {
     /// Print spaces between response bytes (ATS0/ATS1)
     spaces_enabled: bool,
     /// Show header bytes in responses (ATH0/ATH1)
+    // TODO: Actually use this when formatting OBD2 responses
     headers_enabled: bool,
 }
 
@@ -703,7 +705,7 @@ impl Obd2Proxy {
         if let Some(pos) = text_upper.find("410C") {
             let after = &text_upper[pos + 4..];
             // Try to parse hex bytes (with or without spaces)
-            let hex_chars: String = after.chars().filter(|c| c.is_ascii_hexdigit()).collect();
+            let hex_chars: String = after.chars().filter(char::is_ascii_hexdigit).collect();
 
             if hex_chars.len() >= 4 {
                 let a = u32::from_str_radix(&hex_chars[0..2], 16).ok()?;

@@ -35,7 +35,7 @@ const AP_SSID_PREFIX: &str = "TachTalk-";
 /// Convert a subnet mask string (e.g., "255.255.255.0") to CIDR prefix length (e.g., 24)
 fn subnet_mask_to_cidr(mask_str: &str) -> Result<u8> {
     let mask: Ipv4Addr = mask_str.parse().map_err(|e| {
-        anyhow::anyhow!("Invalid subnet mask '{}': {}", mask_str, e)
+        anyhow::anyhow!("Invalid subnet mask '{mask_str}': {e}")
     })?;
     let bits = u32::from(mask);
     // Validate it's a valid mask (all 1s followed by all 0s)
@@ -47,8 +47,7 @@ fn subnet_mask_to_cidr(mask_str: &str) -> Result<u8> {
     };
     if bits != expected {
         return Err(anyhow::anyhow!(
-            "Invalid subnet mask '{}': not a valid mask (expected contiguous 1s)",
-            mask_str
+            "Invalid subnet mask '{mask_str}': not a valid mask (expected contiguous 1s)"
         ));
     }
     Ok(leading_ones as u8)
@@ -103,7 +102,7 @@ fn main() -> Result<()> {
     let led_gpio = config.lock().unwrap().led_gpio;
     info!("Initializing LED controller on GPIO {led_gpio}...");
     // SAFETY: We trust the user-configured GPIO pin number is valid for this board
-    let led_pin = unsafe { AnyIOPin::new(led_gpio as i32) };
+    let led_pin = unsafe { AnyIOPin::new(i32::from(led_gpio)) };
     let led_controller = Arc::new(Mutex::new(LedController::new(
         led_pin,
         peripherals.rmt.channel0,
@@ -134,10 +133,10 @@ fn main() -> Result<()> {
             let subnet_str = cfg.ip.effective_subnet().unwrap();
             
             let ip: Ipv4Addr = ip_str.parse().map_err(|e| {
-                anyhow::anyhow!("Invalid static IP '{}': {}", ip_str, e)
+                anyhow::anyhow!("Invalid static IP '{ip_str}': {e}")
             })?;
             let gateway: Ipv4Addr = gateway_str.parse().map_err(|e| {
-                anyhow::anyhow!("Invalid gateway '{}': {}", gateway_str, e)
+                anyhow::anyhow!("Invalid gateway '{gateway_str}': {e}")
             })?;
             let mask = subnet_mask_to_cidr(subnet_str)?;
             

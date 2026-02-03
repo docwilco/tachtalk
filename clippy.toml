@@ -1,0 +1,2 @@
+# Words that clippy::doc_markdown should not flag as needing backticks
+doc-valid-idents = ["EventSource", "WiFi"]
