@@ -66,72 +66,110 @@ fn handle_client(mut stream: TcpStream) {
     }
 }
 
+fn get_rpm_value(start_time: &Instant) -> u32 {
+    const MIN_RPM: f32 = 800.0;
+    const MAX_RPM: f32 = 3500.0;
+    const RAMP_TIME: f32 = 4.0;
+    const HOLD_TIME: f32 = 3.0;
+    const CYCLE_TIME: f32 = 2.0 * (RAMP_TIME + HOLD_TIME);
+    
+    let elapsed = start_time.elapsed().as_secs_f32();
+    let phase = elapsed % CYCLE_TIME;
+    
+    let rpm = if phase < RAMP_TIME {
+        MIN_RPM + (MAX_RPM - MIN_RPM) * (phase / RAMP_TIME)
+    } else if phase < RAMP_TIME + HOLD_TIME {
+        MAX_RPM
+    } else if phase < 2.0 * RAMP_TIME + HOLD_TIME {
+        let ramp_phase = phase - RAMP_TIME - HOLD_TIME;
+        MAX_RPM - (MAX_RPM - MIN_RPM) * (ramp_phase / RAMP_TIME)
+    } else {
+        MIN_RPM
+    };
+    
+    (rpm * 4.0) as u32
+}
+
+fn get_pid_response(pid: &str, start_time: &Instant) -> Option<String> {
+    match pid {
+        "00" => Some("BE3FA813".to_string()),  // PIDs supported 01-20
+        "04" => Some("64".to_string()),        // Engine load: 39.2%
+        "05" => Some("4F".to_string()),        // Coolant temp: 39°C
+        "0C" => Some(format!("{:04X}", get_rpm_value(start_time))), // RPM
+        "0D" => Some("28".to_string()),        // Speed: 40 km/h
+        "0F" => Some("38".to_string()),        // Intake air temp: 16°C
+        "11" => Some("45".to_string()),        // Throttle: 27%
+        "20" => Some("80000001".to_string()),  // PIDs supported 21-40
+        "40" => Some("FED08000".to_string()),  // PIDs supported 41-60
+        _ => None,
+    }
+}
+
 fn process_command(cmd: &str, start_time: &Instant) -> String {
+    // Handle AT commands
+    if cmd.starts_with("AT") {
+        return match cmd {
+            "ATZ" => "\r\rELM327 v1.5\r\r>".to_string(),
+            "ATE0" | "ATE1" => "OK\r\r>".to_string(),
+            "ATL0" | "ATL1" => "OK\r\r>".to_string(),
+            "ATS0" | "ATS1" => "OK\r\r>".to_string(),
+            "ATH0" | "ATH1" => "OK\r\r>".to_string(),
+            "ATSP0" => "OK\r\r>".to_string(),
+            c if c.starts_with("ATSP") => "OK\r\r>".to_string(),
+            c if c.starts_with("ATST") => "OK\r\r>".to_string(),
+            c if c.starts_with("ATAT") => "OK\r\r>".to_string(),
+            "ATI" => "ELM327 v1.5\r\r>".to_string(),
+            "AT@1" => "Mock ELM327\r\r>".to_string(),
+            _ => "?\r\r>".to_string(),
+        };
+    }
+    
+    // Handle OBD2 commands
     match cmd {
-        // Reset
-        "ATZ" => "\r\rELM327 v1.5\r\r>".to_string(),
-        
-        // Echo off/on
-        "ATE0" => "OK\r\r>".to_string(),
-        "ATE1" => "OK\r\r>".to_string(),
-        
-        // Linefeeds off/on
-        "ATL0" => "OK\r\r>".to_string(),
-        "ATL1" => "OK\r\r>".to_string(),
-        
-        // Spaces off/on
-        "ATS0" => "OK\r\r>".to_string(),
-        "ATS1" => "OK\r\r>".to_string(),
-        
-        // Headers off/on
-        "ATH0" => "OK\r\r>".to_string(),
-        "ATH1" => "OK\r\r>".to_string(),
-        
-        // Protocol selection
-        "ATSP0" => "OK\r\r>".to_string(),
-        c if c.starts_with("ATSP") => "OK\r\r>".to_string(),
-        c if c.starts_with("ATST") => "OK\r\r>".to_string(),
-        c if c.starts_with("ATAT") => "OK\r\r>".to_string(),
-        
-        // Device info
-        "ATI" => "ELM327 v1.5\r\r>".to_string(),
-        "AT@1" => "Mock ELM327\r\r>".to_string(),
-        
-        // OBD2 PIDs supported queries
-        "0100" => "4100BE3FA813\r\r>".to_string(), // PIDs 01-20 supported
-        "0120" => "412080000001\r\r>".to_string(), // PIDs 21-40 supported
-        "0140" => "4140FED08000\r\r>".to_string(), // PIDs 41-60 supported
-        "0160" => "NO DATA\r\r>".to_string(),
-        
-        // Mode 01 - Current data
-        "010C" => {
-            // RPM - simulate varying RPM (800-3000 RPM with wave pattern)
-            let elapsed = start_time.elapsed().as_secs_f32();
-            let rpm_variation = (elapsed * 0.5).sin() * 1100.0;
-            let rpm = 1900.0 + rpm_variation;
-            let rpm_raw = (rpm * 4.0) as u32;
-            format!("410C{:04X}\r\r>", rpm_raw)
-        }
-        "010D" => "410D28\r\r>".to_string(),      // Speed: 40 km/h
-        "0105" => "01054F\r\r>".to_string(),      // Coolant temp: 39°C
-        "010F" => "010F38\r\r>".to_string(),      // Intake air temp: 16°C
-        "0111" => "011145\r\r>".to_string(),      // Throttle: 27%
-        "0104" => "010464\r\r>".to_string(),      // Engine load: 39.2%
-        
-        // Multi-PID request (example: RPM + Speed + Coolant)
-        c if c.contains("010C") && c.len() > 4 => {
-            let elapsed = start_time.elapsed().as_secs_f32();
-            let rpm_variation = (elapsed * 0.5).sin() * 1100.0;
-            let rpm = 1900.0 + rpm_variation;
-            let rpm_raw = (rpm * 4.0) as u32;
-            format!("410C{:04X}0D280F38\r\r>", rpm_raw) // RPM + Speed + IAT
-        }
-        
         // Mode 03 - Show stored DTCs
-        "03" => "4300\r\r>".to_string(), // No DTCs
+        "03" => "4300\r\r>".to_string(),
         
         // Mode 09 - Vehicle info
-        "0902" => "490213455034353637383930\r\r>".to_string(), // VIN part 1
+        "0902" => "490213455034353637383930\r\r>".to_string(),
+        
+        // Mode 01 - Current data (single or multi-PID)
+        c if c.starts_with("01") && c.len() >= 4 => {
+            let pid_data = &c[2..]; // Everything after "01"
+            
+            // Parse PIDs (pairs of hex digits)
+            let mut pids = Vec::new();
+            let mut chars = pid_data.chars().peekable();
+            
+            while chars.peek().is_some() {
+                let mut pid = String::new();
+                
+                // Get next two characters
+                if let Some(c1) = chars.next() {
+                    if let Some(c2) = chars.next() {
+                        pid.push(c1);
+                        pid.push(c2);
+                        pids.push(pid.to_uppercase());
+                    }
+                }
+            }
+            
+            // Build response
+            let mut response = String::new();
+            for pid in pids {
+                if let Some(data) = get_pid_response(&pid, start_time) {
+                    response.push_str(&format!("{}{}", pid, data));
+                } else {
+                    // Unknown PID
+                    return "NO DATA\r\r>".to_string();
+                }
+            }
+            
+            if response.is_empty() {
+                "?\r\r>".to_string()
+            } else {
+                format!("41{}\r\r>", response)
+            }
+        }
         
         // Unknown command
         _ => "?\r\r>".to_string(),
