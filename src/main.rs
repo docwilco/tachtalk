@@ -28,7 +28,7 @@ mod web_server;
 
 use config::Config;
 use leds::LedController;
-use obd2::{AtCommandLog, Obd2Proxy, start_rpm_led_task};
+use obd2::{AtCommandLog, PidLog, Obd2Proxy, start_rpm_led_task};
 
 const AP_SSID_PREFIX: &str = "TachTalk-";
 
@@ -299,6 +299,9 @@ fn main() -> Result<()> {
 
     // Create shared log for tracking AT commands (for debugging via web UI)
     let at_command_log: AtCommandLog = Arc::new(Mutex::new(HashSet::new()));
+    
+    // Create shared log for tracking OBD2 PIDs (for debugging via web UI)
+    let pid_log: PidLog = Arc::new(Mutex::new(HashSet::new()));
 
     // Start web server immediately
     let wifi = Arc::new(Mutex::new(wifi));
@@ -308,9 +311,10 @@ fn main() -> Result<()> {
         let wifi_clone = wifi.clone();
         let ap_hostname_clone = ap_hostname.clone();
         let at_cmd_log_clone = at_command_log.clone();
+        let pid_log_clone = pid_log.clone();
 
         std::thread::spawn(move || {
-            if let Err(e) = web_server::start_server(&config_clone, &mode_clone, &wifi_clone, Some(ap_hostname_clone), at_cmd_log_clone) {
+            if let Err(e) = web_server::start_server(&config_clone, &mode_clone, &wifi_clone, Some(ap_hostname_clone), at_cmd_log_clone, pid_log_clone) {
                 error!("Web server error: {e:?}");
             }
         });
@@ -332,9 +336,10 @@ fn main() -> Result<()> {
         let config_clone = config.clone();
         let rpm_tx_clone = rpm_tx.clone();
         let at_cmd_log_clone = at_command_log.clone();
+        let pid_log_clone = pid_log.clone();
         
         std::thread::spawn(move || {
-            let proxy = Obd2Proxy::new(config_clone, rpm_tx_clone, dongle_tx, at_cmd_log_clone);
+            let proxy = Obd2Proxy::new(config_clone, rpm_tx_clone, dongle_tx, at_cmd_log_clone, pid_log_clone);
             if let Err(e) = proxy.run() {
                 error!("OBD2 proxy error: {e:?}");
             }

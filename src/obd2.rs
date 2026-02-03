@@ -29,6 +29,9 @@ const RECONNECT_DELAY: Duration = Duration::from_secs(1);
 /// Shared log of unique AT commands received from clients (for debugging)
 pub type AtCommandLog = Arc<Mutex<HashSet<String>>>;
 
+/// Shared log of unique OBD2 PIDs requested by clients (for debugging)
+pub type PidLog = Arc<Mutex<HashSet<String>>>;
+
 /// Channel sender for RPM updates to the LED task
 pub type RpmSender = Sender<u32>;
 
@@ -64,6 +67,7 @@ struct CommandContext<'a> {
     rpm_tx: &'a RpmSender,
     dongle_tx: &'a DongleSender,
     at_command_log: &'a AtCommandLog,
+    pid_log: &'a PidLog,
 }
 
 impl Default for ClientState {
@@ -472,6 +476,8 @@ pub struct Obd2Proxy {
     dongle_tx: DongleSender,
     /// Unique AT commands seen from clients (for debugging/web UI)
     at_command_log: AtCommandLog,
+    /// Unique OBD2 PIDs requested by clients (for debugging/web UI)
+    pid_log: PidLog,
 }
 
 impl Obd2Proxy {
@@ -480,12 +486,14 @@ impl Obd2Proxy {
         rpm_tx: RpmSender,
         dongle_tx: DongleSender,
         at_command_log: AtCommandLog,
+        pid_log: PidLog,
     ) -> Self {
         Self {
             config,
             rpm_tx,
             dongle_tx,
             at_command_log,
+            pid_log,
         }
     }
 
@@ -515,10 +523,11 @@ impl Obd2Proxy {
                     let rpm_tx = self.rpm_tx.clone();
                     let dongle_tx = self.dongle_tx.clone();
                     let at_command_log = self.at_command_log.clone();
+                    let pid_log = self.pid_log.clone();
 
                     std::thread::spawn(move || {
                         if let Err(e) =
-                            Self::handle_client(stream, &config, &rpm_tx, &dongle_tx, &at_command_log)
+                            Self::handle_client(stream, &config, &rpm_tx, &dongle_tx, &at_command_log, &pid_log)
                         {
                             error!("Error handling client: {e:?}");
                         }
@@ -542,6 +551,7 @@ impl Obd2Proxy {
         rpm_tx: &RpmSender,
         dongle_tx: &DongleSender,
         at_command_log: &AtCommandLog,
+        pid_log: &PidLog,
     ) -> Result<()> {
         let peer = client_stream.peer_addr()?;
         info!("OBD2 client connected: {peer}");
@@ -596,6 +606,7 @@ impl Obd2Proxy {
                                 rpm_tx,
                                 dongle_tx,
                                 at_command_log,
+                                pid_log,
                             };
                             Self::process_command(
                                 command,
@@ -650,6 +661,11 @@ impl Obd2Proxy {
 
         // Get timeout from config
         let timeout = Duration::from_millis(ctx.config.lock().unwrap().obd2_timeout_ms);
+
+        // Record unique OBD2 PIDs (store uppercase for dedup)
+        if let Ok(mut log) = ctx.pid_log.lock() {
+            log.insert(command.to_uppercase());
+        }
 
         // Forward OBD2 command to dongle task
         match send_command(ctx.dongle_tx, raw_command, timeout) {

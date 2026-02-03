@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use esp_idf_svc::sys::{esp_get_free_heap_size, esp_get_minimum_free_heap_size};
 
 use crate::config::Config;
-use crate::obd2::AtCommandLog;
+use crate::obd2::{AtCommandLog, PidLog};
 use crate::sse_server::SSE_PORT;
 use crate::WifiMode;
 
@@ -54,6 +54,7 @@ struct NetworkStatus {
 #[derive(serde::Serialize)]
 struct DebugInfo {
     at_commands: Vec<String>,
+    pids: Vec<String>,
     free_heap: u32,
     min_free_heap: u32,
 }
@@ -310,6 +311,8 @@ const HTML_INDEX_END: &str = r#";</script>
                 <div class="debug-row"><span>Min Free Heap:</span><span id="minFreeHeap">---</span></div>
                 <h3>AT Commands Received</h3>
                 <div id="atCommands" class="at-commands">Loading...</div>
+                <h3>OBD2 PIDs Requested</h3>
+                <div id="pids" class="pids">Loading...</div>
             </div>
         </details>
         
@@ -821,8 +824,16 @@ const HTML_INDEX_END: &str = r#";</script>
                 } else {
                     el.textContent = info.at_commands.join(', ');
                 }
+                
+                const pidEl = document.getElementById('pids');
+                if (info.pids.length === 0) {
+                    pidEl.textContent = '(none yet)';
+                } else {
+                    pidEl.textContent = info.pids.join(', ');
+                }
             } catch (e) {
                 document.getElementById('atCommands').textContent = '(error)';
+                document.getElementById('pids').textContent = '(error)';
                 document.getElementById('freeHeap').textContent = '---';
                 document.getElementById('minFreeHeap').textContent = '---';
             }
@@ -870,6 +881,7 @@ pub fn start_server(
     wifi: &Arc<Mutex<BlockingWifi<EspWifi<'static>>>>,
     ap_hostname: Option<String>,
     at_command_log: AtCommandLog,
+    pid_log: PidLog,
 ) -> Result<()> {
     info!("Web server starting...");
     
@@ -1096,7 +1108,7 @@ pub fn start_server(
         Ok(())
     })?;
 
-    // GET debug info endpoint (AT commands, memory stats, etc.)
+    // GET debug info endpoint (AT commands, PIDs, memory stats, etc.)
     server.fn_handler("/api/debug_info", Method::Get, move |req| -> Result<(), esp_idf_svc::io::EspIOError> {
         debug!("HTTP: GET /api/debug_info");
         
@@ -1109,12 +1121,22 @@ pub fn start_server(
             })
             .unwrap_or_default();
         
+        let pids: Vec<String> = pid_log
+            .lock()
+            .map(|log| {
+                let mut pids: Vec<String> = log.iter().cloned().collect();
+                pids.sort();
+                pids
+            })
+            .unwrap_or_default();
+        
         // SAFETY: These are simple C functions that return u32 values
         let free_heap = unsafe { esp_get_free_heap_size() };
         let min_free_heap = unsafe { esp_get_minimum_free_heap_size() };
         
         let info = DebugInfo {
             at_commands,
+            pids,
             free_heap,
             min_free_heap,
         };
