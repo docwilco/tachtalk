@@ -12,8 +12,8 @@ pub enum LogLevel {
     Off,
     Error,
     Warn,
-    Info,
     #[default]
+    Info,
     Debug,
 }
 
