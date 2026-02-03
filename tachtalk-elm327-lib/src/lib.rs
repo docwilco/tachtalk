@@ -30,11 +30,13 @@ impl Default for ClientState {
 
 impl ClientState {
     /// Create a new client state with default settings
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
     /// Format a line ending based on current settings
+    #[must_use]
     pub fn line_ending(&self) -> &'static str {
         if self.linefeeds_enabled {
             "\r\n"
@@ -45,6 +47,7 @@ impl ClientState {
 
     /// Format a dongle response according to client settings
     /// The dongle sends compact hex (no spaces), so we add spaces if enabled
+    #[must_use]
     pub fn format_response(&self, response: &[u8]) -> Vec<u8> {
         if !self.spaces_enabled {
             // No formatting needed, return as-is
@@ -139,6 +142,7 @@ impl ClientState {
 
     /// Override this to provide a custom device description for AT@1
     /// Default implementation returns generic ELM327
+    #[must_use]
     pub fn device_description(&self) -> String {
         let le = self.line_ending();
         format!("{le}ELM327{le}>")
@@ -238,8 +242,7 @@ mod tests {
 
     #[test]
     fn test_format_response_without_spaces() {
-        let mut state = ClientState::default();
-        state.spaces_enabled = false;
+        let state = ClientState { spaces_enabled: false, ..Default::default() };
         let input = b"410C1AF8\r\r>";
         let output = state.format_response(input);
         assert_eq!(&output, b"410C1AF8\r\r>");

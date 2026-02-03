@@ -65,7 +65,7 @@ fn run_sse_server(rx: &Receiver<SseMessage>) -> std::io::Result<()> {
                     // Enforce max client limit - close oldest if at capacity
                     if clients.len() >= MAX_SSE_CLIENTS {
                         if let Some(oldest) = clients.first() {
-                            info!("SSE: Max clients reached ({}), closing oldest connection", MAX_SSE_CLIENTS);
+                            info!("SSE: Max clients reached ({MAX_SSE_CLIENTS}), closing oldest connection");
                             let _ = oldest.shutdown(std::net::Shutdown::Both);
                         }
                         clients.remove(0);

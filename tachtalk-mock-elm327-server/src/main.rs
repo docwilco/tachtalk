@@ -3,6 +3,7 @@
 //! Usage: cargo run -p tachtalk-mock-elm327-server
 //! Then connect TachTalk proxy to 127.0.0.1:35000
 
+use std::fmt::Write as _;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::time::Instant;
@@ -49,7 +50,7 @@ fn handle_client(mut stream: TcpStream) {
                     let command = String::from_utf8_lossy(&buffer).trim().to_uppercase();
 
                     if !command.is_empty() {
-                        println!("RX: {}", command);
+                        println!("RX: {command}");
                         let response = process_command(&command, &start_time, &mut state);
                         println!("TX: {}", response.escape_debug());
 
@@ -74,13 +75,13 @@ fn handle_client(mut stream: TcpStream) {
 }
 
 fn get_rpm_value(start_time: &Instant) -> u32 {
-    const MIN_RPM: f32 = 800.0;
-    const MAX_RPM: f32 = 3500.0;
-    const RAMP_TIME: f32 = 4.0;
-    const HOLD_TIME: f32 = 3.0;
-    const CYCLE_TIME: f32 = 2.0 * (RAMP_TIME + HOLD_TIME);
+    const MIN_RPM: f64 = 800.0;
+    const MAX_RPM: f64 = 3500.0;
+    const RAMP_TIME: f64 = 4.0;
+    const HOLD_TIME: f64 = 3.0;
+    const CYCLE_TIME: f64 = 2.0 * (RAMP_TIME + HOLD_TIME);
 
-    let elapsed = start_time.elapsed().as_secs_f32();
+    let elapsed = start_time.elapsed().as_secs_f64();
     let phase = elapsed % CYCLE_TIME;
 
     let rpm = if phase < RAMP_TIME {
@@ -94,7 +95,12 @@ fn get_rpm_value(start_time: &Instant) -> u32 {
         MIN_RPM
     };
 
-    (rpm * 4.0) as u32
+    let scaled = rpm * 4.0;
+    assert!(scaled >= 0.0 && scaled <= f64::from(u32::MAX));
+    // Workaround: allow on statement requires https://github.com/rust-lang/rust/issues/15701
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let result = scaled as u32;
+    result
 }
 
 fn get_pid_response(pid: &str, start_time: &Instant) -> Option<String> {
@@ -157,7 +163,7 @@ fn process_command(cmd: &str, start_time: &Instant, state: &mut ClientState) -> 
             let mut response = String::new();
             for pid in pids {
                 if let Some(data) = get_pid_response(&pid, start_time) {
-                    response.push_str(&format!("{pid}{data}"));
+                    write!(response, "{pid}{data}").unwrap();
                 } else {
                     // Unknown PID
                     return format!("NO DATA{le}{le}>");

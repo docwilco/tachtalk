@@ -25,21 +25,12 @@ const fn default_blink_ms() -> u32 {
 }
 
 /// Blink state tracker
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct BlinkState {
     /// Whether LEDs are currently on (true) or off (false) during blink
     pub is_on: bool,
     /// Accumulated time in milliseconds since last toggle
     pub elapsed_ms: u64,
-}
-
-impl Default for BlinkState {
-    fn default() -> Self {
-        Self {
-            is_on: false,
-            elapsed_ms: 0,
-        }
-    }
 }
 
 impl BlinkState {

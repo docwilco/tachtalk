@@ -34,6 +34,8 @@ impl LedController {
     pub fn update(&mut self, rpm: u32, config: &Config) -> Result<()> {
         // Calculate time delta for blink state updates
         let now = Instant::now();
+        // Delta between LED updates will never exceed u64::MAX milliseconds
+        #[allow(clippy::cast_possible_truncation)]
         let delta_ms = now.duration_since(self.last_update_time).as_millis() as u64;
         self.last_update_time = now;
 

@@ -4,7 +4,7 @@
 //! - Dongle task: owns the single TCP connection to the OBD2 dongle, handles
 //!   connection setup, reconnection, and processes OBD2 data commands
 //! - Proxy server: accepts client connections, forwards OBD2 commands via channel
-//! - AT commands (ATE0, ATZ, etc.) are handled locally per connection using tachtalk_elm327
+//! - AT commands (ATE0, ATZ, etc.) are handled locally per connection using `tachtalk_elm327`
 
 use anyhow::{Context, Result};
 use log::{debug, error, info, warn};
