@@ -397,7 +397,26 @@ fn wifi_connection_manager(
                 let connected = {
                     let mut wifi = wifi.lock().unwrap();
                     
-                    // Just call connect() - don't reconfigure, we're already in Mixed mode
+                    // Scan first to find the target network and its channel
+                    match wifi.scan() {
+                        Ok(networks) => {
+                            if let Some(target) = networks.iter().find(|n| n.ssid.as_str() == sta_ssid) {
+                                info!("Found '{sta_ssid}' on channel {} (RSSI: {})", target.channel, target.signal_strength);
+                            } else {
+                                warn!("Network '{sta_ssid}' not found in scan (found {} networks)", networks.len());
+                                for net in networks.iter().take(5) {
+                                    debug!("  - '{}' ch:{} rssi:{}", net.ssid, net.channel, net.signal_strength);
+                                }
+                                FreeRtos::delay_ms(5000);
+                                continue;
+                            }
+                        }
+                        Err(e) => {
+                            warn!("WiFi scan failed: {e:?}");
+                        }
+                    }
+                    
+                    // Now try to connect
                     match wifi.connect() {
                         Ok(()) => {
                             if wifi.wait_netif_up().is_ok() {

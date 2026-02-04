@@ -29,6 +29,10 @@ struct Args {
     /// Interval between stats printouts in seconds
     #[arg(short, long, default_value = "1")]
     interval: f64,
+
+    /// Use "1" repeat command instead of full "010C" for subsequent requests
+    #[arg(short, long)]
+    repeat: bool,
 }
 
 struct Stats {
@@ -168,9 +172,14 @@ fn parse_rpm_response(response: &str) -> Option<u32> {
     None
 }
 
-fn request_rpm(stream: &mut TcpStream) -> std::io::Result<Option<u32>> {
+fn request_rpm(stream: &mut TcpStream, use_repeat: bool) -> std::io::Result<Option<u32>> {
     // Send RPM request (PID 0x0C)
-    stream.write_all(b"010C\r")?;
+    // Use "1" to repeat last command if enabled (saves 3 bytes per request)
+    if use_repeat {
+        stream.write_all(b"1\r")?;
+    } else {
+        stream.write_all(b"010C\r")?;
+    }
 
     // Read until we get the prompt
     let response = read_until_prompt(stream)?;
@@ -203,6 +212,8 @@ fn run_benchmark(args: &Args) -> std::io::Result<()> {
         None
     };
     let interval = Duration::from_secs_f64(args.interval);
+    let use_repeat = args.repeat;
+    let mut can_repeat = false; // Need to send full command first
 
     loop {
         // Check if we should stop
@@ -214,8 +225,9 @@ fn run_benchmark(args: &Args) -> std::io::Result<()> {
 
         // Request RPM
         let request_start = Instant::now();
-        match request_rpm(&mut stream) {
+        match request_rpm(&mut stream, use_repeat && can_repeat) {
             Ok(Some(rpm)) => {
+                can_repeat = true; // After first successful request, we can use repeat
                 let latency = request_start.elapsed();
                 stats.record_success(latency, rpm);
 

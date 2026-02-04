@@ -15,6 +15,8 @@ pub struct ClientState {
     pub spaces_enabled: bool,
     /// Show header bytes in responses (ATH0/ATH1)
     pub headers_enabled: bool,
+    /// Last OBD command for repeat ("1" command)
+    pub last_obd_command: Option<String>,
 }
 
 impl Default for ClientState {
@@ -24,6 +26,7 @@ impl Default for ClientState {
             linefeeds_enabled: true,
             spaces_enabled: true,
             headers_enabled: false,
+            last_obd_command: None,
         }
     }
 }

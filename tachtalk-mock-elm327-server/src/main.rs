@@ -166,8 +166,18 @@ fn process_command(cmd: &str, start_time: &Instant, state: &mut ClientState) -> 
         return state.handle_at_command(cmd);
     }
 
+    // Handle repeat last command ("1" or empty after CR)
+    let effective_cmd = if cmd == "1" {
+        match &state.last_obd_command {
+            Some(last) => last.clone(),
+            None => return format!("?{le}{le}>"),
+        }
+    } else {
+        cmd.to_string()
+    };
+
     // Handle OBD2 commands
-    let obd_response = match cmd {
+    let obd_response = match effective_cmd.as_str() {
         // Mode 03 - Show stored DTCs
         "03" => Some("4300".to_string()),
 
@@ -223,6 +233,11 @@ fn process_command(cmd: &str, start_time: &Instant, state: &mut ClientState) -> 
 
     match obd_response {
         Some(hex_data) => {
+            // Store this command for repeat functionality (but not if it was already a repeat)
+            if cmd != "1" {
+                state.last_obd_command = Some(effective_cmd);
+            }
+
             // Format the hex data with spaces if enabled
             let formatted_data = state.format_response(hex_data.as_bytes());
             let formatted_str = String::from_utf8_lossy(&formatted_data);
