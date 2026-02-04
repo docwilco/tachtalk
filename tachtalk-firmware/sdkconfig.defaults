@@ -25,3 +25,6 @@ CONFIG_MDNS_ENABLED=y
 # Increase max sockets for handling multiple concurrent connections
 # Default is 10, max is 16 per LWIP Kconfig
 CONFIG_LWIP_MAX_SOCKETS=16
+
+# Task watchdog timeout (default 5s, increased for slow WiFi operations)
+CONFIG_ESP_TASK_WDT_TIMEOUT_S=15

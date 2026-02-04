@@ -26,6 +26,7 @@ mod sse_server;
 mod watchdog;
 mod web_server;
 
+use crate::watchdog::WatchdogHandle;
 use config::Config;
 use leds::LedController;
 use obd2::{AtCommandLog, PidLog, Obd2Proxy, start_rpm_led_task};
@@ -178,7 +179,7 @@ fn start_wifi_sta_connection(
                 ssid: ap_ssid.try_into().unwrap(),
                 password: ap_pw.try_into().unwrap_or_default(),
                 auth_method,
-                channel: 1,
+                channel: 0,
                 ..Default::default()
             },
         ))?;
@@ -283,10 +284,10 @@ fn main() -> Result<()> {
         ssid: ap_ssid.as_str().try_into().unwrap(),
         password: ap_pw.try_into().unwrap_or_default(),
         auth_method,
-        channel: 1,
+        channel: 0,
         ..Default::default()
     }))?;
-    wifi.start()?;
+    wifi.start();
 
     let ap_ip_info = wifi.wifi().ap_netif().get_ip_info()?;
     info!("AP started - connect to '{ap_ssid}' and navigate to http://{}", ap_ip_info.ip);
@@ -368,7 +369,7 @@ fn main() -> Result<()> {
 }
 
 /// Background task to manage WiFi STA connection
-/// - In Mixed mode: AP running, trying to connect to STA
+/// - In Mixed mode: AP running, scanning for target STA network
 /// - In STA mode: Connected to STA, AP disabled
 fn wifi_connection_manager(
     wifi: &Arc<Mutex<BlockingWifi<EspWifi<'static>>>>,
@@ -386,59 +387,43 @@ fn wifi_connection_manager(
         AuthMethod::WPA2Personal
     };
 
+    let watchdog = WatchdogHandle::register("wifi_manager");
+
     loop {
+        watchdog.feed();
         let current_mode = *wifi_mode.lock().unwrap();
 
         match current_mode {
             WifiMode::AccessPoint => {
-                // We're in Mixed mode (AP + trying STA) - try to connect
-                debug!("Attempting STA connection to '{sta_ssid}'");
+                // We're in Mixed mode (AP running) - scan for target network
+                debug!("Scanning for '{sta_ssid}'...");
                 
-                let connected = {
+                let target_found = {
                     let mut wifi = wifi.lock().unwrap();
-                    
-                    // Scan first to find the target network and its channel
+                    // Scan for nearby networks
                     match wifi.scan() {
                         Ok(networks) => {
-                            if let Some(target) = networks.iter().find(|n| n.ssid.as_str() == sta_ssid) {
-                                info!("Found '{sta_ssid}' on channel {} (RSSI: {})", target.channel, target.signal_strength);
+                            let found = networks.iter().any(|ap| {
+                                ap.ssid.as_str() == sta_ssid
+                            });
+                            if found {
+                                info!("Found target network '{sta_ssid}' in scan results");
                             } else {
-                                warn!("Network '{sta_ssid}' not found in scan (found {} networks)", networks.len());
-                                for net in networks.iter().take(5) {
-                                    debug!("  - '{}' ch:{} rssi:{}", net.ssid, net.channel, net.signal_strength);
-                                }
-                                FreeRtos::delay_ms(5000);
-                                continue;
+                                debug!("Target network '{sta_ssid}' not found ({} networks seen)", networks.len());
                             }
+                            found
                         }
                         Err(e) => {
                             warn!("WiFi scan failed: {e:?}");
-                        }
-                    }
-                    
-                    // Now try to connect
-                    match wifi.connect() {
-                        Ok(()) => {
-                            if wifi.wait_netif_up().is_ok() {
-                                if let Ok(ip_info) = wifi.wifi().sta_netif().get_ip_info() {
-                                    info!("WiFi STA connected to '{sta_ssid}' with IP: {}", ip_info.ip);
-                                    true
-                                } else {
-                                    false
-                                }
-                            } else {
-                                false
-                            }
-                        }
-                        Err(e) => {
-                            debug!("STA connection attempt failed: {e:?}");
                             false
                         }
                     }
                 };
+                watchdog.feed(); // Feed after scan
 
-                if connected {
-                    // Switch to STA-only mode (disable AP)
+                if target_found {
+                    // Switch to STA-only mode and connect
+                    info!("Switching to STA-only mode to connect to '{sta_ssid}'");
                     let mut wifi = wifi.lock().unwrap();
                     if let Err(e) = wifi.set_configuration(&Configuration::Client(ClientConfiguration {
                         ssid: sta_ssid.try_into().unwrap_or_default(),
@@ -447,13 +432,52 @@ fn wifi_connection_manager(
                         ..Default::default()
                     })) {
                         warn!("Failed to switch to STA-only mode: {e:?}");
-                    } else {
-                        info!("Switched to STA-only mode (AP disabled)");
-                        *wifi_mode.lock().unwrap() = WifiMode::Client;
+                        continue;
                     }
-                } else {
-                    // Still not connected, wait before retrying
-                    FreeRtos::delay_ms(10000);
+                    
+                    // Now try to connect
+                    match wifi.connect() {
+                        Ok(()) => {
+                            watchdog.feed();
+                            if wifi.wait_netif_up().is_ok() {
+                                if let Ok(ip_info) = wifi.wifi().sta_netif().get_ip_info() {
+                                    info!("WiFi STA connected to '{sta_ssid}' with IP: {}", ip_info.ip);
+                                    *wifi_mode.lock().unwrap() = WifiMode::Client;
+                                    continue;
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            warn!("STA connection failed: {e:?}");
+                        }
+                    }
+                    watchdog.feed();
+                    
+                    // Connection failed - switch back to Mixed mode
+                    warn!("Connection to '{sta_ssid}' failed, returning to Mixed mode");
+                    if let Err(e) = wifi.set_configuration(&Configuration::Mixed(
+                        ClientConfiguration {
+                            ssid: sta_ssid.try_into().unwrap_or_default(),
+                            password: sta_password.try_into().unwrap_or_default(),
+                            auth_method: sta_auth_method,
+                            ..Default::default()
+                        },
+                        AccessPointConfiguration {
+                            ssid: ap_ssid.try_into().unwrap(),
+                            password: ap_pw.as_str().try_into().unwrap_or_default(),
+                            auth_method: ap_auth_method,
+                            channel: 0,
+                            ..Default::default()
+                        },
+                    )) {
+                        warn!("Failed to switch back to Mixed mode: {e:?}");
+                    }
+                }
+                
+                // Wait before next scan (feed watchdog during wait)
+                for _ in 0..10 {
+                    FreeRtos::delay_ms(1000);
+                    watchdog.feed();
                 }
             }
 
@@ -482,7 +506,7 @@ fn wifi_connection_manager(
                             ssid: ap_ssid.try_into().unwrap(),
                             password: ap_pw.as_str().try_into().unwrap_or_default(),
                             auth_method: ap_auth_method,
-                            channel: 1,
+                            channel: 0,
                             ..Default::default()
                         },
                     )) {
