@@ -17,6 +17,7 @@ use esp_idf_svc::ipv4::{
 use log::{debug, info, warn, error};
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 mod config;
 mod dns;
@@ -139,57 +140,49 @@ fn setup_mdns() -> Option<EspMdns> {
     }
 }
 
-/// Start WiFi STA connection if configured, switching to Mixed mode
-fn start_wifi_sta_connection(
-    config: &Arc<Mutex<Config>>,
-    wifi: &Arc<Mutex<BlockingWifi<EspWifi<'static>>>>,
+/// Start WiFi in Mixed mode (AP + STA) and spawn connection manager thread
+fn start_wifi(
+    config: &Config,
+    wifi: BlockingWifi<EspWifi<'static>>,
     wifi_mode: &Arc<Mutex<WifiMode>>,
     ap_ssid: &str,
     ap_password: Option<String>,
-    auth_method: AuthMethod,
-) -> Result<()> {
-    let (sta_ssid, sta_password) = {
-        let cfg = config.lock().unwrap();
-        (cfg.wifi.ssid.clone(), cfg.wifi.password.clone().unwrap_or_default())
-    };
+    ap_auth_method: AuthMethod,
+) -> Result<Arc<Mutex<BlockingWifi<EspWifi<'static>>>>> {
+    // Get STA credentials from config
+    let sta_ssid = config.wifi.ssid.clone();
+    let sta_password = config.wifi.password.clone().unwrap_or_default();
+    let sta_auth_method = if sta_password.is_empty() { AuthMethod::None } else { AuthMethod::WPA2Personal };
 
-    info!("WiFi configured for '{sta_ssid}' - switching to Mixed mode");
-
-    // Determine AP password for mixed mode config
+    // Determine AP password for config
     let ap_pw = ap_password.as_deref().unwrap_or("");
 
-    // Determine STA auth method based on password
-    let sta_auth_method = if sta_password.is_empty() {
-        AuthMethod::None
-    } else {
-        AuthMethod::WPA2Personal
-    };
+    // Start WiFi in Mixed mode (AP + STA) so web UI is accessible while scanning
+    info!("Starting WiFi in Mixed mode: AP '{ap_ssid}' + STA '{sta_ssid}'");
+    let mut wifi = wifi;
+    wifi.set_configuration(&Configuration::Mixed(
+        ClientConfiguration {
+            ssid: sta_ssid.as_str().try_into().unwrap_or_default(),
+            password: sta_password.as_str().try_into().unwrap_or_default(),
+            auth_method: sta_auth_method,
+            ..Default::default()
+        },
+        AccessPointConfiguration {
+            ssid: ap_ssid.try_into().unwrap(),
+            password: ap_pw.try_into().unwrap_or_default(),
+            auth_method: ap_auth_method,
+            channel: 0,
+            ..Default::default()
+        },
+    ))?;
+    wifi.start()?;
 
-    // Switch to Mixed mode so we can try STA while keeping AP running
-    {
-        let mut wifi = wifi.lock().unwrap();
-        wifi.set_configuration(&Configuration::Mixed(
-            ClientConfiguration {
-                ssid: sta_ssid.as_str().try_into().unwrap_or_default(),
-                password: sta_password.as_str().try_into().unwrap_or_default(),
-                auth_method: sta_auth_method,
-                ..Default::default()
-            },
-            AccessPointConfiguration {
-                ssid: ap_ssid.try_into().unwrap(),
-                password: ap_pw.try_into().unwrap_or_default(),
-                auth_method,
-                channel: 0,
-                ..Default::default()
-            },
-        ))?;
-    }
+    let wifi = Arc::new(Mutex::new(wifi));
 
-    // Spawn background task to manage WiFi connection
+    // Spawn connection manager thread
     let wifi_clone = wifi.clone();
     let wifi_mode_clone = wifi_mode.clone();
     let ap_ssid = ap_ssid.to_string();
-
     std::thread::spawn(move || {
         wifi_connection_manager(
             &wifi_clone,
@@ -198,11 +191,11 @@ fn start_wifi_sta_connection(
             &sta_password,
             &ap_ssid,
             ap_password,
-            auth_method,
+            ap_auth_method,
         );
     });
 
-    Ok(())
+    Ok(wifi)
 }
 
 fn main() -> Result<()> {
@@ -264,7 +257,7 @@ fn main() -> Result<()> {
     let ap_netif = create_ap_netif()?;
     
     let wifi = EspWifi::wrap_all(wifi_driver, sta_netif, ap_netif)?;
-    let mut wifi = BlockingWifi::wrap(wifi, sys_loop)?;
+    let wifi = BlockingWifi::wrap(wifi, sys_loop)?;
 
     // Generate AP SSID from MAC address
     let mac = wifi.wifi().sta_netif().get_mac()?;
@@ -273,23 +266,22 @@ fn main() -> Result<()> {
 
     // Get AP password from config
     let ap_password = config.lock().unwrap().ap_password.clone();
-    let (auth_method, ap_pw) = match &ap_password {
-        Some(pw) if !pw.is_empty() => (AuthMethod::WPA2Personal, pw.as_str()),
-        _ => (AuthMethod::None, ""),
+    let ap_auth_method = match &ap_password {
+        Some(pw) if !pw.is_empty() => AuthMethod::WPA2Personal,
+        _ => AuthMethod::None,
     };
 
-    // Start AP immediately so web UI is accessible right away
-    info!("Starting Access Point: {ap_ssid}");
-    wifi.set_configuration(&Configuration::AccessPoint(AccessPointConfiguration {
-        ssid: ap_ssid.as_str().try_into().unwrap(),
-        password: ap_pw.try_into().unwrap_or_default(),
-        auth_method,
-        channel: 0,
-        ..Default::default()
-    }))?;
-    wifi.start();
+    // Start WiFi in Mixed mode and spawn connection manager thread
+    let wifi = start_wifi(
+        &config.lock().unwrap(),
+        wifi,
+        &wifi_mode,
+        &ap_ssid,
+        ap_password,
+        ap_auth_method,
+    )?;
 
-    let ap_ip_info = wifi.wifi().ap_netif().get_ip_info()?;
+    let ap_ip_info = wifi.lock().unwrap().wifi().ap_netif().get_ip_info()?;
     info!("AP started - connect to '{ap_ssid}' and navigate to http://{}", ap_ip_info.ip);
 
     // Start DNS server for captive portal
@@ -304,8 +296,7 @@ fn main() -> Result<()> {
     // Create shared log for tracking OBD2 PIDs (for debugging via web UI)
     let pid_log: PidLog = Arc::new(Mutex::new(HashSet::new()));
 
-    // Start web server immediately
-    let wifi = Arc::new(Mutex::new(wifi));
+    // Start web server
     {
         let config_clone = config.clone();
         let mode_clone = wifi_mode.clone();
@@ -348,23 +339,159 @@ fn main() -> Result<()> {
     }
     info!("OBD2 proxy started");
 
-    // Check if WiFi STA is configured and switch to Mixed mode if so
-    let wifi_configured = {
-        let cfg = config.lock().unwrap();
-        cfg.wifi.is_configured()
-    };
-
-    if wifi_configured {
-        start_wifi_sta_connection(&config, &wifi, &wifi_mode, &ap_ssid, ap_password, auth_method)?;
-    } else {
-        info!("No WiFi configured - AP mode only. Configure WiFi via web UI.");
-    }
-
     info!("All systems running!");
 
     // Main loop - keep alive
     loop {
         FreeRtos::delay_ms(1000);
+    }
+}
+
+/// Configuration bundle for WiFi connection manager
+struct WifiManagerContext<'a> {
+    wifi: &'a Arc<Mutex<BlockingWifi<EspWifi<'static>>>>,
+    wifi_mode: &'a Arc<Mutex<WifiMode>>,
+    sta_ssid: &'a str,
+    client_config: Configuration,
+    mixed_config: Configuration,
+    watchdog: WatchdogHandle,
+}
+
+/// Handle Mixed mode: scan for target network, attempt connection if found
+fn handle_mixed_mode(ctx: &WifiManagerContext<'_>) {
+    let sta_ssid = ctx.sta_ssid;
+    debug!("Scanning for '{sta_ssid}'...");
+    
+    let target_found = {
+        let mut wifi = ctx.wifi.lock().unwrap();
+        match wifi.scan() {
+            Ok(networks) => {
+                let found = networks.iter().any(|ap| ap.ssid.as_str() == sta_ssid);
+                if found {
+                    info!("Found target network '{sta_ssid}' in scan results");
+                } else {
+                    debug!("Target network '{sta_ssid}' not found ({} networks seen)", networks.len());
+                }
+                found
+            }
+            Err(e) => {
+                warn!("WiFi scan failed: {e:?}");
+                false
+            }
+        }
+    };
+    ctx.watchdog.feed();
+
+    if target_found {
+        info!("Switching to STA-only mode to connect to '{sta_ssid}'");
+        let mut wifi = ctx.wifi.lock().unwrap();
+        
+        // Stop WiFi before changing configuration
+        if let Err(e) = wifi.stop() {
+            warn!("Failed to stop WiFi for mode switch: {e:?}");
+            return;
+        }
+        
+        if let Err(e) = wifi.set_configuration(&ctx.client_config) {
+            warn!("Failed to switch to STA-only mode: {e:?}");
+            // Try to restart in Mixed mode
+            if let Err(e) = wifi.set_configuration(&ctx.mixed_config) {
+                warn!("Failed to restore Mixed mode config: {e:?}");
+            }
+            if let Err(e) = wifi.start() {
+                warn!("Failed to restart WiFi after config failure: {e:?}");
+            }
+            return;
+        }
+        
+        // Restart WiFi with new configuration
+        if let Err(e) = wifi.start() {
+            warn!("Failed to start WiFi in STA-only mode: {e:?}");
+            if let Err(e) = wifi.set_configuration(&ctx.mixed_config) {
+                warn!("Failed to restore Mixed mode config: {e:?}");
+            }
+            if let Err(e) = wifi.start() {
+                warn!("Failed to restart WiFi after start failure: {e:?}");
+            }
+            return;
+        }
+        
+        // Brief delay for WiFi driver to settle after mode switch
+        FreeRtos::delay_ms(100);
+        
+        match wifi.connect() {
+            Ok(()) => {
+                // Wait for IP with watchdog-friendly polling (3s chunks, up to 15s total)
+                for _ in 0..5 {
+                    ctx.watchdog.feed();
+                    let result = wifi.ip_wait_while(
+                        || wifi.is_up().map(|up| !up),
+                        Some(Duration::from_secs(3)),
+                    );
+                    if result.is_ok() {
+                        if let Ok(ip_info) = wifi.wifi().sta_netif().get_ip_info() {
+                            info!("WiFi STA connected to '{sta_ssid}' with IP: {}", ip_info.ip);
+                            *ctx.wifi_mode.lock().unwrap() = WifiMode::Client;
+                            return;
+                        }
+                    }
+                    // Check if already up before next iteration
+                    if wifi.is_up().unwrap_or(false) {
+                        break;
+                    }
+                }
+            }
+            Err(e) => {
+                warn!("STA connection failed: {e:?}");
+            }
+        }
+        ctx.watchdog.feed();
+        
+        // Connection failed - switch back to Mixed mode
+        warn!("Connection to '{sta_ssid}' failed, returning to Mixed mode");
+        if let Err(e) = wifi.stop() {
+            warn!("Failed to stop WiFi for fallback: {e:?}");
+        }
+        if let Err(e) = wifi.set_configuration(&ctx.mixed_config) {
+            warn!("Failed to switch back to Mixed mode: {e:?}");
+        }
+        if let Err(e) = wifi.start() {
+            warn!("Failed to restart WiFi in Mixed mode: {e:?}");
+        }
+    }
+    
+    // Wait before next scan
+    for _ in 0..10 {
+        FreeRtos::delay_ms(1000);
+        ctx.watchdog.feed();
+    }
+}
+
+/// Handle Client mode: monitor connection, switch back to Mixed if disconnected
+fn handle_client_mode(ctx: &WifiManagerContext<'_>) {
+    FreeRtos::delay_ms(1000);
+    
+    let connected = {
+        let wifi = ctx.wifi.lock().unwrap();
+        wifi.is_connected().unwrap_or(false)
+    };
+    
+    if !connected {
+        warn!("WiFi STA disconnected from '{}' - switching back to Mixed mode", ctx.sta_ssid);
+        
+        let mut wifi = ctx.wifi.lock().unwrap();
+        if let Err(e) = wifi.stop() {
+            warn!("Failed to stop WiFi for mode switch: {e:?}");
+        }
+        if let Err(e) = wifi.set_configuration(&ctx.mixed_config) {
+            warn!("Failed to switch to Mixed mode: {e:?}");
+        } else {
+            info!("Switched to Mixed mode (AP re-enabled)");
+            *ctx.wifi_mode.lock().unwrap() = WifiMode::AccessPoint;
+        }
+        if let Err(e) = wifi.start() {
+            warn!("Failed to restart WiFi in Mixed mode: {e:?}");
+        }
     }
 }
 
@@ -381,142 +508,43 @@ fn wifi_connection_manager(
     ap_auth_method: AuthMethod,
 ) {
     let ap_pw = ap_password.unwrap_or_default();
-    let sta_auth_method = if sta_password.is_empty() {
-        AuthMethod::None
-    } else {
-        AuthMethod::WPA2Personal
+    let sta_auth_method = if sta_password.is_empty() { AuthMethod::None } else { AuthMethod::WPA2Personal };
+
+    let ctx = WifiManagerContext {
+        wifi,
+        wifi_mode,
+        sta_ssid,
+        client_config: Configuration::Client(ClientConfiguration {
+            ssid: sta_ssid.try_into().unwrap_or_default(),
+            password: sta_password.try_into().unwrap_or_default(),
+            auth_method: sta_auth_method,
+            ..Default::default()
+        }),
+        mixed_config: Configuration::Mixed(
+            ClientConfiguration {
+                ssid: sta_ssid.try_into().unwrap_or_default(),
+                password: sta_password.try_into().unwrap_or_default(),
+                auth_method: sta_auth_method,
+                ..Default::default()
+            },
+            AccessPointConfiguration {
+                ssid: ap_ssid.try_into().unwrap(),
+                password: ap_pw.as_str().try_into().unwrap_or_default(),
+                auth_method: ap_auth_method,
+                channel: 0,
+                ..Default::default()
+            },
+        ),
+        watchdog: WatchdogHandle::register("wifi_manager"),
     };
 
-    let watchdog = WatchdogHandle::register("wifi_manager");
-
     loop {
-        watchdog.feed();
-        let current_mode = *wifi_mode.lock().unwrap();
+        ctx.watchdog.feed();
+        let current_mode = *ctx.wifi_mode.lock().unwrap();
 
         match current_mode {
-            WifiMode::AccessPoint => {
-                // We're in Mixed mode (AP running) - scan for target network
-                debug!("Scanning for '{sta_ssid}'...");
-                
-                let target_found = {
-                    let mut wifi = wifi.lock().unwrap();
-                    // Scan for nearby networks
-                    match wifi.scan() {
-                        Ok(networks) => {
-                            let found = networks.iter().any(|ap| {
-                                ap.ssid.as_str() == sta_ssid
-                            });
-                            if found {
-                                info!("Found target network '{sta_ssid}' in scan results");
-                            } else {
-                                debug!("Target network '{sta_ssid}' not found ({} networks seen)", networks.len());
-                            }
-                            found
-                        }
-                        Err(e) => {
-                            warn!("WiFi scan failed: {e:?}");
-                            false
-                        }
-                    }
-                };
-                watchdog.feed(); // Feed after scan
-
-                if target_found {
-                    // Switch to STA-only mode and connect
-                    info!("Switching to STA-only mode to connect to '{sta_ssid}'");
-                    let mut wifi = wifi.lock().unwrap();
-                    if let Err(e) = wifi.set_configuration(&Configuration::Client(ClientConfiguration {
-                        ssid: sta_ssid.try_into().unwrap_or_default(),
-                        password: sta_password.try_into().unwrap_or_default(),
-                        auth_method: sta_auth_method,
-                        ..Default::default()
-                    })) {
-                        warn!("Failed to switch to STA-only mode: {e:?}");
-                        continue;
-                    }
-                    
-                    // Now try to connect
-                    match wifi.connect() {
-                        Ok(()) => {
-                            watchdog.feed();
-                            if wifi.wait_netif_up().is_ok() {
-                                if let Ok(ip_info) = wifi.wifi().sta_netif().get_ip_info() {
-                                    info!("WiFi STA connected to '{sta_ssid}' with IP: {}", ip_info.ip);
-                                    *wifi_mode.lock().unwrap() = WifiMode::Client;
-                                    continue;
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            warn!("STA connection failed: {e:?}");
-                        }
-                    }
-                    watchdog.feed();
-                    
-                    // Connection failed - switch back to Mixed mode
-                    warn!("Connection to '{sta_ssid}' failed, returning to Mixed mode");
-                    if let Err(e) = wifi.set_configuration(&Configuration::Mixed(
-                        ClientConfiguration {
-                            ssid: sta_ssid.try_into().unwrap_or_default(),
-                            password: sta_password.try_into().unwrap_or_default(),
-                            auth_method: sta_auth_method,
-                            ..Default::default()
-                        },
-                        AccessPointConfiguration {
-                            ssid: ap_ssid.try_into().unwrap(),
-                            password: ap_pw.as_str().try_into().unwrap_or_default(),
-                            auth_method: ap_auth_method,
-                            channel: 0,
-                            ..Default::default()
-                        },
-                    )) {
-                        warn!("Failed to switch back to Mixed mode: {e:?}");
-                    }
-                }
-                
-                // Wait before next scan (feed watchdog during wait)
-                for _ in 0..10 {
-                    FreeRtos::delay_ms(1000);
-                    watchdog.feed();
-                }
-            }
-
-            WifiMode::Client => {
-                // We're in STA-only mode - monitor connection
-                FreeRtos::delay_ms(1000);
-                
-                let connected = {
-                    let wifi = wifi.lock().unwrap();
-                    wifi.is_connected().unwrap_or(false)
-                };
-                
-                if !connected {
-                    warn!("WiFi STA disconnected from '{sta_ssid}' - switching back to Mixed mode");
-                    
-                    // Switch back to Mixed mode (re-enable AP)
-                    let mut wifi = wifi.lock().unwrap();
-                    if let Err(e) = wifi.set_configuration(&Configuration::Mixed(
-                        ClientConfiguration {
-                            ssid: sta_ssid.try_into().unwrap_or_default(),
-                            password: sta_password.try_into().unwrap_or_default(),
-                            auth_method: sta_auth_method,
-                            ..Default::default()
-                        },
-                        AccessPointConfiguration {
-                            ssid: ap_ssid.try_into().unwrap(),
-                            password: ap_pw.as_str().try_into().unwrap_or_default(),
-                            auth_method: ap_auth_method,
-                            channel: 0,
-                            ..Default::default()
-                        },
-                    )) {
-                        warn!("Failed to switch to Mixed mode: {e:?}");
-                    } else {
-                        info!("Switched to Mixed mode (AP re-enabled)");
-                        *wifi_mode.lock().unwrap() = WifiMode::AccessPoint;
-                    }
-                }
-            }
+            WifiMode::AccessPoint => handle_mixed_mode(&ctx),
+            WifiMode::Client => handle_client_mode(&ctx),
         }
     }
 }

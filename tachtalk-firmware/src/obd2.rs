@@ -162,31 +162,28 @@ fn dongle_task(rx: &Receiver<DongleRequest>, config: &Arc<Mutex<Config>>) {
                         let repeat_result = execute_command(&mut state.stream, b"1", timeout);
                         
                         // Check if repeat worked
-                        match &repeat_result {
-                            Ok(response) => {
-                                let response_str = String::from_utf8_lossy(response);
-                                if response_str.contains('?') {
-                                    // Repeat not supported, mark and resend full command
-                                    info!("Dongle does not support repeat command");
-                                    state.supports_repeat = Some(false);
-                                    // Update last_command before sending (dongle will have this as its last)
-                                    state.last_command = Some(request.command.clone());
-                                    execute_command(&mut state.stream, &request.command, timeout)
-                                } else {
-                                    // Repeat worked! last_command stays the same (we repeated it)
-                                    if state.supports_repeat.is_none() {
-                                        info!("Dongle supports repeat command");
-                                        state.supports_repeat = Some(true);
-                                    }
-                                    repeat_result
+                        if let Ok(response) = &repeat_result {
+                            let response_str = String::from_utf8_lossy(response);
+                            if response_str.contains('?') {
+                                // Repeat not supported, mark and resend full command
+                                info!("Dongle does not support repeat command");
+                                state.supports_repeat = Some(false);
+                                // Update last_command before sending (dongle will have this as its last)
+                                state.last_command = Some(request.command.clone());
+                                execute_command(&mut state.stream, &request.command, timeout)
+                            } else {
+                                // Repeat worked! last_command stays the same (we repeated it)
+                                if state.supports_repeat.is_none() {
+                                    info!("Dongle supports repeat command");
+                                    state.supports_repeat = Some(true);
                                 }
-                            }
-                            Err(_) => {
-                                // Repeat failed with error - clear last_command since we don't
-                                // know if dongle processed it
-                                state.last_command = None;
                                 repeat_result
                             }
+                        } else {
+                            // Repeat failed with error - clear last_command since we don't
+                            // know if dongle processed it
+                            state.last_command = None;
+                            repeat_result
                         }
                     } else {
                         // Update last_command before sending (dongle will have this as its last)
@@ -288,8 +285,6 @@ fn try_connect(dongle_ip: &str, dongle_port: u16, timeout: Duration, watchdog: &
         last_command: None,
     })
 }
-
-/// Execute a command on the dongle and return the response
 
 /// Execute a command on the dongle and return the response
 fn execute_command(stream: &mut TcpStream, command: &[u8], timeout: Duration) -> Result<Obd2Buffer, DongleError> {
@@ -658,18 +653,15 @@ impl Obd2Proxy {
 
         // Handle "1" repeat command - expand to this client's last command
         let (effective_command, effective_raw): (String, Obd2Buffer) = if command == "1" {
-            match &state.last_obd_command {
-                Some(last) => {
-                    debug!("Expanding repeat command to: {last}");
-                    (last.clone(), last.as_bytes().into())
-                }
-                None => {
-                    // No previous command - return error
-                    let le = state.line_ending();
-                    let error_response = format!("{le}?{le}>");
-                    writer.write_all(error_response.as_bytes())?;
-                    return Ok(());
-                }
+            if let Some(last) = &state.last_obd_command {
+                debug!("Expanding repeat command to: {last}");
+                (last.clone(), last.as_bytes().into())
+            } else {
+                // No previous command - return error
+                let le = state.line_ending();
+                let error_response = format!("{le}?{le}>");
+                writer.write_all(error_response.as_bytes())?;
+                return Ok(());
             }
         } else {
             (command.to_string(), raw_command.into())

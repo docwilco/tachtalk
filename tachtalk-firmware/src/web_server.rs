@@ -237,6 +237,27 @@ const HTML_INDEX_END: &str = r#";</script>
             padding: 3px 0;
             font-size: 0.9em;
         }
+        .raw-config-textarea {
+            width: 100%;
+            min-height: 300px;
+            font-family: monospace;
+            font-size: 0.85em;
+            background-color: #1a1a1a;
+            color: #8f8;
+            border: 1px solid #444;
+            border-radius: 3px;
+            padding: 10px;
+            resize: vertical;
+            white-space: pre;
+            overflow-wrap: normal;
+            overflow-x: auto;
+        }
+        .raw-config-buttons {
+            margin-top: 10px;
+        }
+        .raw-config-buttons button {
+            margin-right: 10px;
+        }
         .at-commands {
             font-family: monospace;
             font-size: 0.85em;
@@ -313,6 +334,19 @@ const HTML_INDEX_END: &str = r#";</script>
                 <div id="atCommands" class="at-commands">Loading...</div>
                 <h3>OBD2 PIDs Requested</h3>
                 <div id="pids" class="pids">Loading...</div>
+            </div>
+        </details>
+        
+        <details class="debug-section">
+            <summary>📝 Raw Config JSON</summary>
+            <div class="debug-content">
+                <p style="color: #888; font-size: 0.9em;">Edit the raw configuration JSON. Be careful - invalid JSON will be rejected.</p>
+                <textarea id="rawConfigJson" class="raw-config-textarea" spellcheck="false"></textarea>
+                <div class="raw-config-buttons">
+                    <button id="btnSaveRawConfig" onclick="saveRawConfig()">Save Raw Config</button>
+                    <button id="btnReloadRawConfig" onclick="loadRawConfig()">Reload</button>
+                    <button onclick="formatRawConfig()">Format JSON</button>
+                </div>
             </div>
         </details>
         
@@ -810,6 +844,72 @@ const HTML_INDEX_END: &str = r#";</script>
             return (bytes / (1024 * 1024)).toFixed(2) + ' MB';
         }
 
+        async function loadRawConfig() {
+            setButtonLoading('btnReloadRawConfig', true, 'Loading...');
+            try {
+                const response = await fetch('/api/config');
+                if (response.ok) {
+                    const cfg = await response.json();
+                    document.getElementById('rawConfigJson').value = JSON.stringify(cfg, null, 2);
+                    showStatus('Raw config loaded!', false);
+                } else {
+                    showStatus('Failed to load raw config', true);
+                }
+            } catch (error) {
+                showStatus('Error: ' + error.message, true);
+            } finally {
+                setButtonLoading('btnReloadRawConfig', false);
+            }
+        }
+
+        async function saveRawConfig() {
+            const textarea = document.getElementById('rawConfigJson');
+            let parsed;
+            try {
+                parsed = JSON.parse(textarea.value);
+            } catch (e) {
+                showStatus('Invalid JSON: ' + e.message, true);
+                return;
+            }
+            
+            setButtonLoading('btnSaveRawConfig', true, 'Saving...');
+            try {
+                const response = await fetch('/api/config', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(parsed)
+                });
+                
+                if (response.ok) {
+                    const result = await response.json().catch(() => ({}));
+                    if (result.restart) {
+                        showStatus('Raw config saved! Restarting device...', false);
+                    } else {
+                        showStatus('Raw config saved! Reloading page config...', false);
+                        // Reload the main config to sync UI
+                        loadConfig();
+                    }
+                } else {
+                    showStatus('Failed to save raw config (server rejected)', true);
+                }
+            } catch (error) {
+                showStatus('Error: ' + error.message, true);
+            } finally {
+                setButtonLoading('btnSaveRawConfig', false);
+            }
+        }
+
+        function formatRawConfig() {
+            const textarea = document.getElementById('rawConfigJson');
+            try {
+                const parsed = JSON.parse(textarea.value);
+                textarea.value = JSON.stringify(parsed, null, 2);
+                showStatus('JSON formatted!', false);
+            } catch (e) {
+                showStatus('Invalid JSON: ' + e.message, true);
+            }
+        }
+
         async function loadDebugInfo() {
             try {
                 const response = await fetch('/api/debug_info');
@@ -847,12 +947,21 @@ const HTML_INDEX_END: &str = r#";</script>
         setupRpmEventSource();
         loadDebugInfo();
         
+        // Load raw config when that section is opened
+        document.querySelectorAll('.debug-section').forEach(details => {
+            details.addEventListener('toggle', (e) => {
+                if (e.target.open && e.target.querySelector('#rawConfigJson')) {
+                    loadRawConfig();
+                }
+            });
+        });
+        
         // Poll network status (RPM uses SSE now)
         setInterval(loadNetworkStatus, 5000);
         // Poll debug info every second (only when debug section is open)
         setInterval(() => {
-            const details = document.querySelector('.debug-section');
-            if (details && details.open) loadDebugInfo();
+            const debugSection = document.querySelector('.debug-section:has(#freeHeap)');
+            if (debugSection && debugSection.open) loadDebugInfo();
         }, 1000);
     </script>
 </body>
@@ -938,7 +1047,7 @@ pub fn start_server(
     let config_clone = config.clone();
     server.fn_handler("/api/config", Method::Post, move |mut req| -> Result<(), esp_idf_svc::io::EspIOError> {
         info!("HTTP: POST /api/config");
-        let mut buf = vec![0u8; 2048];
+        let mut buf = vec![0u8; 8192];
         let bytes_read = req.read(&mut buf)?;
         
         if let Ok(mut new_config) = serde_json::from_slice::<Config>(&buf[..bytes_read]) {
@@ -1149,14 +1258,25 @@ pub fn start_server(
     })?;
 
     // POST reboot endpoint
-    server.fn_handler("/api/reboot", Method::Post, |req| -> Result<(), esp_idf_svc::io::EspIOError> {
+    let wifi_reboot = wifi.clone();
+    server.fn_handler("/api/reboot", Method::Post, move |req| -> Result<(), esp_idf_svc::io::EspIOError> {
         info!("HTTP: POST /api/reboot - Device reboot requested");
         
         req.into_ok_response()?;
         
         // Schedule restart after response is sent
-        std::thread::spawn(|| {
+        let wifi = wifi_reboot.clone();
+        std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_secs(1));
+            
+            // Stop WiFi before restarting to ensure clean shutdown
+            info!("Stopping WiFi before reboot...");
+            if let Ok(mut wifi) = wifi.lock() {
+                if let Err(e) = wifi.stop() {
+                    warn!("Failed to stop WiFi: {e:?}");
+                }
+            }
+            
             info!("Rebooting device now...");
             unsafe {
                 esp_idf_svc::sys::esp_restart();

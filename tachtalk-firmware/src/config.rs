@@ -46,19 +46,15 @@ pub fn init_nvs(nvs_partition: EspNvsPartition<NvsDefault>) -> Result<()> {
     Ok(())
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WifiConfig {
     pub ssid: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub password: Option<String>,
 }
 
-impl WifiConfig {
-    pub fn is_configured(&self) -> bool {
-        !self.ssid.is_empty()
-    }
-
-    pub fn new_default() -> Self {
+impl Default for WifiConfig {
+    fn default() -> Self {
         Self {
             ssid: "V-LINK".to_string(),
             password: None,
@@ -182,7 +178,7 @@ const fn default_obd2_timeout_ms() -> u64 {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            wifi: WifiConfig::new_default(),
+            wifi: WifiConfig::default(),
             ip: IpConfig::default(),
             obd2: Obd2Config::default(),
             ap_password: None,
@@ -260,11 +256,15 @@ impl Default for Config {
 }
 
 impl Config {
-    /// Clamp values to valid ranges (e.g., timeout limits)
+    /// Clamp values to valid ranges and fix invalid values
     pub fn validate(&mut self) {
         if self.obd2_timeout_ms > MAX_OBD2_TIMEOUT_MS {
             warn!("Clamping obd2_timeout_ms from {} to {}", self.obd2_timeout_ms, MAX_OBD2_TIMEOUT_MS);
             self.obd2_timeout_ms = MAX_OBD2_TIMEOUT_MS;
+        }
+        if self.wifi.ssid.is_empty() {
+            warn!("WiFi SSID is empty, resetting to default");
+            self.wifi = WifiConfig::default();
         }
     }
 
