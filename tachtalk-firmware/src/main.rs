@@ -20,10 +20,12 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 mod config;
+mod cpu_stats;
 mod dns;
 mod leds;
 mod obd2;
 mod sse_server;
+mod thread_util;
 mod watchdog;
 mod web_server;
 
@@ -183,7 +185,7 @@ fn start_wifi(
     let wifi_clone = wifi.clone();
     let wifi_mode_clone = wifi_mode.clone();
     let ap_ssid = ap_ssid.to_string();
-    std::thread::spawn(move || {
+    thread_util::spawn_named(c"wifi_mgr", move || {
         wifi_connection_manager(
             &wifi_clone,
             &wifi_mode_clone,
@@ -304,7 +306,14 @@ fn main() -> Result<()> {
     // Create shared RPM state for HTTP polling fallback
     let shared_rpm: web_server::SharedRpm = Arc::new(Mutex::new(None));
 
-    // Start web server
+    // Start OBD2 dongle task and RPM/LED task (before web server so we can pass rpm_tx)
+    let dongle_tx = obd2::start_dongle_task(config.clone());
+    
+    // Start the combined RPM poller and LED update task
+    // This takes ownership of led_controller (no Arc<Mutex> needed)
+    let rpm_tx = start_rpm_led_task(led_controller, config.clone(), sse_tx.clone(), dongle_tx.clone(), shared_rpm.clone());
+
+    // Start web server (needs rpm_tx to notify of config changes)
     {
         let config_clone = config.clone();
         let mode_clone = wifi_mode.clone();
@@ -313,9 +322,10 @@ fn main() -> Result<()> {
         let at_cmd_log_clone = at_command_log.clone();
         let pid_log_clone = pid_log.clone();
         let shared_rpm_clone = shared_rpm.clone();
+        let rpm_tx_clone = rpm_tx.clone();
 
-        std::thread::spawn(move || {
-            if let Err(e) = web_server::start_server(&config_clone, &mode_clone, &wifi_clone, Some(ap_hostname_clone), at_cmd_log_clone, pid_log_clone, shared_rpm_clone) {
+        thread_util::spawn_named(c"web_srv", move || {
+            if let Err(e) = web_server::start_server(&config_clone, &mode_clone, &wifi_clone, Some(ap_hostname_clone), at_cmd_log_clone, pid_log_clone, shared_rpm_clone, rpm_tx_clone) {
                 error!("Web server error: {e:?}");
             }
         });
@@ -326,20 +336,14 @@ fn main() -> Result<()> {
     // Start mDNS for local discovery (tachtalk.local)
     let _mdns = setup_mdns();
 
-    // Start OBD2 proxy and RPM/LED task
-    let dongle_tx = obd2::start_dongle_task(config.clone());
-    
-    // Start the combined RPM poller and LED update task
-    // This takes ownership of led_controller (no Arc<Mutex> needed)
-    let rpm_tx = start_rpm_led_task(led_controller, config.clone(), sse_tx.clone(), dongle_tx.clone(), shared_rpm);
-    
+    // Start OBD2 proxy
     {
         let config_clone = config.clone();
         let rpm_tx_clone = rpm_tx.clone();
         let at_cmd_log_clone = at_command_log.clone();
         let pid_log_clone = pid_log.clone();
         
-        std::thread::spawn(move || {
+        thread_util::spawn_named(c"obd2_proxy", move || {
             let proxy = Obd2Proxy::new(config_clone, rpm_tx_clone, dongle_tx, at_cmd_log_clone, pid_log_clone);
             if let Err(e) = proxy.run() {
                 error!("OBD2 proxy error: {e:?}");
@@ -350,9 +354,17 @@ fn main() -> Result<()> {
 
     info!("All systems running!");
 
-    // Main loop - keep alive
+    // CPU usage monitoring
+    let mut cpu_snapshots = std::collections::HashMap::new();
+    let mut cpu_total = 0u64;
+
+    // Main loop - keep alive and print CPU stats
     loop {
-        FreeRtos::delay_ms(1000);
+        // Sleep for 5 seconds (5 iterations of 1s)
+        for _ in 0..5 {
+            FreeRtos::delay_ms(1000);
+        }
+        cpu_stats::print_cpu_usage_deltas(&mut cpu_snapshots, &mut cpu_total);
     }
 }
 

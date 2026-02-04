@@ -995,6 +995,7 @@ pub fn start_server(
     at_command_log: AtCommandLog,
     pid_log: PidLog,
     shared_rpm: SharedRpm,
+    rpm_tx: crate::obd2::RpmTaskSender,
 ) -> Result<()> {
     info!("Web server starting...");
     
@@ -1049,6 +1050,7 @@ pub fn start_server(
 
     // POST config endpoint
     let config_clone = config.clone();
+    let rpm_tx_clone = rpm_tx.clone();
     server.fn_handler("/api/config", Method::Post, move |mut req| -> Result<(), esp_idf_svc::io::EspIOError> {
         info!("HTTP: POST /api/config");
         let mut buf = vec![0u8; 8192];
@@ -1078,13 +1080,16 @@ pub fn start_server(
                 }
             }
             
+            // Notify RPM task of config change (to recalculate render interval)
+            let _ = rpm_tx_clone.send(crate::obd2::RpmTaskMessage::ConfigChanged);
+            
             if let Some(old_gpio) = old_gpio {
                 info!("LED GPIO changed from {} to new value, resetting old pin and restarting in 2 seconds...", old_gpio);
                 // Reset the OLD GPIO to clear RMT routing before restart
                 unsafe { esp_idf_svc::sys::gpio_reset_pin(i32::from(old_gpio)); }
                 let mut response = req.into_ok_response()?;
                 response.write_all(b"{\"restart\":true}")?;
-                std::thread::spawn(|| {
+                crate::thread_util::spawn_named(c"restart", || {
                     std::thread::sleep(std::time::Duration::from_secs(2));
                     unsafe { esp_idf_svc::sys::esp_restart(); }
                 });
@@ -1132,7 +1137,7 @@ pub fn start_server(
             
             // Schedule restart after response is sent
             info!("WiFi configured, restarting in 2 seconds...");
-            std::thread::spawn(|| {
+            crate::thread_util::spawn_named(c"restart", || {
                 std::thread::sleep(std::time::Duration::from_secs(2));
                 unsafe {
                     esp_idf_svc::sys::esp_restart();
@@ -1280,7 +1285,7 @@ pub fn start_server(
         
         // Schedule restart after response is sent
         let wifi = wifi_reboot.clone();
-        std::thread::spawn(move || {
+        crate::thread_util::spawn_named(c"restart", move || {
             std::thread::sleep(std::time::Duration::from_secs(1));
             
             // Stop WiFi before restarting to ensure clean shutdown

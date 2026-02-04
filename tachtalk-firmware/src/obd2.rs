@@ -27,6 +27,17 @@ const IDLE_POLL_INTERVAL_MS: u64 = 100;
 const CLIENT_ACTIVITY_BACKOFF: Duration = Duration::from_millis(500);
 const RECONNECT_DELAY: Duration = Duration::from_secs(1);
 
+/// Get current wallclock time in milliseconds
+fn get_wallclock_ms() -> u64 {
+    (esp_idf_svc::systime::EspSystemTime.now().as_millis() % u128::from(u64::MAX)) as u64
+}
+
+/// Compute the next wallclock-aligned deadline for a given interval
+fn next_aligned_deadline(interval_ms: u64) -> u64 {
+    let now_ms = get_wallclock_ms();
+    ((now_ms / interval_ms) + 1) * interval_ms
+}
+
 /// State for the dongle connection
 struct DongleState {
     stream: TcpStream,
@@ -42,8 +53,17 @@ pub type AtCommandLog = Arc<Mutex<HashSet<String>>>;
 /// Shared log of unique OBD2 PIDs requested by clients (for debugging)
 pub type PidLog = Arc<Mutex<HashSet<String>>>;
 
-/// Channel sender for RPM updates to the LED task
-pub type RpmSender = Sender<u32>;
+/// Messages sent to the LED task
+#[derive(Debug, Clone)]
+pub enum RpmTaskMessage {
+    /// RPM update from client or poll
+    Rpm(u32),
+    /// Config changed, recalculate render interval
+    ConfigChanged,
+}
+
+/// Channel sender for messages to the LED task
+pub type RpmTaskSender = Sender<RpmTaskMessage>;
 
 /// Type alias for small OBD2 command/response buffers
 pub type Obd2Buffer = SmallVec<[u8; 12]>;
@@ -59,7 +79,7 @@ pub struct DongleRequest {
 /// Shared context for processing OBD2 commands (reduces parameter count)
 struct CommandContext<'a> {
     config: &'a Arc<Mutex<Config>>,
-    rpm_tx: &'a RpmSender,
+    rpm_tx: &'a RpmTaskSender,
     dongle_tx: &'a DongleSender,
     at_command_log: &'a AtCommandLog,
     pid_log: &'a PidLog,
@@ -104,7 +124,7 @@ pub type DongleSender = Sender<DongleRequest>;
 /// Start the dongle task and return a sender for requests
 pub fn start_dongle_task(config: Arc<Mutex<Config>>) -> DongleSender {
     let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || {
+    crate::thread_util::spawn_named(c"obd2_dongle", move || {
         dongle_task(&rx, &config);
     });
     tx
@@ -366,10 +386,10 @@ pub fn start_rpm_led_task(
     sse_tx: SseSender,
     dongle_tx: DongleSender,
     shared_rpm: crate::web_server::SharedRpm,
-) -> RpmSender {
-    let (rpm_tx, rpm_rx) = mpsc::channel::<u32>();
+) -> RpmTaskSender {
+    let (rpm_tx, rpm_rx) = mpsc::channel::<RpmTaskMessage>();
 
-    std::thread::spawn(move || {
+    crate::thread_util::spawn_named(c"rpm_led", move || {
         // Boot animation: blink purple 3 times
         {
             let total_leds = config.lock().unwrap().total_leds;
@@ -383,50 +403,65 @@ pub fn start_rpm_led_task(
         info!("RPM/LED task started (GPIO {led_gpio})");
 
         let mut current_rpm: Option<u32> = None;
+        let mut last_rendered_rpm: Option<u32> = None;
         let mut last_client_rpm: Option<Instant> = None;
         let mut last_poll: Option<Instant> = None;
+
+        // Compute blink render interval (None = no blinking, event-driven only)
+        let compute_blink_interval = |cfg: &Config| -> Option<u64> {
+            match tachtalk_shift_lights_lib::compute_render_interval(&cfg.thresholds) {
+                Some(ms) => {
+                    info!("LED render interval: {ms}ms (blinking active)");
+                    Some(u64::from(ms))
+                }
+                None => {
+                    info!("LED render: event-driven only (no blinking)");
+                    None
+                }
+            }
+        };
+        let mut blink_interval_ms = compute_blink_interval(&config.lock().unwrap());
+        let mut next_deadline_ms = blink_interval_ms.map(next_aligned_deadline);
 
         loop {
             watchdog.feed();
 
-            // Calculate timeout based on:
-            // 1. Time until next background poll (if no client activity)
-            // 2. Time until next blink toggle (if blinking)
-            let timeout = {
-                let cfg = config.lock().unwrap();
-                
-                // Time until we should poll again
-                let poll_interval = Duration::from_millis(IDLE_POLL_INTERVAL_MS);
-                let time_until_poll = last_poll
-                    .map_or(Duration::ZERO, |t| poll_interval.saturating_sub(t.elapsed()));
-
-                // Time until next blink (find active blinking threshold)
-                let blink_interval = if let Some(rpm) = current_rpm {
-                    cfg.thresholds
-                        .iter()
-                        .filter(|t| rpm >= t.rpm && t.blink)
-                        .next_back()
-                        .map(|t| Duration::from_millis(u64::from(t.blink_ms)))
-                } else {
-                    None
-                };
-
-                // Use minimum of poll interval and blink interval
-                match blink_interval {
-                    Some(blink) => time_until_poll.min(blink),
-                    None => time_until_poll,
+            // Compute timeout: blink interval if blinking, otherwise poll interval
+            let timeout = match (blink_interval_ms, next_deadline_ms) {
+                (Some(_), Some(deadline)) => {
+                    let now_ms = get_wallclock_ms();
+                    Duration::from_millis(deadline.saturating_sub(now_ms))
                 }
+                _ => Duration::from_millis(IDLE_POLL_INTERVAL_MS),
             };
 
-            // Wait for RPM from client or timeout
+            // Track whether we need to render this iteration
+            let mut should_render = false;
+            let mut hit_blink_deadline = false;
+
+            // Wait for message from client or timeout
             match rpm_rx.recv_timeout(timeout) {
-                Ok(rpm) => {
+                Ok(RpmTaskMessage::Rpm(rpm)) => {
                     last_client_rpm = Some(Instant::now());
-                    current_rpm = Some(rpm);
+                    if current_rpm != Some(rpm) {
+                        current_rpm = Some(rpm);
+                        should_render = true; // RPM changed
+                    }
                     *shared_rpm.lock().unwrap() = Some(rpm);
                     debug!("Received client RPM: {rpm}");
                 }
+                Ok(RpmTaskMessage::ConfigChanged) => {
+                    blink_interval_ms = compute_blink_interval(&config.lock().unwrap());
+                    next_deadline_ms = blink_interval_ms.map(next_aligned_deadline);
+                    should_render = true; // Config changed, re-render
+                }
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    // Blink deadline reached - need to render if blinking is active
+                    if blink_interval_ms.is_some() {
+                        should_render = true;
+                        hit_blink_deadline = true;
+                    }
+                    
                     // Check if we should poll the dongle
                     let client_idle = last_client_rpm
                         .map_or(true, |t| t.elapsed() >= CLIENT_ACTIVITY_BACKOFF);
@@ -438,10 +473,15 @@ pub fn start_rpm_led_task(
                             config.lock().unwrap().obd2_timeout_ms
                         );
                         
+                        // Feed watchdog before potentially long blocking call
+                        watchdog.feed();
                         if let Ok(response) = send_command(&dongle_tx, b"010C", timeout) {
                             if let Some(rpm) = tachtalk_elm327_lib::extract_rpm_from_response(&response) {
                                 debug!("Polled RPM: {rpm}");
-                                current_rpm = Some(rpm);
+                                if current_rpm != Some(rpm) {
+                                    current_rpm = Some(rpm);
+                                    should_render = true; // RPM changed
+                                }
                                 *shared_rpm.lock().unwrap() = Some(rpm);
                             }
                         }
@@ -453,12 +493,30 @@ pub fn start_rpm_led_task(
                 }
             }
 
-            // Update LEDs and send to SSE (always, to handle blinking)
-            if let Some(rpm) = current_rpm {
-                let _ = sse_tx.send(SseMessage::RpmUpdate(rpm));
-                
-                if let Ok(cfg) = config.lock() {
-                    let _ = led_controller.update(rpm, &cfg);
+            // Update LEDs only when needed (RPM changed or blinking)
+            if should_render {
+                if let Some(rpm) = current_rpm {
+                    // Only send SSE if RPM actually changed
+                    if last_rendered_rpm != Some(rpm) {
+                        let _ = sse_tx.send(SseMessage::RpmUpdate(rpm));
+                        last_rendered_rpm = Some(rpm);
+                    }
+                    
+                    let timestamp_ms = get_wallclock_ms();
+                    if let Ok(cfg) = config.lock() {
+                        let _ = led_controller.update(rpm, &cfg, timestamp_ms);
+                    }
+                }
+            }
+
+            // Advance blink deadline only when we hit it (not on every message)
+            if hit_blink_deadline {
+                if let (Some(interval), Some(ref mut deadline)) = (blink_interval_ms, &mut next_deadline_ms) {
+                    *deadline += interval;
+                    // If we fell behind, realign to wallclock
+                    if *deadline <= get_wallclock_ms() {
+                        *deadline = next_aligned_deadline(interval);
+                    }
                 }
             }
         }
@@ -469,7 +527,7 @@ pub fn start_rpm_led_task(
 
 pub struct Obd2Proxy {
     config: Arc<Mutex<Config>>,
-    rpm_tx: RpmSender,
+    rpm_tx: RpmTaskSender,
     dongle_tx: DongleSender,
     /// Unique AT commands seen from clients (for debugging/web UI)
     at_command_log: AtCommandLog,
@@ -480,7 +538,7 @@ pub struct Obd2Proxy {
 impl Obd2Proxy {
     pub fn new(
         config: Arc<Mutex<Config>>,
-        rpm_tx: RpmSender,
+        rpm_tx: RpmTaskSender,
         dongle_tx: DongleSender,
         at_command_log: AtCommandLog,
         pid_log: PidLog,
@@ -522,7 +580,7 @@ impl Obd2Proxy {
                     let at_command_log = self.at_command_log.clone();
                     let pid_log = self.pid_log.clone();
 
-                    std::thread::spawn(move || {
+                    crate::thread_util::spawn_named(c"obd2_client", move || {
                         if let Err(e) =
                             Self::handle_client(stream, &config, &rpm_tx, &dongle_tx, &at_command_log, &pid_log)
                         {
@@ -545,7 +603,7 @@ impl Obd2Proxy {
     fn handle_client(
         client_stream: TcpStream,
         config: &Arc<Mutex<Config>>,
-        rpm_tx: &RpmSender,
+        rpm_tx: &RpmTaskSender,
         dongle_tx: &DongleSender,
         at_command_log: &AtCommandLog,
         pid_log: &PidLog,
@@ -689,7 +747,7 @@ impl Obd2Proxy {
                 // Extract RPM if this was an RPM request - send to RPM/LED task
                 if let Some(rpm) = tachtalk_elm327_lib::extract_rpm_from_response(&response) {
                     debug!("Client RPM request: {rpm}");
-                    let _ = ctx.rpm_tx.send(rpm);
+                    let _ = ctx.rpm_tx.send(RpmTaskMessage::Rpm(rpm));
                 }
 
                 // Format and send dongle response (echo already sent character-by-character)

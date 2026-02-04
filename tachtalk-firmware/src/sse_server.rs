@@ -30,7 +30,7 @@ pub type SseSender = Sender<SseMessage>;
 pub fn start_sse_server() -> SseSender {
     let (tx, rx) = mpsc::channel::<SseMessage>();
 
-    std::thread::spawn(move || {
+    crate::thread_util::spawn_named(c"sse_srv", move || {
         if let Err(e) = run_sse_server(&rx) {
             error!("SSE server error: {e}");
         }

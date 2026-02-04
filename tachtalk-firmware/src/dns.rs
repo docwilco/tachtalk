@@ -15,7 +15,7 @@ const AP_IP: Ipv4Addr = Ipv4Addr::new(192, 168, 71, 1);
 /// The server responds to all A record queries with the AP IP address,
 /// causing all DNS lookups to resolve to the captive portal.
 pub fn start_dns_server() {
-    std::thread::spawn(|| {
+    crate::thread_util::spawn_named(c"dns_srv", || {
         if let Err(e) = run_dns_server() {
             error!("DNS server error: {e}");
         }

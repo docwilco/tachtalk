@@ -28,3 +28,10 @@ CONFIG_LWIP_MAX_SOCKETS=16
 
 # Task watchdog timeout (default 5s, increased for slow WiFi operations)
 CONFIG_ESP_TASK_WDT_TIMEOUT_S=15
+
+# Enable FreeRTOS runtime stats for CPU usage monitoring
+CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS=y
+CONFIG_FREERTOS_USE_TRACE_FACILITY=y
+
+# Enable pthread to use thread name for FreeRTOS task name
+CONFIG_PTHREAD_TASK_NAME_DEFAULT=""
