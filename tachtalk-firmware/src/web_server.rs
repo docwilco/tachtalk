@@ -14,6 +14,9 @@ use crate::obd2::{AtCommandLog, PidLog};
 use crate::sse_server::SSE_PORT;
 use crate::WifiMode;
 
+/// Shared RPM state for polling fallback when SSE is unavailable
+pub type SharedRpm = Arc<Mutex<Option<u32>>>;
+
 /// IP configuration for WiFi request
 #[derive(serde::Deserialize)]
 struct IpConfigRequest {
@@ -991,6 +994,7 @@ pub fn start_server(
     ap_hostname: Option<String>,
     at_command_log: AtCommandLog,
     pid_log: PidLog,
+    shared_rpm: SharedRpm,
 ) -> Result<()> {
     info!("Web server starting...");
     
@@ -1057,9 +1061,13 @@ pub fn start_server(
             debug!("Config update: {} thresholds, log_level={:?}", 
                    new_config.thresholds.len(), new_config.log_level);
             
-            let needs_restart = {
+            let old_gpio = {
                 let cfg = config_clone.lock().unwrap();
-                cfg.led_gpio != new_config.led_gpio
+                if cfg.led_gpio != new_config.led_gpio {
+                    Some(cfg.led_gpio)
+                } else {
+                    None
+                }
             };
             
             {
@@ -1070,8 +1078,10 @@ pub fn start_server(
                 }
             }
             
-            if needs_restart {
-                info!("LED GPIO changed, restarting in 2 seconds...");
+            if let Some(old_gpio) = old_gpio {
+                info!("LED GPIO changed from {} to new value, resetting old pin and restarting in 2 seconds...", old_gpio);
+                // Reset the OLD GPIO to clear RMT routing before restart
+                unsafe { esp_idf_svc::sys::gpio_reset_pin(i32::from(old_gpio)); }
                 let mut response = req.into_ok_response()?;
                 response.write_all(b"{\"restart\":true}")?;
                 std::thread::spawn(|| {
@@ -1208,10 +1218,14 @@ pub fn start_server(
     })?;
 
     // GET RPM endpoint (fallback for non-SSE clients)
-    server.fn_handler("/api/rpm", Method::Get, |req| -> Result<(), esp_idf_svc::io::EspIOError> {
-        info!("HTTP: GET /api/rpm");
-        // This is just a fallback, real updates come via SSE on port 8081
-        let json = r#"{"rpm":null}"#;
+    let rpm_clone = shared_rpm.clone();
+    server.fn_handler("/api/rpm", Method::Get, move |req| -> Result<(), esp_idf_svc::io::EspIOError> {
+        debug!("HTTP: GET /api/rpm");
+        let rpm = rpm_clone.lock().unwrap();
+        let json = match *rpm {
+            Some(r) => format!(r#"{{"rpm":{r}}}"#),
+            None => r#"{"rpm":null}"#.to_string(),
+        };
         let mut response = req.into_ok_response()?;
         response.write_all(json.as_bytes())?;
         Ok(())

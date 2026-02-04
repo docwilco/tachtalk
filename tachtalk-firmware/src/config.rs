@@ -294,7 +294,7 @@ impl Config {
             let mut buf = vec![0u8; len];
             nvs.get_blob(NVS_CONFIG_KEY, &mut buf)?;
             let config: Config = serde_json::from_slice(&buf)?;
-            debug!("Config parsed: wifi.ssid={:?}, log_level={:?}", config.wifi.ssid, config.log_level);
+            debug!("Config parsed: wifi.ssid={:?}, log_level={:?}, led_gpio={}", config.wifi.ssid, config.log_level, config.led_gpio);
             Ok(config)
         } else {
             Err(anyhow!("No config found in NVS"))

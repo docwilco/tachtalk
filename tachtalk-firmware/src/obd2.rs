@@ -357,6 +357,7 @@ pub fn send_command(dongle_tx: &DongleSender, command: &[u8], timeout: Duration)
 /// - Polls the dongle for RPM when no client activity
 /// - Updates LEDs based on current RPM
 /// - Sends RPM to SSE clients
+/// - Updates shared RPM for HTTP polling fallback
 /// 
 /// Returns a sender for client handlers to report RPM values.
 pub fn start_rpm_led_task(
@@ -364,6 +365,7 @@ pub fn start_rpm_led_task(
     config: Arc<Mutex<Config>>,
     sse_tx: SseSender,
     dongle_tx: DongleSender,
+    shared_rpm: crate::web_server::SharedRpm,
 ) -> RpmSender {
     let (rpm_tx, rpm_rx) = mpsc::channel::<u32>();
 
@@ -377,7 +379,8 @@ pub fn start_rpm_led_task(
         }
 
         let watchdog = WatchdogHandle::register("rpm_led_task");
-        info!("RPM/LED task started");
+        let led_gpio = config.lock().unwrap().led_gpio;
+        info!("RPM/LED task started (GPIO {led_gpio})");
 
         let mut current_rpm: Option<u32> = None;
         let mut last_client_rpm: Option<Instant> = None;
@@ -420,6 +423,7 @@ pub fn start_rpm_led_task(
                 Ok(rpm) => {
                     last_client_rpm = Some(Instant::now());
                     current_rpm = Some(rpm);
+                    *shared_rpm.lock().unwrap() = Some(rpm);
                     debug!("Received client RPM: {rpm}");
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
@@ -438,6 +442,7 @@ pub fn start_rpm_led_task(
                             if let Some(rpm) = tachtalk_elm327_lib::extract_rpm_from_response(&response) {
                                 debug!("Polled RPM: {rpm}");
                                 current_rpm = Some(rpm);
+                                *shared_rpm.lock().unwrap() = Some(rpm);
                             }
                         }
                     }

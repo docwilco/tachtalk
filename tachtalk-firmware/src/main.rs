@@ -237,6 +237,11 @@ fn main() -> Result<()> {
     // Initialize LED controller with GPIO from config
     let led_gpio = config.lock().unwrap().led_gpio;
     info!("Initializing LED controller on GPIO {led_gpio}...");
+    // Reset the GPIO pin to clear any residual RMT configuration from previous boot
+    // This ensures clean initialization when GPIO pin is changed via config
+    unsafe {
+        esp_idf_svc::sys::gpio_reset_pin(i32::from(led_gpio));
+    }
     // SAFETY: We trust the user-configured GPIO pin number is valid for this board
     let led_pin = unsafe { AnyIOPin::new(i32::from(led_gpio)) };
     let led_controller = LedController::new(
@@ -296,6 +301,9 @@ fn main() -> Result<()> {
     // Create shared log for tracking OBD2 PIDs (for debugging via web UI)
     let pid_log: PidLog = Arc::new(Mutex::new(HashSet::new()));
 
+    // Create shared RPM state for HTTP polling fallback
+    let shared_rpm: web_server::SharedRpm = Arc::new(Mutex::new(None));
+
     // Start web server
     {
         let config_clone = config.clone();
@@ -304,9 +312,10 @@ fn main() -> Result<()> {
         let ap_hostname_clone = ap_hostname.clone();
         let at_cmd_log_clone = at_command_log.clone();
         let pid_log_clone = pid_log.clone();
+        let shared_rpm_clone = shared_rpm.clone();
 
         std::thread::spawn(move || {
-            if let Err(e) = web_server::start_server(&config_clone, &mode_clone, &wifi_clone, Some(ap_hostname_clone), at_cmd_log_clone, pid_log_clone) {
+            if let Err(e) = web_server::start_server(&config_clone, &mode_clone, &wifi_clone, Some(ap_hostname_clone), at_cmd_log_clone, pid_log_clone, shared_rpm_clone) {
                 error!("Web server error: {e:?}");
             }
         });
@@ -322,7 +331,7 @@ fn main() -> Result<()> {
     
     // Start the combined RPM poller and LED update task
     // This takes ownership of led_controller (no Arc<Mutex> needed)
-    let rpm_tx = start_rpm_led_task(led_controller, config.clone(), sse_tx.clone(), dongle_tx.clone());
+    let rpm_tx = start_rpm_led_task(led_controller, config.clone(), sse_tx.clone(), dongle_tx.clone(), shared_rpm);
     
     {
         let config_clone = config.clone();
