@@ -27,6 +27,15 @@ const IDLE_POLL_INTERVAL_MS: u64 = 100;
 const CLIENT_ACTIVITY_BACKOFF: Duration = Duration::from_millis(500);
 const RECONNECT_DELAY: Duration = Duration::from_secs(1);
 
+/// State for the dongle connection
+struct DongleState {
+    stream: TcpStream,
+    /// Whether the dongle supports the "1" repeat command (None = untested)
+    supports_repeat: Option<bool>,
+    /// Last OBD2 command sent (for repeat optimization)
+    last_command: Option<Obd2Buffer>,
+}
+
 /// Shared log of unique AT commands received from clients (for debugging)
 pub type AtCommandLog = Arc<Mutex<HashSet<String>>>;
 
@@ -105,7 +114,7 @@ pub fn start_dongle_task(config: Arc<Mutex<Config>>) -> DongleSender {
 fn dongle_task(rx: &Receiver<DongleRequest>, config: &Arc<Mutex<Config>>) {
     info!("OBD2 dongle task starting...");
     
-    let mut connection: Option<TcpStream> = None;
+    let mut connection: Option<DongleState> = None;
     let mut last_connect_attempt: Option<Instant> = None;
     
     let watchdog = WatchdogHandle::register("obd2_dongle");
@@ -141,8 +150,58 @@ fn dongle_task(rx: &Receiver<DongleRequest>, config: &Arc<Mutex<Config>>) {
         match rx.recv_timeout(Duration::from_millis(100)) {
             Ok(request) => {
                 debug!("Dongle request: {:?}", String::from_utf8_lossy(&request.command));
-                let result = if let Some(ref mut stream) = connection {
-                    execute_command(stream, &request.command, timeout)
+                let result = if let Some(ref mut state) = connection {
+                    // Check if we can try repeat command optimization
+                    // Only try if not proven unsupported, and same command as last
+                    let can_try_repeat = state.supports_repeat != Some(false)
+                        && state.last_command.as_ref() == Some(&request.command)
+                        && !request.command.starts_with(b"AT");
+                    
+                    let result = if can_try_repeat {
+                        debug!("Trying repeat command");
+                        let repeat_result = execute_command(&mut state.stream, b"1", timeout);
+                        
+                        // Check if repeat worked
+                        match &repeat_result {
+                            Ok(response) => {
+                                let response_str = String::from_utf8_lossy(response);
+                                if response_str.contains('?') {
+                                    // Repeat not supported, mark and resend full command
+                                    info!("Dongle does not support repeat command");
+                                    state.supports_repeat = Some(false);
+                                    // Update last_command before sending (dongle will have this as its last)
+                                    state.last_command = Some(request.command.clone());
+                                    execute_command(&mut state.stream, &request.command, timeout)
+                                } else {
+                                    // Repeat worked! last_command stays the same (we repeated it)
+                                    if state.supports_repeat.is_none() {
+                                        info!("Dongle supports repeat command");
+                                        state.supports_repeat = Some(true);
+                                    }
+                                    repeat_result
+                                }
+                            }
+                            Err(_) => {
+                                // Repeat failed with error - clear last_command since we don't
+                                // know if dongle processed it
+                                state.last_command = None;
+                                repeat_result
+                            }
+                        }
+                    } else {
+                        // Update last_command before sending (dongle will have this as its last)
+                        if !request.command.starts_with(b"AT") {
+                            state.last_command = Some(request.command.clone());
+                        }
+                        let result = execute_command(&mut state.stream, &request.command, timeout);
+                        // If command failed, clear last_command since we don't know if dongle processed it
+                        if result.is_err() {
+                            state.last_command = None;
+                        }
+                        result
+                    };
+                    
+                    result
                 } else {
                     Err(DongleError::NotConnected)
                 };
@@ -174,7 +233,7 @@ fn dongle_task(rx: &Receiver<DongleRequest>, config: &Arc<Mutex<Config>>) {
 }
 
 /// Try to connect to the dongle and initialize it
-fn try_connect(dongle_ip: &str, dongle_port: u16, timeout: Duration, watchdog: &WatchdogHandle) -> Option<TcpStream> {
+fn try_connect(dongle_ip: &str, dongle_port: u16, timeout: Duration, watchdog: &WatchdogHandle) -> Option<DongleState> {
     info!("Connecting to OBD2 dongle at {dongle_ip}:{dongle_port} (timeout: {}ms)", timeout.as_millis());
 
     let addr: SocketAddr = format!("{dongle_ip}:{dongle_port}").parse().ok()?;
@@ -222,8 +281,15 @@ fn try_connect(dongle_ip: &str, dongle_port: u16, timeout: Duration, watchdog: &
     }
 
     info!("Connected to OBD2 dongle");
-    Some(stream)
+    
+    Some(DongleState {
+        stream,
+        supports_repeat: None, // Will be tested lazily on first repeat opportunity
+        last_command: None,
+    })
 }
+
+/// Execute a command on the dongle and return the response
 
 /// Execute a command on the dongle and return the response
 fn execute_command(stream: &mut TcpStream, command: &[u8], timeout: Duration) -> Result<Obd2Buffer, DongleError> {
@@ -590,17 +656,39 @@ impl Obd2Proxy {
             return Ok(());
         }
 
+        // Handle "1" repeat command - expand to this client's last command
+        let (effective_command, effective_raw): (String, Obd2Buffer) = if command == "1" {
+            match &state.last_obd_command {
+                Some(last) => {
+                    debug!("Expanding repeat command to: {last}");
+                    (last.clone(), last.as_bytes().into())
+                }
+                None => {
+                    // No previous command - return error
+                    let le = state.line_ending();
+                    let error_response = format!("{le}?{le}>");
+                    writer.write_all(error_response.as_bytes())?;
+                    return Ok(());
+                }
+            }
+        } else {
+            (command.to_string(), raw_command.into())
+        };
+
         // Get timeout from config
         let timeout = Duration::from_millis(ctx.config.lock().unwrap().obd2_timeout_ms);
 
         // Record unique OBD2 PIDs (store uppercase for dedup)
         if let Ok(mut log) = ctx.pid_log.lock() {
-            log.insert(command.to_uppercase());
+            log.insert(effective_command.to_uppercase());
         }
 
         // Forward OBD2 command to dongle task
-        match send_command(ctx.dongle_tx, raw_command, timeout) {
+        match send_command(ctx.dongle_tx, &effective_raw, timeout) {
             Ok(response) => {
+                // Store this command for per-client repeat functionality
+                state.last_obd_command = Some(effective_command.clone());
+
                 // Extract RPM if this was an RPM request - send to RPM/LED task
                 if let Some(rpm) = tachtalk_elm327_lib::extract_rpm_from_response(&response) {
                     debug!("Client RPM request: {rpm}");
