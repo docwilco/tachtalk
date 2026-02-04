@@ -41,6 +41,7 @@ struct Network {
 /// Network status response
 #[derive(serde::Serialize)]
 struct NetworkStatus {
+    ssid: Option<String>,
     ip: Option<String>,
     gateway: Option<String>,
     subnet: Option<String>,
@@ -288,13 +289,30 @@ pub fn start_server(state: &Arc<State>, ap_hostname: Option<String>) -> Result<(
             mac_bytes[0], mac_bytes[1], mac_bytes[2],
             mac_bytes[3], mac_bytes[4], mac_bytes[5]);
         
+        // Get SSID and RSSI from current STA connection info
+        let (ssid, rssi) = if wifi.is_connected().unwrap_or(false) {
+            let mut ap_info: esp_idf_svc::sys::wifi_ap_record_t = unsafe { std::mem::zeroed() };
+            let result = unsafe { esp_idf_svc::sys::esp_wifi_sta_get_ap_info(&mut ap_info) };
+            if result == esp_idf_svc::sys::ESP_OK {
+                let ssid_bytes = &ap_info.ssid;
+                let ssid_len = ssid_bytes.iter().position(|&b| b == 0).unwrap_or(ssid_bytes.len());
+                let ssid = String::from_utf8_lossy(&ssid_bytes[..ssid_len]).to_string();
+                (Some(ssid), Some(ap_info.rssi))
+            } else {
+                (None, None)
+            }
+        } else {
+            (None, None)
+        };
+        
         let status = NetworkStatus {
+            ssid,
             ip: ip_info.as_ref().map(|i| format!("{}", i.ip)),
             gateway: ip_info.as_ref().map(|i| format!("{}", i.subnet.gateway)),
             subnet: ip_info.as_ref().map(|i| format!("{}", i.subnet.mask)),
             dns: ip_info.as_ref().and_then(|i| i.dns.map(|d| format!("{d}"))),
             mac,
-            rssi: None, // TODO: Get RSSI from wifi driver
+            rssi,
         };
         
         let json = serde_json::to_string(&status).unwrap_or_else(|_| "{}".to_string());

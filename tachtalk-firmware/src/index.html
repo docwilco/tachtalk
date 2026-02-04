@@ -21,10 +21,49 @@
         }
         .threshold {
             background-color: #2a2a2a;
-            padding: 15px;
+            padding: 10px 15px;
             margin: 10px 0;
             border-radius: 5px;
             border-left: 4px solid #00ff00;
+        }
+        .threshold-header {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            margin-bottom: 8px;
+        }
+        .threshold-title {
+            font-size: 1.1em;
+            font-weight: bold;
+            color: #fff;
+            background: transparent;
+            border: none;
+            border-bottom: 1px dashed #666;
+            padding: 2px 4px;
+            min-width: 100px;
+        }
+        .threshold-title:focus {
+            outline: none;
+            border-bottom-color: #00ff00;
+        }
+        .threshold-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 5px 15px;
+        }
+        .threshold-grid .form-group {
+            margin: 5px 0;
+        }
+        .threshold-grid input[type="number"] {
+            width: 70px;
+        }
+        .threshold-buttons {
+            margin-top: 8px;
+        }
+        .threshold-buttons button {
+            padding: 5px 10px;
+            margin: 2px;
+            font-size: 0.9em;
         }
         .form-group {
             margin: 10px 0;
@@ -238,7 +277,7 @@
 </head>
 <body>
     <div class="container">
-        <h1>🏁 TachTalk Configuration <span id="modeIndicator" class="mode-indicator"></span></h1>
+        <h1>📈 TachTalk Configuration <span id="modeIndicator" class="mode-indicator"></span></h1>
         
         <div id="apBanner" class="ap-mode-banner" style="display: none;">
             ⚠️ Running in Setup Mode - Configure WiFi below to connect to your network
@@ -251,13 +290,14 @@
         </div>
         
         <div class="network-info">
-            <h2>📊 Network Status</h2>
+            <h2>🌐 Network Status</h2>
+            <div class="info-row"><span>SSID:</span><span id="netSsid">---</span></div>
             <div class="info-row"><span>IP Address:</span><span id="netIp">---</span></div>
             <div class="info-row"><span>Gateway:</span><span id="netGateway">---</span></div>
             <div class="info-row"><span>Subnet Mask:</span><span id="netSubnet">---</span></div>
             <div class="info-row"><span>DNS:</span><span id="netDns">---</span></div>
             <div class="info-row"><span>MAC Address:</span><span id="netMac">---</span></div>
-            <div class="info-row"><span>RSSI:</span><span id="netRssi">---</span></div>
+            <div class="info-row"><span>Signal:</span><span id="netRssi">---</span></div>
         </div>
         
         <details class="debug-section">
@@ -329,7 +369,7 @@
         </div>
         
         <div class="wifi-config">
-            <h2>� Access Point Configuration</h2>
+            <h2>📡 Access Point Configuration</h2>
             <div class="form-group">
                 <label>AP SSID:</label>
                 <input type="text" id="apSsid" placeholder="TachTalk-XXXX (auto)">
@@ -346,7 +386,7 @@
         </div>
         
         <div class="wifi-config">
-            <h2>�🔌 OBD2 Configuration</h2>
+            <h2>🔌 OBD2 Configuration</h2>
             <div class="form-group">
                 <label>Dongle IP:</label>
                 <input type="text" id="obd2DongleIp" placeholder="192.168.0.10">
@@ -379,25 +419,26 @@
                 </select>
             </div>
             <div class="form-group">
+                <label>Total LEDs:</label>
+                <input type="number" id="totalLeds" value="8">
+            </div>
+            <div class="form-group">
+                <label>LED GPIO Pin:</label>
+                <input type="number" id="ledGpio" value="48" min="0" max="48">
+                <small style="color: #888;">(requires restart)</small>
+            </div>
+            <div class="form-group">
                 <button id="btnReboot" onclick="rebootDevice()" style="background-color: #ff5500;">🔄 Reboot Device</button>
             </div>
         </div>
+        
+        <button id="btnSaveConfig2" onclick="saveConfig()">Save Configuration</button>
+        <button id="btnReload2" onclick="loadConfig()">Reload</button>
         
         <h2>RPM Thresholds</h2>
         <div id="thresholds"></div>
         
         <button onclick="addThreshold()">Add Threshold</button>
-        
-        <div class="form-group">
-            <label>Total LEDs:</label>
-            <input type="number" id="totalLeds" value="8">
-        </div>
-        
-        <div class="form-group">
-            <label>LED GPIO Pin:</label>
-            <input type="number" id="ledGpio" value="48" min="0" max="48">
-            <small style="color: #888;">(requires restart)</small>
-        </div>
         
         <button id="btnSaveConfig" onclick="saveConfig()">Save Configuration</button>
         <button id="btnReload" onclick="loadConfig()">Reload</button>
@@ -491,45 +532,49 @@
             config.thresholds.forEach((threshold, index) => {
                 const div = document.createElement('div');
                 div.className = 'threshold';
-                div.innerHTML = '<h3>' + (threshold.name || 'Threshold ' + (index + 1)) + '</h3>' +
-                    '<div class="form-group">' +
-                        '<label>Name:</label>' +
-                        '<input type="text" value="' + (threshold.name || '') + '" onchange="updateThreshold(' + index + ', \'name\', this.value)">' +
-                    '</div>' +
-                    '<div class="form-group">' +
-                        '<label>RPM:</label>' +
-                        '<input type="number" value="' + threshold.rpm + '" onchange="updateThreshold(' + index + ', \'rpm\', parseInt(this.value))">' +
-                    '</div>' +
-                    '<div class="form-group">' +
-                        '<label>Start LED:</label>' +
-                        '<input type="number" min="0" value="' + threshold.start_led + '" onchange="updateThreshold(' + index + ', \'start_led\', parseInt(this.value))">' +
-                    '</div>' +
-                    '<div class="form-group">' +
-                        '<label>End LED:</label>' +
-                        '<input type="number" min="0" value="' + threshold.end_led + '" onchange="updateThreshold(' + index + ', \'end_led\', parseInt(this.value))">' +
-                    '</div>' +
-                    '<div class="form-group">' +
-                        '<label>Color:</label>' +
-                        '<input type="color" value="' + rgbToHex(threshold.color) + '" onchange="updateThreshold(' + index + ', \'color\', hexToRgb(this.value))">' +
-                    '</div>' +
-                    '<div class="form-group">' +
-                        '<label>Blink:</label>' +
-                        '<input type="checkbox" ' + (threshold.blink ? 'checked' : '') + ' onchange="updateThreshold(' + index + ', \'blink\', this.checked)">' +
-                    '</div>' +
+                const blinkMsHtml = threshold.blink ? 
                     '<div class="form-group">' +
                         '<label>Blink ms:</label>' +
                         '<input type="number" min="50" step="50" value="' + (threshold.blink_ms || 500) + '" onchange="updateThreshold(' + index + ', \'blink_ms\', parseInt(this.value))">' +
+                    '</div>' : '<div class="form-group"></div>';
+                div.innerHTML = 
+                    '<div class="threshold-header">' +
+                        '<input type="text" class="threshold-title" value="' + (threshold.name || 'Threshold ' + (index + 1)) + '" onchange="updateThreshold(' + index + ', \'name\', this.value)">' +
                     '</div>' +
-                    '<button onclick="moveThreshold(' + index + ', -1)">▲ Up</button>' +
-                    '<button onclick="moveThreshold(' + index + ', 1)">▼ Down</button>' +
-                    '<button onclick="removeThreshold(' + index + ')">Remove</button>';
+                    '<div class="threshold-grid">' +
+                        '<div class="form-group">' +
+                            '<label>RPM:</label>' +
+                            '<input type="number" value="' + threshold.rpm + '" onchange="updateThreshold(' + index + ', \'rpm\', parseInt(this.value))">' +
+                        '</div>' +
+                        '<div class="form-group">' +
+                            '<label>Color:</label>' +
+                            '<input type="color" value="' + rgbToHex(threshold.color) + '" onchange="updateThreshold(' + index + ', \'color\', hexToRgb(this.value))">' +
+                        '</div>' +
+                        '<div class="form-group">' +
+                            '<label>From LED:</label>' +
+                            '<input type="number" min="0" value="' + threshold.start_led + '" onchange="updateThreshold(' + index + ', \'start_led\', parseInt(this.value))">' +
+                        '</div>' +
+                        '<div class="form-group">' +
+                            '<label>To LED:</label>' +
+                            '<input type="number" min="0" value="' + threshold.end_led + '" onchange="updateThreshold(' + index + ', \'end_led\', parseInt(this.value))">' +
+                        '</div>' +
+                        '<div class="form-group">' +
+                            '<label>Blink:</label>' +
+                            '<input type="checkbox" ' + (threshold.blink ? 'checked' : '') + ' onchange="updateThreshold(' + index + ', \'blink\', this.checked); renderThresholds();">' +
+                        '</div>' +
+                        blinkMsHtml +
+                    '</div>' +
+                    '<div class="threshold-buttons">' +
+                        '<button onclick="moveThreshold(' + index + ', -1)">▲</button>' +
+                        '<button onclick="moveThreshold(' + index + ', 1)">▼</button>' +
+                        '<button onclick="removeThreshold(' + index + ')">✕</button>' +
+                    '</div>';
                 container.appendChild(div);
             });
         }
 
         function updateThreshold(index, field, value) {
             config.thresholds[index][field] = value;
-            if (field === 'name') renderThresholds();
         }
 
         function addThreshold() {
@@ -782,12 +827,23 @@
                 const response = await fetch('/api/network');
                 if (response.ok) {
                     const data = await response.json();
+                    document.getElementById('netSsid').textContent = data.ssid || '---';
                     document.getElementById('netIp').textContent = data.ip || '---';
                     document.getElementById('netGateway').textContent = data.gateway || '---';
                     document.getElementById('netSubnet').textContent = data.subnet || '---';
                     document.getElementById('netDns').textContent = data.dns || '---';
                     document.getElementById('netMac').textContent = data.mac || '---';
-                    document.getElementById('netRssi').textContent = data.rssi ? data.rssi + ' dBm' : '---';
+                    if (data.rssi !== null && data.rssi !== undefined) {
+                        let quality;
+                        if (data.rssi >= -50) quality = 'Excellent';
+                        else if (data.rssi >= -60) quality = 'Good';
+                        else if (data.rssi >= -70) quality = 'Fair';
+                        else if (data.rssi >= -80) quality = 'Weak';
+                        else quality = 'Poor';
+                        document.getElementById('netRssi').textContent = quality + ' (' + data.rssi + ' dBm)';
+                    } else {
+                        document.getElementById('netRssi').textContent = '---';
+                    }
                 }
             } catch (error) {
                 console.error('Failed to load network status:', error);
