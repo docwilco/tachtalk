@@ -7,7 +7,7 @@ use log::{debug, error, info, warn};
 use smallvec::SmallVec;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 use std::time::{Duration, Instant};
 
 use crate::watchdog::WatchdogHandle;
@@ -25,18 +25,13 @@ pub enum SseMessage {
 
 /// Sender for SSE messages
 pub type SseSender = Sender<SseMessage>;
+pub type SseReceiver = Receiver<SseMessage>;
 
-/// Start the SSE server and return a sender for RPM updates
-pub fn start_sse_server() -> SseSender {
-    let (tx, rx) = mpsc::channel::<SseMessage>();
-
-    crate::thread_util::spawn_named(c"sse_srv", move || {
-        if let Err(e) = run_sse_server(&rx) {
-            error!("SSE server error: {e}");
-        }
-    });
-
-    tx
+/// Run the SSE server task
+pub fn sse_server_task(rx: &SseReceiver) {
+    if let Err(e) = run_sse_server(rx) {
+        error!("SSE server error: {e}");
+    }
 }
 
 /// SSE server main loop

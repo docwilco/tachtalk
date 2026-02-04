@@ -2,20 +2,16 @@ use anyhow::Result;
 use embedded_svc::http::Method;
 use embedded_svc::io::Write;
 use esp_idf_svc::http::server::{Configuration, EspHttpServer};
-use esp_idf_svc::wifi::{BlockingWifi, EspWifi};
 use log::{debug, error, info, warn};
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use esp_idf_svc::sys::{esp_get_free_heap_size, esp_get_minimum_free_heap_size};
 
-use crate::config::Config;
-use crate::obd2::{AtCommandLog, PidLog};
+use crate::obd2::RpmTaskMessage;
 use crate::sse_server::SSE_PORT;
+use crate::State;
 use crate::WifiMode;
-
-/// Shared RPM state for polling fallback when SSE is unavailable
-pub type SharedRpm = Arc<Mutex<Option<u32>>>;
 
 /// IP configuration for WiFi request
 #[derive(serde::Deserialize)]
@@ -397,7 +393,24 @@ const HTML_INDEX_END: &str = r#";</script>
         </div>
         
         <div class="wifi-config">
-            <h2>🔌 OBD2 Configuration</h2>
+            <h2>� Access Point Configuration</h2>
+            <div class="form-group">
+                <label>AP SSID:</label>
+                <input type="text" id="apSsid" placeholder="TachTalk-XXXX (auto)">
+                <small style="color: #888;">Leave empty for auto (MAC-based)</small>
+            </div>
+            <div class="form-group">
+                <label>AP Password:</label>
+                <span class="password-wrapper">
+                    <input type="password" id="apPassword" placeholder="No password (open)">
+                    <button type="button" class="toggle-password" onclick="toggleApPasswordVisibility()">Show</button>
+                </span>
+                <small style="color: #888;">Leave empty for open AP</small>
+            </div>
+        </div>
+        
+        <div class="wifi-config">
+            <h2>�🔌 OBD2 Configuration</h2>
             <div class="form-group">
                 <label>Dongle IP:</label>
                 <input type="text" id="obd2DongleIp" placeholder="192.168.0.10">
@@ -409,6 +422,11 @@ const HTML_INDEX_END: &str = r#";</script>
             <div class="form-group">
                 <label>Proxy Listen Port:</label>
                 <input type="number" id="obd2ListenPort" placeholder="35000" min="1" max="65535">
+            </div>
+            <div class="form-group">
+                <label>Timeout (ms):</label>
+                <input type="number" id="obd2TimeoutMs" placeholder="4500" min="100" max="4500">
+                <small style="color: #888;">Max 4500ms</small>
             </div>
         </div>
         
@@ -467,6 +485,9 @@ const HTML_INDEX_END: &str = r#";</script>
             wifi: { ssid: '', password: '' },
             ip: { use_dhcp: true, ip: null, gateway: null, subnet: null, dns: null },
             obd2: { dongle_ip: '192.168.0.10', dongle_port: 35000, listen_port: 35000 },
+            ap_ssid: null,
+            ap_password: null,
+            obd2_timeout_ms: 4500,
             log_level: 'info',
             thresholds: [
                 { name: 'Off', rpm: 0, start_led: 0, end_led: 0, color: { r: 0, g: 0, b: 0 }, blink: false, blink_ms: 500 },
@@ -489,6 +510,18 @@ const HTML_INDEX_END: &str = r#";</script>
 
         function togglePasswordVisibility() {
             const input = document.getElementById('wifiPassword');
+            const button = event.target;
+            if (input.type === 'password') {
+                input.type = 'text';
+                button.textContent = 'Hide';
+            } else {
+                input.type = 'password';
+                button.textContent = 'Show';
+            }
+        }
+
+        function toggleApPasswordVisibility() {
+            const input = document.getElementById('apPassword');
             const button = event.target;
             if (input.type === 'password') {
                 input.type = 'text';
@@ -608,6 +641,9 @@ const HTML_INDEX_END: &str = r#";</script>
                 dongle_port: parseInt(document.getElementById('obd2DonglePort').value) || 35000,
                 listen_port: parseInt(document.getElementById('obd2ListenPort').value) || 35000
             };
+            config.obd2_timeout_ms = parseInt(document.getElementById('obd2TimeoutMs').value) || 4500;
+            config.ap_ssid = document.getElementById('apSsid').value || null;
+            config.ap_password = document.getElementById('apPassword').value || null;
             config.log_level = document.getElementById('logLevel').value;
             
             setButtonLoading('btnSaveConfig', true, 'Saving...');
@@ -763,6 +799,13 @@ const HTML_INDEX_END: &str = r#";</script>
                     
                     // Log level
                     document.getElementById('logLevel').value = config.log_level || 'info';
+                    
+                    // AP config
+                    document.getElementById('apSsid').value = config.ap_ssid || '';
+                    document.getElementById('apPassword').value = config.ap_password || '';
+                    
+                    // OBD2 timeout
+                    document.getElementById('obd2TimeoutMs').value = config.obd2_timeout_ms || 4500;
                     
                     renderThresholds();
                     showStatus('Configuration loaded!', false);
@@ -987,16 +1030,7 @@ const HTML_CAPTIVE_PORTAL: &str = r#"
 "#;
 
 #[allow(clippy::too_many_lines)] // Route registration function - length is proportional to endpoints
-pub fn start_server(
-    config: &Arc<Mutex<Config>>,
-    wifi_mode: &Arc<Mutex<WifiMode>>,
-    wifi: &Arc<Mutex<BlockingWifi<EspWifi<'static>>>>,
-    ap_hostname: Option<String>,
-    at_command_log: AtCommandLog,
-    pid_log: PidLog,
-    shared_rpm: SharedRpm,
-    rpm_tx: crate::obd2::RpmTaskSender,
-) -> Result<()> {
+pub fn start_server(state: &Arc<State>, ap_hostname: Option<String>) -> Result<()> {
     info!("Web server starting...");
     
     // Enable wildcard URI matching for captive portal fallback handler
@@ -1021,10 +1055,10 @@ pub fn start_server(
     })?;
 
     // GET mode endpoint
-    let mode_clone = wifi_mode.clone();
+    let state_clone = state.clone();
     server.fn_handler("/api/mode", Method::Get, move |req| -> Result<(), esp_idf_svc::io::EspIOError> {
         info!("HTTP: GET /api/mode");
-        let mode = mode_clone.lock().unwrap();
+        let mode = state_clone.wifi_mode.lock().unwrap();
         let mode_str = match *mode {
             WifiMode::AccessPoint => "ap",
             WifiMode::Client => "client",
@@ -1037,10 +1071,10 @@ pub fn start_server(
     })?;
 
     // GET config endpoint
-    let config_clone = config.clone();
+    let state_clone = state.clone();
     server.fn_handler("/api/config", Method::Get, move |req| -> Result<(), esp_idf_svc::io::EspIOError> {
         info!("HTTP: GET /api/config");
-        let cfg = config_clone.lock().unwrap();
+        let cfg = state_clone.config.lock().unwrap();
         let json = serde_json::to_string(&*cfg).unwrap();
         
         let mut response = req.into_ok_response()?;
@@ -1049,14 +1083,13 @@ pub fn start_server(
     })?;
 
     // POST config endpoint
-    let config_clone = config.clone();
-    let rpm_tx_clone = rpm_tx.clone();
+    let state_clone = state.clone();
     server.fn_handler("/api/config", Method::Post, move |mut req| -> Result<(), esp_idf_svc::io::EspIOError> {
         info!("HTTP: POST /api/config");
         let mut buf = vec![0u8; 8192];
         let bytes_read = req.read(&mut buf)?;
         
-        if let Ok(mut new_config) = serde_json::from_slice::<Config>(&buf[..bytes_read]) {
+        if let Ok(mut new_config) = serde_json::from_slice::<crate::config::Config>(&buf[..bytes_read]) {
             // Validate/clamp values to safe ranges
             new_config.validate();
             
@@ -1064,7 +1097,7 @@ pub fn start_server(
                    new_config.thresholds.len(), new_config.log_level);
             
             let old_gpio = {
-                let cfg = config_clone.lock().unwrap();
+                let cfg = state_clone.config.lock().unwrap();
                 if cfg.led_gpio == new_config.led_gpio {
                     None
                 } else {
@@ -1073,7 +1106,7 @@ pub fn start_server(
             };
             
             {
-                let mut cfg = config_clone.lock().unwrap();
+                let mut cfg = state_clone.config.lock().unwrap();
                 *cfg = new_config;
                 if let Err(e) = cfg.save() {
                     warn!("Failed to save config: {e}");
@@ -1081,7 +1114,7 @@ pub fn start_server(
             }
             
             // Notify RPM task of config change (to recalculate render interval)
-            let _ = rpm_tx_clone.send(crate::obd2::RpmTaskMessage::ConfigChanged);
+            let _ = state_clone.rpm_tx.send(RpmTaskMessage::ConfigChanged);
             
             if let Some(old_gpio) = old_gpio {
                 info!("LED GPIO changed from {old_gpio} to new value, resetting old pin and restarting in 2 seconds...");
@@ -1105,7 +1138,7 @@ pub fn start_server(
     })?;
 
     // POST wifi endpoint - save wifi and restart
-    let config_clone = config.clone();
+    let state_clone = state.clone();
     server.fn_handler("/api/wifi", Method::Post, move |mut req| -> Result<(), esp_idf_svc::io::EspIOError> {
         info!("HTTP: POST /api/wifi");
         let mut buf = vec![0u8; 1024];
@@ -1114,7 +1147,7 @@ pub fn start_server(
         if let Ok(wifi_req) = serde_json::from_slice::<WifiRequest>(&buf[..bytes_read]) {
             info!("WiFi config update: ssid={:?}, dhcp={:?}", 
                   wifi_req.ssid, wifi_req.ip.as_ref().map(|i| i.use_dhcp));
-            let mut cfg = config_clone.lock().unwrap();
+            let mut cfg = state_clone.config.lock().unwrap();
             cfg.wifi.ssid = wifi_req.ssid;
             cfg.wifi.password = wifi_req.password.filter(|p| !p.is_empty());
             
@@ -1151,10 +1184,10 @@ pub fn start_server(
     })?;
 
     // GET wifi scan endpoint
-    let wifi_clone = wifi.clone();
+    let state_clone = state.clone();
     server.fn_handler("/api/wifi/scan", Method::Get, move |req| -> Result<(), esp_idf_svc::io::EspIOError> {
         info!("HTTP: GET /api/wifi/scan");
-        let mut wifi = wifi_clone.lock().unwrap();
+        let mut wifi = state_clone.wifi.lock().unwrap();
         
         let networks: Vec<Network> = match wifi.scan() {
             Ok(aps) => {
@@ -1193,10 +1226,10 @@ pub fn start_server(
     })?;
 
     // GET network status endpoint
-    let wifi_clone = wifi.clone();
+    let state_clone = state.clone();
     server.fn_handler("/api/network", Method::Get, move |req| -> Result<(), esp_idf_svc::io::EspIOError> {
         info!("HTTP: GET /api/network");
-        let wifi = wifi_clone.lock().unwrap();
+        let wifi = state_clone.wifi.lock().unwrap();
         
         let sta_netif = wifi.wifi().sta_netif();
         let ip_info = sta_netif.get_ip_info().ok();
@@ -1223,10 +1256,10 @@ pub fn start_server(
     })?;
 
     // GET RPM endpoint (fallback for non-SSE clients)
-    let rpm_clone = shared_rpm.clone();
+    let state_clone = state.clone();
     server.fn_handler("/api/rpm", Method::Get, move |req| -> Result<(), esp_idf_svc::io::EspIOError> {
         debug!("HTTP: GET /api/rpm");
-        let rpm = rpm_clone.lock().unwrap();
+        let rpm = state_clone.shared_rpm.lock().unwrap();
         let json = match *rpm {
             Some(r) => format!(r#"{{"rpm":{r}}}"#),
             None => r#"{"rpm":null}"#.to_string(),
@@ -1237,10 +1270,11 @@ pub fn start_server(
     })?;
 
     // GET debug info endpoint (AT commands, PIDs, memory stats, etc.)
+    let state_clone = state.clone();
     server.fn_handler("/api/debug_info", Method::Get, move |req| -> Result<(), esp_idf_svc::io::EspIOError> {
         debug!("HTTP: GET /api/debug_info");
         
-        let at_commands: Vec<String> = at_command_log
+        let at_commands: Vec<String> = state_clone.at_command_log
             .lock()
             .map(|log| {
                 let mut cmds: Vec<String> = log.iter().cloned().collect();
@@ -1249,7 +1283,7 @@ pub fn start_server(
             })
             .unwrap_or_default();
         
-        let pids: Vec<String> = pid_log
+        let pids: Vec<String> = state_clone.pid_log
             .lock()
             .map(|log| {
                 let mut pids: Vec<String> = log.iter().cloned().collect();
@@ -1277,20 +1311,20 @@ pub fn start_server(
     })?;
 
     // POST reboot endpoint
-    let wifi_reboot = wifi.clone();
+    let state_clone = state.clone();
     server.fn_handler("/api/reboot", Method::Post, move |req| -> Result<(), esp_idf_svc::io::EspIOError> {
         info!("HTTP: POST /api/reboot - Device reboot requested");
         
         req.into_ok_response()?;
         
         // Schedule restart after response is sent
-        let wifi = wifi_reboot.clone();
+        let state = state_clone.clone();
         crate::thread_util::spawn_named(c"restart", move || {
             std::thread::sleep(std::time::Duration::from_secs(1));
             
             // Stop WiFi before restarting to ensure clean shutdown
             info!("Stopping WiFi before reboot...");
-            if let Ok(mut wifi) = wifi.lock() {
+            if let Ok(mut wifi) = state.wifi.lock() {
                 if let Err(e) = wifi.stop() {
                     warn!("Failed to stop WiFi: {e:?}");
                 }

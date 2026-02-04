@@ -152,6 +152,9 @@ pub struct Config {
     pub ip: IpConfig,
     #[serde(default)]
     pub obd2: Obd2Config,
+    /// AP SSID override. If None, uses "TachTalk-XXXX" where XXXX is derived from MAC.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ap_ssid: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ap_password: Option<String>,
     #[serde(default)]
@@ -181,6 +184,7 @@ impl Default for Config {
             wifi: WifiConfig::default(),
             ip: IpConfig::default(),
             obd2: Obd2Config::default(),
+            ap_ssid: None,
             ap_password: None,
             log_level: LogLevel::default(),
             thresholds: vec![

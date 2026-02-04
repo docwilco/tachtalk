@@ -9,18 +9,19 @@
 use anyhow::{Context, Result};
 use log::{debug, error, info, warn};
 use smallvec::SmallVec;
-use std::collections::HashSet;
 use std::io::{BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+
+use crate::config::Config;
 use std::time::{Duration, Instant};
 use tachtalk_elm327_lib::ClientState;
 
-use crate::config::Config;
 use crate::leds::LedController;
-use crate::sse_server::{SseMessage, SseSender};
+use crate::sse_server::SseMessage;
 use crate::watchdog::WatchdogHandle;
+use crate::State;
 
 const IDLE_POLL_INTERVAL_MS: u64 = 100;
 /// How long after a client RPM update before background poller resumes
@@ -106,12 +107,6 @@ impl DongleState {
     }
 }
 
-/// Shared log of unique AT commands received from clients (for debugging)
-pub type AtCommandLog = Arc<Mutex<HashSet<String>>>;
-
-/// Shared log of unique OBD2 PIDs requested by clients (for debugging)
-pub type PidLog = Arc<Mutex<HashSet<String>>>;
-
 /// Messages sent to the LED task
 #[derive(Debug, Clone)]
 pub enum RpmTaskMessage {
@@ -137,10 +132,7 @@ pub struct DongleRequest {
 
 /// Shared context for processing OBD2 commands (reduces parameter count)
 struct CommandContext<'a> {
-    config: &'a Arc<Mutex<Config>>,
-    dongle_tx: &'a DongleSender,
-    at_command_log: &'a AtCommandLog,
-    pid_log: &'a PidLog,
+    state: &'a Arc<State>,
 }
 
 /// Errors from the dongle task
@@ -178,18 +170,10 @@ impl DongleError {
 }
 
 pub type DongleSender = Sender<DongleRequest>;
+pub type DongleReceiver = Receiver<DongleRequest>;
 
-/// Start the dongle task and return a sender for requests
-pub fn start_dongle_task(config: Arc<Mutex<Config>>, rpm_tx: RpmTaskSender) -> DongleSender {
-    let (tx, rx) = mpsc::channel();
-    crate::thread_util::spawn_named(c"obd2_dongle", move || {
-        dongle_task(&rx, &config, &rpm_tx);
-    });
-    tx
-}
-
-/// The dongle task - owns the connection and processes requests
-fn dongle_task(rx: &Receiver<DongleRequest>, config: &Arc<Mutex<Config>>, rpm_tx: &RpmTaskSender) {
+/// Run the dongle task - owns the connection and processes requests
+pub fn dongle_task(state: &Arc<State>, rx: &DongleReceiver) {
     info!("OBD2 dongle task starting...");
 
     let mut connection: Option<DongleState> = None;
@@ -204,7 +188,7 @@ fn dongle_task(rx: &Receiver<DongleRequest>, config: &Arc<Mutex<Config>>, rpm_tx
 
         // Get config values
         let (timeout, dongle_ip, dongle_port) = {
-            let cfg = config.lock().unwrap();
+            let cfg = state.config.lock().unwrap();
             (
                 Duration::from_millis(cfg.obd2_timeout_ms),
                 cfg.obd2.dongle_ip.clone(),
@@ -257,7 +241,7 @@ fn dongle_task(rx: &Receiver<DongleRequest>, config: &Arc<Mutex<Config>>, rpm_tx
                             tachtalk_elm327_lib::extract_rpm_from_response(result.as_ref().unwrap())
                         {
                             debug!("Dongle extracted RPM: {rpm}");
-                            let _ = rpm_tx.send(RpmTaskMessage::Rpm(rpm));
+                            let _ = state.rpm_tx.send(RpmTaskMessage::Rpm(rpm));
                         }
                     }
                 }
@@ -442,12 +426,7 @@ pub fn send_command_async(dongle_tx: &DongleSender, command: &[u8]) {
     let _ = dongle_tx.send(request);
 }
 
-/// Create the RPM task channel. The sender goes to `dongle_task`, receiver to `rpm_led_task`.
-pub fn create_rpm_channel() -> (RpmTaskSender, std::sync::mpsc::Receiver<RpmTaskMessage>) {
-    mpsc::channel::<RpmTaskMessage>()
-}
-
-/// Start the combined RPM poller and LED update task.
+/// Run the combined RPM poller and LED update task.
 ///
 /// This task:
 /// - Receives RPM values from dongle task via channel
@@ -455,142 +434,122 @@ pub fn create_rpm_channel() -> (RpmTaskSender, std::sync::mpsc::Receiver<RpmTask
 /// - Updates LEDs based on current RPM
 /// - Sends RPM to SSE clients
 /// - Updates shared RPM for HTTP polling fallback
-pub fn start_rpm_led_task(
+pub fn rpm_led_task(
+    state: &Arc<State>,
     mut led_controller: LedController,
-    config: Arc<Mutex<Config>>,
-    sse_tx: SseSender,
-    dongle_tx: DongleSender,
-    shared_rpm: crate::web_server::SharedRpm,
     rpm_rx: std::sync::mpsc::Receiver<RpmTaskMessage>,
 ) {
-    crate::thread_util::spawn_named(c"rpm_led", move || {
-        // Boot animation: blink purple 3 times
-        {
-            let total_leds = config.lock().unwrap().total_leds;
-            if let Err(e) = led_controller.boot_animation(total_leds) {
-                warn!("Boot animation failed: {e}");
+    // Boot animation: blink purple 3 times
+    {
+        let total_leds = state.config.lock().unwrap().total_leds;
+        if let Err(e) = led_controller.boot_animation(total_leds) {
+            warn!("Boot animation failed: {e}");
+        }
+    }
+
+    let watchdog = WatchdogHandle::register("rpm_led_task");
+    let led_gpio = state.config.lock().unwrap().led_gpio;
+    info!("RPM/LED task started (GPIO {led_gpio})");
+
+    let mut current_rpm: Option<u32> = None;
+    let mut last_rendered_rpm: Option<u32> = None;
+    let mut last_client_rpm: Option<Instant> = None;
+    let mut last_poll: Option<Instant> = None;
+
+    let mut blink_interval_ms = compute_blink_interval(&state.config.lock().unwrap());
+
+    loop {
+        watchdog.feed();
+
+        // Track whether we need to render this iteration
+        let mut should_render = false;
+        let mut should_render_on_timeout = false;
+
+        // Compute timeout: minimum of blink deadline and poll interval
+        let blink_timeout_ms = blink_interval_ms.map(time_until_next_deadline);
+        let timeout_ms = match blink_timeout_ms {
+            Some(blink_ms) => {
+                if blink_ms < IDLE_POLL_INTERVAL_MS {
+                    should_render_on_timeout = true;
+                    blink_ms
+                } else {
+                    IDLE_POLL_INTERVAL_MS
+                }
+            }
+            None => IDLE_POLL_INTERVAL_MS,
+        };
+        let timeout = Duration::from_millis(timeout_ms);
+
+        // Wait for message or timeout
+        match rpm_rx.recv_timeout(timeout) {
+            Ok(RpmTaskMessage::Rpm(rpm)) => {
+                last_client_rpm = Some(Instant::now());
+                if current_rpm != Some(rpm) {
+                    current_rpm = Some(rpm);
+                    should_render = true; // RPM changed
+                }
+                *state.shared_rpm.lock().unwrap() = Some(rpm);
+                debug!("Received RPM: {rpm}");
+            }
+            Ok(RpmTaskMessage::ConfigChanged) => {
+                blink_interval_ms = compute_blink_interval(&state.config.lock().unwrap());
+                should_render = true; // Config changed, re-render
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                if should_render_on_timeout {
+                    should_render = true;
+                }
+
+                // Check if we should poll the dongle for RPM
+                let client_idle =
+                    last_client_rpm.map_or(true, |t| t.elapsed() >= CLIENT_ACTIVITY_BACKOFF);
+                let poll_due = last_poll.map_or(true, |t| {
+                    t.elapsed() >= Duration::from_millis(IDLE_POLL_INTERVAL_MS)
+                });
+                if client_idle && poll_due {
+                    last_poll = Some(Instant::now());
+                    // Fire-and-forget: dongle task will extract RPM and send back via channel
+                    send_command_async(&state.dongle_tx, b"010C");
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                warn!("RPM channel disconnected, exiting task");
+                break;
             }
         }
 
-        let watchdog = WatchdogHandle::register("rpm_led_task");
-        let led_gpio = config.lock().unwrap().led_gpio;
-        info!("RPM/LED task started (GPIO {led_gpio})");
-
-        let mut current_rpm: Option<u32> = None;
-        let mut last_rendered_rpm: Option<u32> = None;
-        let mut last_client_rpm: Option<Instant> = None;
-        let mut last_poll: Option<Instant> = None;
-
-        let mut blink_interval_ms = compute_blink_interval(&config.lock().unwrap());
-
-        loop {
-            watchdog.feed();
-
-            // Track whether we need to render this iteration
-            let mut should_render = false;
-            let mut should_render_on_timeout = false;
-
-            // Compute timeout: minimum of blink deadline and poll interval
-            let blink_timeout_ms = blink_interval_ms.map(time_until_next_deadline);
-            let timeout_ms = match blink_timeout_ms {
-                Some(blink_ms) => {
-                    if blink_ms < IDLE_POLL_INTERVAL_MS {
-                        should_render_on_timeout = true;
-                        blink_ms
-                    } else {
-                        IDLE_POLL_INTERVAL_MS
-                    }
+        // Update LEDs only when needed (RPM changed or blinking)
+        if should_render {
+            if let Some(rpm) = current_rpm {
+                // Only send SSE if RPM actually changed
+                if last_rendered_rpm != Some(rpm) {
+                    let _ = state.sse_tx.send(SseMessage::RpmUpdate(rpm));
+                    last_rendered_rpm = Some(rpm);
                 }
-                None => IDLE_POLL_INTERVAL_MS,
-            };
-            let timeout = Duration::from_millis(timeout_ms);
 
-            // Wait for message or timeout
-            match rpm_rx.recv_timeout(timeout) {
-                Ok(RpmTaskMessage::Rpm(rpm)) => {
-                    last_client_rpm = Some(Instant::now());
-                    if current_rpm != Some(rpm) {
-                        current_rpm = Some(rpm);
-                        should_render = true; // RPM changed
-                    }
-                    *shared_rpm.lock().unwrap() = Some(rpm);
-                    debug!("Received RPM: {rpm}");
-                }
-                Ok(RpmTaskMessage::ConfigChanged) => {
-                    blink_interval_ms = compute_blink_interval(&config.lock().unwrap());
-                    should_render = true; // Config changed, re-render
-                }
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                    if should_render_on_timeout {
-                        should_render = true;
-                    }
-
-                    // Check if we should poll the dongle for RPM
-                    let client_idle =
-                        last_client_rpm.map_or(true, |t| t.elapsed() >= CLIENT_ACTIVITY_BACKOFF);
-                    let poll_due = last_poll.map_or(true, |t| {
-                        t.elapsed() >= Duration::from_millis(IDLE_POLL_INTERVAL_MS)
-                    });
-                    if client_idle && poll_due {
-                        last_poll = Some(Instant::now());
-                        // Fire-and-forget: dongle task will extract RPM and send back via channel
-                        send_command_async(&dongle_tx, b"010C");
-                    }
-                }
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                    warn!("RPM channel disconnected, exiting task");
-                    break;
-                }
-            }
-
-            // Update LEDs only when needed (RPM changed or blinking)
-            if should_render {
-                if let Some(rpm) = current_rpm {
-                    // Only send SSE if RPM actually changed
-                    if last_rendered_rpm != Some(rpm) {
-                        let _ = sse_tx.send(SseMessage::RpmUpdate(rpm));
-                        last_rendered_rpm = Some(rpm);
-                    }
-
-                    let timestamp_ms = get_wallclock_ms();
-                    if let Ok(cfg) = config.lock() {
-                        let _ = led_controller.update(rpm, &cfg, timestamp_ms);
-                    }
+                let timestamp_ms = get_wallclock_ms();
+                if let Ok(cfg) = state.config.lock() {
+                    let _ = led_controller.update(rpm, &cfg, timestamp_ms);
                 }
             }
         }
-    });
+    }
 }
 
 pub struct Obd2Proxy {
-    config: Arc<Mutex<Config>>,
-    dongle_tx: DongleSender,
-    /// Unique AT commands seen from clients (for debugging/web UI)
-    at_command_log: AtCommandLog,
-    /// Unique OBD2 PIDs requested by clients (for debugging/web UI)
-    pid_log: PidLog,
+    state: Arc<State>,
 }
 
 impl Obd2Proxy {
-    pub fn new(
-        config: Arc<Mutex<Config>>,
-        dongle_tx: DongleSender,
-        at_command_log: AtCommandLog,
-        pid_log: PidLog,
-    ) -> Self {
-        Self {
-            config,
-            dongle_tx,
-            at_command_log,
-            pid_log,
-        }
+    pub fn new(state: Arc<State>) -> Self {
+        Self { state }
     }
 
     pub fn run(self) -> Result<()> {
         info!("OBD2 proxy starting...");
 
         // Get listen port from config
-        let listen_port = self.config.lock().unwrap().obd2.listen_port;
+        let listen_port = self.state.config.lock().unwrap().obd2.listen_port;
 
         // Start proxy server
         let listener = TcpListener::bind(format!("0.0.0.0:{listen_port}"))?;
@@ -608,19 +567,10 @@ impl Obd2Proxy {
 
             match listener.accept() {
                 Ok((stream, _)) => {
-                    let config = self.config.clone();
-                    let dongle_tx = self.dongle_tx.clone();
-                    let at_command_log = self.at_command_log.clone();
-                    let pid_log = self.pid_log.clone();
+                    let state = self.state.clone();
 
                     crate::thread_util::spawn_named(c"obd2_client", move || {
-                        if let Err(e) = Self::handle_client(
-                            stream,
-                            &config,
-                            &dongle_tx,
-                            &at_command_log,
-                            &pid_log,
-                        ) {
+                        if let Err(e) = Self::handle_client(stream, &state) {
                             error!("Error handling client: {e:?}");
                         }
                     });
@@ -637,18 +587,12 @@ impl Obd2Proxy {
     }
 
     #[allow(clippy::needless_pass_by_value)] // TcpStream is consumed by BufReader
-    fn handle_client(
-        client_stream: TcpStream,
-        config: &Arc<Mutex<Config>>,
-        dongle_tx: &DongleSender,
-        at_command_log: &AtCommandLog,
-        pid_log: &PidLog,
-    ) -> Result<()> {
+    fn handle_client(client_stream: TcpStream, state: &Arc<State>) -> Result<()> {
         let peer = client_stream.peer_addr()?;
         info!("OBD2 client connected: {peer}");
 
         // Get timeout from config for socket operations
-        let timeout = Duration::from_millis(config.lock().unwrap().obd2_timeout_ms);
+        let timeout = Duration::from_millis(state.config.lock().unwrap().obd2_timeout_ms);
         client_stream.set_read_timeout(Some(timeout))?;
         client_stream.set_write_timeout(Some(timeout))?;
 
@@ -660,7 +604,7 @@ impl Obd2Proxy {
         let mut writer = &client_stream;
 
         // Track per-connection ELM327 state
-        let mut state = ClientState::default();
+        let mut client_state = ClientState::default();
 
         // Command buffer for accumulating characters
         let mut cmd_buffer = Vec::with_capacity(64);
@@ -680,7 +624,7 @@ impl Obd2Proxy {
                     let ch = byte[0];
 
                     // Echo character immediately if enabled
-                    if state.echo_enabled {
+                    if client_state.echo_enabled {
                         writer.write_all(&byte)?;
                     }
 
@@ -692,17 +636,12 @@ impl Obd2Proxy {
 
                         if !command.is_empty() {
                             debug!("OBD2 client command: {command:?}");
-                            let ctx = CommandContext {
-                                config,
-                                dongle_tx,
-                                at_command_log,
-                                pid_log,
-                            };
+                            let ctx = CommandContext { state };
                             Self::process_command(
                                 command,
                                 &cmd_buffer,
                                 &mut writer,
-                                &mut state,
+                                &mut client_state,
                                 &ctx,
                             )?;
                         }
@@ -730,7 +669,7 @@ impl Obd2Proxy {
         command: &str,
         raw_command: &[u8],
         writer: &mut &TcpStream,
-        state: &mut ClientState,
+        client_state: &mut ClientState,
         ctx: &CommandContext<'_>,
     ) -> Result<()> {
         // Check if this is an AT command (handle locally)
@@ -738,11 +677,11 @@ impl Obd2Proxy {
             debug!("Handling AT command locally");
 
             // Record unique AT commands (store uppercase for dedup)
-            if let Ok(mut log) = ctx.at_command_log.lock() {
+            if let Ok(mut log) = ctx.state.at_command_log.lock() {
                 log.insert(command.to_uppercase());
             }
 
-            let response = state.handle_at_command(command);
+            let response = client_state.handle_at_command(command);
             writer
                 .write_all(response.as_bytes())
                 .context("Failed to write AT response")?;
@@ -751,12 +690,12 @@ impl Obd2Proxy {
 
         // Handle "1" repeat command - expand to this client's last command
         let (effective_command, effective_raw): (String, Obd2Buffer) = if command == "1" {
-            if let Some(last) = &state.last_obd_command {
+            if let Some(last) = &client_state.last_obd_command {
                 debug!("Expanding repeat command to: {last}");
                 (last.clone(), last.as_bytes().into())
             } else {
                 // No previous command - return error
-                let le = state.line_ending();
+                let le = client_state.line_ending();
                 let error_response = format!("{le}?{le}>");
                 writer.write_all(error_response.as_bytes())?;
                 return Ok(());
@@ -766,22 +705,22 @@ impl Obd2Proxy {
         };
 
         // Get timeout from config
-        let timeout = Duration::from_millis(ctx.config.lock().unwrap().obd2_timeout_ms);
+        let timeout = Duration::from_millis(ctx.state.config.lock().unwrap().obd2_timeout_ms);
 
         // Record unique OBD2 PIDs (store uppercase for dedup)
-        if let Ok(mut log) = ctx.pid_log.lock() {
+        if let Ok(mut log) = ctx.state.pid_log.lock() {
             log.insert(effective_command.to_uppercase());
         }
 
         // Forward OBD2 command to dongle task
         // RPM extraction happens in the dongle task - it sends to rpm_led automatically
-        match send_command(ctx.dongle_tx, &effective_raw, timeout) {
+        match send_command(&ctx.state.dongle_tx, &effective_raw, timeout) {
             Ok(response) => {
                 // Store this command for per-client repeat functionality
-                state.last_obd_command = Some(effective_command.clone());
+                client_state.last_obd_command = Some(effective_command.clone());
 
                 // Format and send dongle response (echo already sent character-by-character)
-                let formatted = state.format_response(&response);
+                let formatted = client_state.format_response(&response);
                 writer
                     .write_all(&formatted)
                     .context("Failed to write response")?;
@@ -789,7 +728,7 @@ impl Obd2Proxy {
             Err(e) => {
                 error!("Dongle error: {e}");
                 // Send proper ELM327 error response (echo already sent)
-                let le = state.line_ending();
+                let le = client_state.line_ending();
                 let error_msg = e.to_elm327_error();
                 let error_response = format!("{le}{error_msg}{le}>");
                 writer.write_all(error_response.as_bytes())?;
