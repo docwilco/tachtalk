@@ -61,6 +61,10 @@ pub struct LedState {
 
 /// Compute LED colors based on RPM and threshold configuration
 ///
+/// All matching thresholds (where `rpm >= threshold.rpm`) are applied cumulatively
+/// in order. This allows different LED ranges to have different colors at the same
+/// RPM. Later thresholds override earlier ones for overlapping LED ranges.
+///
 /// # Arguments
 /// * `rpm` - Current engine RPM
 /// * `thresholds` - List of threshold configurations (evaluated in order)
@@ -86,34 +90,26 @@ pub fn compute_led_state(
     let mut is_blinking = false;
     let mut threshold_name = None;
 
-    // Apply the active threshold
-    if let Some(threshold) = active_threshold {
-        threshold_name = Some(threshold.name.clone());
+    if let Some(highest) = active_threshold {
+        threshold_name = Some(highest.name.clone());
+        is_blinking = highest.blink;
+    }
 
-        // Handle blinking
-        if threshold.blink {
-            is_blinking = true;
-
-            if !blink_state.is_on {
-                // During blink off state, show the threshold underneath (if any)
-                if matching.len() >= 2 {
-                    let underneath = matching[matching.len() - 2];
-                    let color = underneath.color;
-                    let start = underneath.start_led.min(total_leds);
-                    let end = (underneath.end_led + 1).min(total_leds);
-                    for led in &mut leds[start..end] {
-                        *led = color;
-                    }
-                }
-                return LedState {
-                    leds,
-                    is_blinking,
-                    active_threshold: threshold_name,
-                };
-            }
+    // Handle blinking: during blink OFF phase, exclude the highest threshold
+    let thresholds_to_apply: &[&ThresholdConfig] = if is_blinking && !blink_state.is_on {
+        // During blink off, apply all thresholds except the blinking one
+        if matching.len() >= 2 {
+            &matching[..matching.len() - 1]
+        } else {
+            &[]
         }
+    } else {
+        // Normal case: apply all matching thresholds
+        &matching
+    };
 
-        // Light up LEDs for this threshold
+    // Apply all matching thresholds cumulatively (in order, so later ones override)
+    for threshold in thresholds_to_apply {
         let color = threshold.color;
         let start = threshold.start_led.min(total_leds);
         let end = (threshold.end_led + 1).min(total_leds); // end_led is inclusive
@@ -204,14 +200,14 @@ mod tests {
     }
 
     #[test]
-    fn test_higher_threshold_replaces_lower() {
+    fn test_higher_threshold_cumulative_with_lower() {
         let thresholds = make_thresholds();
         let blink_state = BlinkState::default();
         let state = compute_led_state(5500, &thresholds, 8, &blink_state);
 
         assert_eq!(state.active_threshold, Some("Yellow".to_string()));
         
-        // LEDs 0-4 should be yellow
+        // LEDs 0-4 should be yellow (Yellow overrides Green for 0-2, adds 3-4)
         assert_eq!(state.leds[0], RGB8::new(255, 255, 0));
         assert_eq!(state.leds[4], RGB8::new(255, 255, 0));
         // LEDs 5-7 should be off
@@ -285,5 +281,210 @@ mod tests {
         assert_eq!(state.leds[5], RGB8::new(255, 0, 0));
         assert_eq!(state.leds[7], RGB8::new(255, 0, 0));
         assert_eq!(state.leds.len(), 8);
+    }
+
+    /// Test cumulative thresholds with non-overlapping LED ranges (progressive shift light)
+    #[test]
+    fn test_cumulative_non_overlapping_ranges() {
+        // Simulate a progressive shift light: blue 0-2, green 3-5, yellow 6-8, red 9-11
+        let thresholds = vec![
+            ThresholdConfig {
+                name: "Off".to_string(),
+                rpm: 0,
+                start_led: 0,
+                end_led: 11,
+                color: RGB8::new(0, 0, 0),
+                blink: false,
+                blink_ms: 500,
+            },
+            ThresholdConfig {
+                name: "Blue".to_string(),
+                rpm: 1000,
+                start_led: 0,
+                end_led: 2,
+                color: RGB8::new(0, 0, 255),
+                blink: false,
+                blink_ms: 500,
+            },
+            ThresholdConfig {
+                name: "Green".to_string(),
+                rpm: 1500,
+                start_led: 3,
+                end_led: 5,
+                color: RGB8::new(0, 255, 0),
+                blink: false,
+                blink_ms: 500,
+            },
+            ThresholdConfig {
+                name: "Yellow".to_string(),
+                rpm: 2000,
+                start_led: 6,
+                end_led: 8,
+                color: RGB8::new(255, 255, 0),
+                blink: false,
+                blink_ms: 500,
+            },
+            ThresholdConfig {
+                name: "Red".to_string(),
+                rpm: 2500,
+                start_led: 9,
+                end_led: 11,
+                color: RGB8::new(255, 0, 0),
+                blink: false,
+                blink_ms: 500,
+            },
+        ];
+        let blink_state = BlinkState::default();
+
+        // At 1200 RPM: only blue should be on
+        let state = compute_led_state(1200, &thresholds, 12, &blink_state);
+        assert_eq!(state.active_threshold, Some("Blue".to_string()));
+        assert_eq!(state.leds[0], RGB8::new(0, 0, 255)); // blue
+        assert_eq!(state.leds[2], RGB8::new(0, 0, 255)); // blue
+        assert_eq!(state.leds[3], RGB8::default()); // off
+        assert_eq!(state.leds[11], RGB8::default()); // off
+
+        // At 1700 RPM: blue AND green should be on
+        let state = compute_led_state(1700, &thresholds, 12, &blink_state);
+        assert_eq!(state.active_threshold, Some("Green".to_string()));
+        assert_eq!(state.leds[0], RGB8::new(0, 0, 255)); // blue stays on
+        assert_eq!(state.leds[2], RGB8::new(0, 0, 255)); // blue stays on
+        assert_eq!(state.leds[3], RGB8::new(0, 255, 0)); // green
+        assert_eq!(state.leds[5], RGB8::new(0, 255, 0)); // green
+        assert_eq!(state.leds[6], RGB8::default()); // off
+
+        // At 2200 RPM: blue, green, AND yellow should be on
+        let state = compute_led_state(2200, &thresholds, 12, &blink_state);
+        assert_eq!(state.active_threshold, Some("Yellow".to_string()));
+        assert_eq!(state.leds[0], RGB8::new(0, 0, 255)); // blue
+        assert_eq!(state.leds[3], RGB8::new(0, 255, 0)); // green
+        assert_eq!(state.leds[6], RGB8::new(255, 255, 0)); // yellow
+        assert_eq!(state.leds[8], RGB8::new(255, 255, 0)); // yellow
+        assert_eq!(state.leds[9], RGB8::default()); // off
+
+        // At 3000 RPM: all colors should be on
+        let state = compute_led_state(3000, &thresholds, 12, &blink_state);
+        assert_eq!(state.active_threshold, Some("Red".to_string()));
+        assert_eq!(state.leds[0], RGB8::new(0, 0, 255)); // blue
+        assert_eq!(state.leds[3], RGB8::new(0, 255, 0)); // green
+        assert_eq!(state.leds[6], RGB8::new(255, 255, 0)); // yellow
+        assert_eq!(state.leds[9], RGB8::new(255, 0, 0)); // red
+        assert_eq!(state.leds[11], RGB8::new(255, 0, 0)); // red
+    }
+
+    /// Test progressive single-LED thresholds within a color zone
+    #[test]
+    fn test_progressive_single_led_thresholds() {
+        // Each LED lights up at a different RPM
+        let thresholds = vec![
+            ThresholdConfig {
+                name: "Off".to_string(),
+                rpm: 0,
+                start_led: 0,
+                end_led: 2,
+                color: RGB8::new(0, 0, 0),
+                blink: false,
+                blink_ms: 500,
+            },
+            ThresholdConfig {
+                name: "Blue 1".to_string(),
+                rpm: 1000,
+                start_led: 0,
+                end_led: 0,
+                color: RGB8::new(0, 0, 255),
+                blink: false,
+                blink_ms: 500,
+            },
+            ThresholdConfig {
+                name: "Blue 2".to_string(),
+                rpm: 1167,
+                start_led: 1,
+                end_led: 1,
+                color: RGB8::new(0, 0, 255),
+                blink: false,
+                blink_ms: 500,
+            },
+            ThresholdConfig {
+                name: "Blue 3".to_string(),
+                rpm: 1333,
+                start_led: 2,
+                end_led: 2,
+                color: RGB8::new(0, 0, 255),
+                blink: false,
+                blink_ms: 500,
+            },
+        ];
+        let blink_state = BlinkState::default();
+
+        // At 1100 RPM: only LED 0
+        let state = compute_led_state(1100, &thresholds, 3, &blink_state);
+        assert_eq!(state.leds[0], RGB8::new(0, 0, 255));
+        assert_eq!(state.leds[1], RGB8::default());
+        assert_eq!(state.leds[2], RGB8::default());
+
+        // At 1200 RPM: LEDs 0 and 1
+        let state = compute_led_state(1200, &thresholds, 3, &blink_state);
+        assert_eq!(state.leds[0], RGB8::new(0, 0, 255));
+        assert_eq!(state.leds[1], RGB8::new(0, 0, 255));
+        assert_eq!(state.leds[2], RGB8::default());
+
+        // At 1400 RPM: all three LEDs
+        let state = compute_led_state(1400, &thresholds, 3, &blink_state);
+        assert_eq!(state.leds[0], RGB8::new(0, 0, 255));
+        assert_eq!(state.leds[1], RGB8::new(0, 0, 255));
+        assert_eq!(state.leds[2], RGB8::new(0, 0, 255));
+    }
+
+    /// Test blink OFF shows all thresholds underneath (cumulative)
+    #[test]
+    fn test_blink_off_shows_all_underneath() {
+        let thresholds = vec![
+            ThresholdConfig {
+                name: "Blue".to_string(),
+                rpm: 1000,
+                start_led: 0,
+                end_led: 2,
+                color: RGB8::new(0, 0, 255),
+                blink: false,
+                blink_ms: 500,
+            },
+            ThresholdConfig {
+                name: "Green".to_string(),
+                rpm: 1500,
+                start_led: 3,
+                end_led: 5,
+                color: RGB8::new(0, 255, 0),
+                blink: false,
+                blink_ms: 500,
+            },
+            ThresholdConfig {
+                name: "Shift".to_string(),
+                rpm: 2000,
+                start_led: 0,
+                end_led: 5,
+                color: RGB8::new(255, 0, 0),
+                blink: true,
+                blink_ms: 100,
+            },
+        ];
+
+        // Blink ON: all red
+        let blink_on = BlinkState { is_on: true, elapsed_ms: 0 };
+        let state = compute_led_state(2500, &thresholds, 6, &blink_on);
+        assert!(state.is_blinking);
+        assert_eq!(state.leds[0], RGB8::new(255, 0, 0));
+        assert_eq!(state.leds[5], RGB8::new(255, 0, 0));
+
+        // Blink OFF: should show blue AND green underneath
+        let blink_off = BlinkState { is_on: false, elapsed_ms: 0 };
+        let state = compute_led_state(2500, &thresholds, 6, &blink_off);
+        assert!(state.is_blinking);
+        assert_eq!(state.active_threshold, Some("Shift".to_string()));
+        // Blue LEDs 0-2
+        assert_eq!(state.leds[0], RGB8::new(0, 0, 255));
+        assert_eq!(state.leds[2], RGB8::new(0, 0, 255));
+        // Green LEDs 3-5
+        assert_eq!(state.leds[3], RGB8::new(0, 255, 0));
+        assert_eq!(state.leds[5], RGB8::new(0, 255, 0));
     }
 }
