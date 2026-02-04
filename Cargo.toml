@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "tachtalk-benchmark-client",
     "tachtalk-elm327-lib",
     "tachtalk-shift-lights-lib",
     "tachtalk-firmware",
