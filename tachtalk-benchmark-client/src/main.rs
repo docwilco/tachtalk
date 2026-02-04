@@ -78,6 +78,7 @@ impl Stats {
 
     fn print_interval(&mut self, verbose: bool) {
         let elapsed = self.interval_start.elapsed();
+        #[allow(clippy::cast_precision_loss)] // interval_requests won't approach 2^53
         let rate = self.interval_requests as f64 / elapsed.as_secs_f64();
 
         if verbose {
@@ -112,8 +113,10 @@ impl Stats {
         println!("Total errors:   {}", self.errors);
 
         if self.requests > 0 {
+            #[allow(clippy::cast_precision_loss)] // requests won't approach 2^53
             let rate = self.requests as f64 / total_elapsed.as_secs_f64();
-            let avg_latency = self.total_latency / self.requests as u32;
+            let avg_latency = self.total_latency
+                / u32::try_from(self.requests).expect("request count exceeded u32::MAX");
 
             println!("Request rate:   {rate:.1} req/s");
             println!("Min latency:    {:.3}ms", self.min_latency.as_secs_f64() * 1000.0);

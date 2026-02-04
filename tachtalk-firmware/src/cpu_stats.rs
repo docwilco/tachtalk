@@ -15,12 +15,16 @@ type TaskSnapshots = HashMap<usize, u64>;
 /// Get the current time in microseconds
 fn get_time_us() -> u64 {
     // SAFETY: esp_timer_get_time is safe to call
-    unsafe { esp_timer_get_time() as u64 }
+    // Timer returns microseconds since boot - always non-negative
+    #[allow(clippy::cast_sign_loss)]
+    unsafe {
+        esp_timer_get_time() as u64
+    }
 }
 
 /// Get the number of CPU cores
 fn get_num_cores() -> u32 {
-    configNUM_CORES as u32
+    configNUM_CORES
 }
 
 /// Collect current task states and print CPU usage deltas
@@ -40,8 +44,8 @@ pub fn print_cpu_usage_deltas(prev_snapshots: &mut TaskSnapshots, prev_total: &m
     let tasks_returned = unsafe {
         uxTaskGetSystemState(
             task_array.as_mut_ptr(),
-            task_array.len() as UBaseType_t,
-            &mut total_runtime as *mut u32,
+            UBaseType_t::try_from(task_array.len()).expect("task count fits in u32"),
+            &raw mut total_runtime,
         )
     } as usize;
 
@@ -65,10 +69,9 @@ pub fn print_cpu_usage_deltas(prev_snapshots: &mut TaskSnapshots, prev_total: &m
     let mut current_snapshots: TaskSnapshots = HashMap::with_capacity(tasks_returned);
     let mut usages: Vec<(String, usize, f32)> = Vec::with_capacity(tasks_returned);
 
-    for i in 0..tasks_returned {
-        let task = &task_array[i];
+    for task in task_array.iter().take(tasks_returned) {
         let handle = task.xHandle as usize;
-        let runtime = task.ulRunTimeCounter as u64;
+        let runtime = u64::from(task.ulRunTimeCounter);
 
         // Get task name
         // SAFETY: pcTaskName is a null-terminated C string
@@ -84,6 +87,8 @@ pub fn print_cpu_usage_deltas(prev_snapshots: &mut TaskSnapshots, prev_total: &m
 
         // Calculate percentage relative to one core (100% = one full core)
         // A task using both cores fully would show 200% on a dual-core system
+        // Precision loss is fine - we only display 1 decimal place
+        #[allow(clippy::cast_precision_loss)]
         let percentage = if delta_total_us > 0 {
             (delta_runtime as f32 / delta_total_us as f32) * 100.0
         } else {
@@ -104,7 +109,7 @@ pub fn print_cpu_usage_deltas(prev_snapshots: &mut TaskSnapshots, prev_total: &m
     for (name, task_id, percentage) in usages {
         if percentage >= 0.1 {
             // Only show tasks using at least 0.1%
-            info!("  {:16} (#{:2}): {:5.1}%", name, task_id, percentage);
+            info!("  {name:16} (#{task_id:2}): {percentage:5.1}%");
         }
     }
 

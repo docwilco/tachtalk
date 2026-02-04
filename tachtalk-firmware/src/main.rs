@@ -306,12 +306,15 @@ fn main() -> Result<()> {
     // Create shared RPM state for HTTP polling fallback
     let shared_rpm: web_server::SharedRpm = Arc::new(Mutex::new(None));
 
-    // Start OBD2 dongle task and RPM/LED task (before web server so we can pass rpm_tx)
-    let dongle_tx = obd2::start_dongle_task(config.clone());
+    // Create RPM channel - sender goes to dongle task, receiver to rpm_led task
+    let (rpm_tx, rpm_rx) = obd2::create_rpm_channel();
+
+    // Start OBD2 dongle task (needs rpm_tx to send extracted RPM values)
+    let dongle_tx = obd2::start_dongle_task(config.clone(), rpm_tx.clone());
     
     // Start the combined RPM poller and LED update task
     // This takes ownership of led_controller (no Arc<Mutex> needed)
-    let rpm_tx = start_rpm_led_task(led_controller, config.clone(), sse_tx.clone(), dongle_tx.clone(), shared_rpm.clone());
+    start_rpm_led_task(led_controller, config.clone(), sse_tx.clone(), dongle_tx.clone(), shared_rpm.clone(), rpm_rx);
 
     // Start web server (needs rpm_tx to notify of config changes)
     {
@@ -339,12 +342,11 @@ fn main() -> Result<()> {
     // Start OBD2 proxy
     {
         let config_clone = config.clone();
-        let rpm_tx_clone = rpm_tx.clone();
         let at_cmd_log_clone = at_command_log.clone();
         let pid_log_clone = pid_log.clone();
         
         thread_util::spawn_named(c"obd2_proxy", move || {
-            let proxy = Obd2Proxy::new(config_clone, rpm_tx_clone, dongle_tx, at_cmd_log_clone, pid_log_clone);
+            let proxy = Obd2Proxy::new(config_clone, dongle_tx, at_cmd_log_clone, pid_log_clone);
             if let Err(e) = proxy.run() {
                 error!("OBD2 proxy error: {e:?}");
             }

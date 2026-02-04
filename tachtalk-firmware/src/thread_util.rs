@@ -1,8 +1,8 @@
 //! Helper for spawning threads with FreeRTOS task names
 //!
-//! Rust's std::thread::Builder::name() sets the pthread name after creation,
+//! Rust's `std::thread::Builder::name()` sets the pthread name after creation,
 //! but ESP-IDF creates the FreeRTOS task at pthread creation time with the
-//! default name. This module uses ThreadSpawnConfiguration to set the name
+//! default name. This module uses `ThreadSpawnConfiguration` to set the name
 //! before spawning.
 
 use esp_idf_hal::task::thread::ThreadSpawnConfiguration;
@@ -26,8 +26,10 @@ where
     let prev_conf = ThreadSpawnConfiguration::get();
     
     // Create new config with our name
-    let mut conf = ThreadSpawnConfiguration::default();
-    conf.name = Some(name.to_bytes_with_nul());
+    let conf = ThreadSpawnConfiguration {
+        name: Some(name.to_bytes_with_nul()),
+        ..Default::default()
+    };
     conf.set().expect("Failed to set thread spawn configuration");
     
     // Spawn the thread

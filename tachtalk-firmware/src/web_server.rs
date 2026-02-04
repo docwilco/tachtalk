@@ -1065,10 +1065,10 @@ pub fn start_server(
             
             let old_gpio = {
                 let cfg = config_clone.lock().unwrap();
-                if cfg.led_gpio != new_config.led_gpio {
-                    Some(cfg.led_gpio)
-                } else {
+                if cfg.led_gpio == new_config.led_gpio {
                     None
+                } else {
+                    Some(cfg.led_gpio)
                 }
             };
             
@@ -1084,7 +1084,7 @@ pub fn start_server(
             let _ = rpm_tx_clone.send(crate::obd2::RpmTaskMessage::ConfigChanged);
             
             if let Some(old_gpio) = old_gpio {
-                info!("LED GPIO changed from {} to new value, resetting old pin and restarting in 2 seconds...", old_gpio);
+                info!("LED GPIO changed from {old_gpio} to new value, resetting old pin and restarting in 2 seconds...");
                 // Reset the OLD GPIO to clear RMT routing before restart
                 unsafe { esp_idf_svc::sys::gpio_reset_pin(i32::from(old_gpio)); }
                 let mut response = req.into_ok_response()?;
