@@ -5,8 +5,8 @@ Get TachTalk up and running in 15 minutes!
 ## Prerequisites
 
 - ESP32-S3 development board
-- WS2812B LED strip (8+ LEDs)
-- WiFi network
+- WS2812B LED strip (1+ LEDs)
+- Wi-Fi OBD2 dongle (e.g., Vgate iCar 2)
 - Computer with Rust installed
 
 ## Step 1: Install Rust Tools (5 minutes)
@@ -26,21 +26,12 @@ espup install
 cargo install ldproxy espflash
 ```
 
-## Step 2: Configure WiFi (1 minute)
-
-Create a `.env` file or set environment variables:
-
-```bash
-export WIFI_SSID="YourNetworkName"
-export WIFI_PASSWORD="YourPassword"
-```
-
-## Step 3: Build and Flash (5 minutes)
+## Step 2: Build and Flash (5 minutes)
 
 ```bash
 # Clone the repository (if you haven't already)
 git clone https://github.com/docwilco/tachtalk.git
-cd tachtalk
+cd tachtalk/tachtalk-firmware
 
 # Build and flash to ESP32-S3
 cargo run --release
@@ -51,7 +42,7 @@ The firmware will:
 - Flash to your ESP32-S3
 - Start monitoring serial output
 
-## Step 4: Wire the Hardware (2 minutes)
+## Step 3: Wire the Hardware (2 minutes)
 
 Connect your WS2812B LED strip:
 
@@ -66,45 +57,60 @@ ESP32-S3 GND    ──> LED Strip GND
 - LED strip needs external 5V power (not from ESP32)
 - See [WIRING_GUIDE.md](WIRING_GUIDE.md) for detailed instructions
 
-## Step 5: Configure (2 minutes)
+## Step 4: Initial Configuration (3 minutes)
 
-1. Find your ESP32's IP address in the serial monitor output:
-   ```
-   WiFi IP Info: IpInfo { ip: 192.168.1.100, ... }
-   ```
+1. **Connect to the TachTalk WiFi hotspot**
+   - Look for `TachTalk-XXXX` in your WiFi networks
+   - Connect (no password by default)
 
-2. Open web browser to: `http://192.168.1.100`
+2. **Open the configuration page**
+   - A captive portal should redirect you automatically
+   - If not, go to: `http://192.168.71.1`
 
-3. Configure your shift light thresholds:
-   - Add/remove thresholds
-   - Set RPM values
-   - Choose colors
-   - Set number of LEDs per threshold
-   - Configure blink RPM
+3. **Configure WiFi to connect to your OBD2 dongle**
+   - Enter the dongle's SSID (default: "V-LINK" for Vgate iCar 2)
+   - Enter password if required
+   - Click "Save & Connect"
+   - The device will reboot and connect to the dongle network
 
-4. Click "Save Configuration"
+4. **Reconnect to access the Web UI**
+   - Connect your computer/phone to the same network as the OBD2 dongle
+   - Access TachTalk at `http://tachtalk.local` or its IP address
+
+## Step 5: Configure Shift Lights (2 minutes)
+
+In the Web UI:
+- Adjust RPM thresholds for your vehicle
+- Set colors for each threshold
+- Configure LED ranges (start/end LED)
+- Enable blink for shift warning
+- Set brightness level
+- Click "Save Configuration"
 
 ## Step 6: Connect to Vehicle
 
 ### Without RaceChroнo (Standalone Mode)
-1. Plug Vgate iCar 2 into vehicle OBD2 port
-2. Ensure Vgate is at IP 192.168.0.10
-3. Turn on ignition
-4. LEDs will start showing RPM automatically!
+1. Plug OBD2 dongle into vehicle OBD2 port
+2. Turn on ignition
+3. Power on ESP32-S3
+4. Device connects to dongle WiFi automatically
+5. LEDs will start showing RPM!
 
 ### With RaceChroнo (Proxy Mode)
 1. Configure RaceChroнo OBD2 connection:
    - Type: WiFi/Network
-   - IP: Your ESP32 IP (e.g., 192.168.1.100)
+   - IP: TachTalk's IP (check Web UI) or tachtalk.local
    - Port: 35000
 2. Connect in RaceChroнo
-3. LEDs show RPM based on your thresholds
+3. LEDs show RPM based on your thresholds while RaceChroнo logs data
 
 ## Verification Checklist
 
-- [ ] ESP32-S3 boots successfully
-- [ ] WiFi connects (check serial output)
-- [ ] Web UI accessible at ESP32 IP address
+- [ ] ESP32-S3 boots successfully (check serial output)
+- [ ] TachTalk-XXXX WiFi hotspot appears on first boot
+- [ ] Web UI accessible at 192.168.71.1 in AP mode
+- [ ] Device connects to dongle WiFi after configuration
+- [ ] Web UI accessible via tachtalk.local in client mode
 - [ ] LED strip powers on
 - [ ] LEDs respond to RPM changes
 - [ ] Configuration changes save successfully
@@ -115,32 +121,34 @@ ESP32-S3 GND    ──> LED Strip GND
 ```bash
 # Make sure environment is sourced
 . ~/export-esp.sh
-
-# Verify WiFi credentials are set
-echo $WIFI_SSID
-echo $WIFI_PASSWORD
 ```
 
-### WiFi Won't Connect
-- Check SSID and password are correct
-- Ensure 2.4GHz WiFi (ESP32 doesn't support 5GHz)
-- Check serial output for error messages
+### Can't Find TachTalk WiFi
+- Check that ESP32 is powered
+- Look for `TachTalk-` prefix in WiFi list
+- Check serial output for boot messages
+
+### WiFi Won't Connect to Dongle
+- Verify SSID spelling (case-sensitive)
+- Check password is correct
+- Ensure dongle is powered on
+- 2.4GHz only (ESP32 doesn't support 5GHz)
 
 ### LEDs Don't Light
-- Verify wiring (see Step 4)
-- Check LED strip power supply (5V, 2A+)
-- Try accessing web UI and setting a low RPM threshold
+- Verify wiring (see Step 3)
+- Check LED strip power supply (5V, sufficient current)
+- Verify GPIO pin in Web UI (System Settings → LED GPIO Pin)
 - Check serial output for LED controller errors
 
 ### Can't Access Web UI
-- Verify ESP32 IP from serial output
-- Ensure computer is on same network
-- Try pinging the ESP32 IP
-- Check firewall settings
+- **AP mode**: Connect to TachTalk-XXXX, go to 192.168.71.1
+- **Client mode**: Use device IP from serial output, or tachtalk.local
+- Ensure you're on the same network
+- Try pinging the device
 
 ### LEDs Flicker or Wrong Colors
 - Add 330Ω resistor on data line
-- Use level shifter (3.3V to 5V)
+- Use level shifter (3.3V to 5V) for longer runs
 - Add 1000μF capacitor to LED power
 - See [WIRING_GUIDE.md](WIRING_GUIDE.md) for details
 
@@ -152,21 +160,20 @@ echo $WIFI_PASSWORD
 
 ## Example Configurations
 
-### First-Time Setup (Recommended)
-Start with these safe values:
-- Threshold 1: 3000 RPM, Green, 2 LEDs
-- Threshold 2: 4000 RPM, Yellow, 4 LEDs  
-- Threshold 3: 5000 RPM, Red, 6 LEDs
-- Blink: 6000 RPM
-- Total LEDs: 8
+### First-Time Setup (Testing)
+Start with default thresholds and adjust based on your vehicle:
+- Threshold at 1000 RPM: Blue (idle indicator)
+- Threshold at 1500 RPM: Green
+- Threshold at 2000 RPM: Yellow
+- Threshold at 2500 RPM: Red
+- Threshold at 3000 RPM: Blink (shift warning)
 
 ### Racing Setup
-For track use:
-- Threshold 1: 4000 RPM, Green, 2 LEDs
-- Threshold 2: 5500 RPM, Yellow, 5 LEDs
-- Threshold 3: 6500 RPM, Red, 8 LEDs
-- Blink: 7000 RPM
-- Total LEDs: 8
+For track use, adjust RPM values to match your engine:
+- Green: 80% of redline
+- Yellow: 90% of redline
+- Red: 95% of redline
+- Blink: At or just before redline
 
 ## Getting Help
 
@@ -174,34 +181,30 @@ If you encounter issues:
 
 1. **Check Serial Output**: Most issues show up here
    ```bash
-   cargo run --release
-   # Watch for error messages
+   cd tachtalk-firmware
+   espflash monitor
    ```
 
-2. **Verify Hardware**: 
+2. **Check Web UI Status**: Connection Status section shows network and OBD2 state
+
+3. **Verify Hardware**: 
    - All connections secure
    - Correct voltages (5V for LEDs, 3.3V logic)
    - No shorts or reversed polarity
 
-3. **Review Documentation**:
+4. **Review Documentation**:
    - [README.md](README.md) - Overview
    - [WIRING_GUIDE.md](WIRING_GUIDE.md) - Hardware setup
    - [WEBUI_GUIDE.md](WEBUI_GUIDE.md) - Configuration
    - [ARCHITECTURE.md](ARCHITECTURE.md) - How it works
 
-4. **Common Issues**:
-   - **Build errors**: Source ESP environment (`. ~/export-esp.sh`)
-   - **WiFi errors**: Check credentials and 2.4GHz network
-   - **LED issues**: Verify wiring and power supply
-   - **Web UI errors**: Check IP address and network
-
 ## Success!
 
 Once everything is working:
-- LEDs should respond to engine RPM
-- Web UI shows current configuration
+- LEDs respond to engine RPM
+- Web UI shows real-time RPM and connection status
 - Configuration changes apply immediately
-- System automatically polls RPM when idle
+- Settings persist across reboots
 
 Enjoy your new shift lights! 🏁
 
@@ -212,11 +215,4 @@ Enjoy your new shift lights! 🏁
 3. **Protect from Heat**: Keep ESP32 away from engine heat
 4. **Use Quality Wire**: Automotive-grade wire for permanent installation
 5. **Add Fusing**: Use appropriate fuse for vehicle installation
-6. **Document Settings**: Note your favorite configurations for different scenarios
-
-## What's Next?
-
-- Experiment with different color schemes
-- Try multiple threshold configurations
-- Fine-tune based on your engine's power band
-- Share your setup with others!
+6. **Adjust Brightness**: Lower brightness for night driving to avoid distraction

@@ -4,9 +4,9 @@
 
 ### Main Components
 - ESP32-S3 Development Board (e.g., ESP32-S3-DevKitC-1)
-- WS2812B LED Strip (8+ LEDs recommended)
-- Vgate iCar 2 Wi-Fi OBD2 Dongle
-- 5V Power Supply (2A+ for LED strip)
+- WS2812B LED Strip (1+ LEDs)
+- Wi-Fi OBD2 Dongle (e.g., Vgate iCar 2)
+- 5V Power Supply (capacity depends on LED count)
 - USB-C cable for ESP32-S3 programming
 
 ### Optional Components
@@ -18,12 +18,14 @@
 
 ### ESP32-S3 to WS2812B LED Strip
 
+The default GPIO pin is 48, but this is **configurable via the Web UI** (System Settings → LED GPIO Pin).
+
 ```
-ESP32-S3          WS2812B Strip
-──────────────────────────────
-GPIO48    ──────> DIN (Data In)
-GND       ──────> GND
-5V*       ──────> +5V
+ESP32-S3               WS2812B Strip
+──────────────────────────────────────
+GPIO (default 48) ───> DIN (Data In)
+GND               ───> GND
+5V*               ───> +5V
 
 * Note: 5V should come from external power supply, not ESP32
 ```
@@ -33,11 +35,11 @@ GND       ──────> GND
 ```
 ESP32-S3          Level Shifter         WS2812B Strip
 ─────────────────────────────────────────────────────
-GPIO48    ───────> LV Input
-3.3V      ───────> LV VCC
-GND       ───────> GND    ───────────> GND
-                  HV VCC  <────┐
-                  HV Output ───┼──────> DIN
+GPIO (cfg) ──────> LV Input
+3.3V       ──────> LV VCC
+GND        ──────> GND    ───────────> GND
+                   HV VCC  <────┐
+                   HV Output ───┼──────> DIN
 5V Supply ──────────────────────┴─────> +5V
 ```
 

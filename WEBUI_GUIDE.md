@@ -2,189 +2,225 @@
 
 ## Accessing the Web UI
 
-1. Connect your device to the same WiFi network as the ESP32-S3
-2. Find the IP address of the ESP32 (check serial monitor output during boot)
-3. Open a web browser and navigate to: `http://<esp32-ip-address>`
+### First Boot (Access Point Mode)
+1. Connect to the `TachTalk-XXXX` WiFi network (XXXX is derived from the device MAC)
+2. A captive portal should redirect you automatically
+3. If not, open a browser to: `http://192.168.71.1`
 
-Example: `http://192.168.1.100`
+### After WiFi Configuration (Client Mode)
+1. Connect your device to the same WiFi network as the ESP32-S3
+2. Access via mDNS: `http://tachtalk.local`
+3. Or use the device's IP address (shown in serial output or the Web UI status)
 
 ## Configuration Interface
 
 ### Main Screen
 
 The web UI displays:
-- Current configuration status
-- List of RPM thresholds
-- Blink configuration
-- Total LED count setting
-- Save/Reload buttons
+- Current RPM (real-time via Server-Sent Events)
+- Brightness slider with live preview
+- Connection status diagram
+- WiFi configuration
+- Access Point configuration
+- OBD2 configuration
+- System settings
+- RPM threshold configuration
+- Debug information (collapsible)
+
+### Connection Status Diagram
+
+The visual diagram shows:
+- **OBD2 Dongle**: Connection status to the Wi-Fi OBD2 dongle
+- **TachTalk Device**: Central hub showing WiFi and TCP connections
+- **OBD2 Clients**: Number of connected clients (e.g., RaceChroнo)
+- **Browser**: Your current Web UI connection
+
+Click on nodes to see detailed network information (IP addresses, ports, signal strength).
+
+### Brightness Control
+
+- **Slider**: Adjust LED brightness from 0 (off) to 255 (full)
+- **Save Button**: Persist brightness setting to NVS
+- Changes apply immediately for preview, but require Save to persist
+
+### WiFi Configuration
+
+Configure connection to your OBD2 dongle's network:
+
+- **SSID**: Network name (default: "V-LINK" for Vgate iCar 2)
+- **Password**: Network password (leave empty for open networks)
+- **IP Mode**: 
+  - DHCP (Automatic) - recommended
+  - Static IP - for fixed address configuration
+- **Static IP Fields** (when Static IP selected):
+  - IP Address (default: 192.168.0.20)
+  - Gateway (default: 192.168.0.1)
+  - Subnet Mask (default: 255.255.255.0)
+  - DNS (optional)
+- **Scan Networks**: Discover available WiFi networks
+- **Save & Connect**: Apply settings and reboot
+
+### Access Point Configuration
+
+Configure the setup hotspot:
+
+- **AP SSID**: Custom name (leave empty for auto: TachTalk-XXXX)
+- **AP Password**: Secure the hotspot (leave empty for open network)
+
+### OBD2 Configuration
+
+Configure connection to the OBD2 dongle:
+
+- **Dongle IP**: IP address of the OBD2 dongle (default: 192.168.0.10)
+- **Dongle Port**: TCP port of the dongle (default: 35000)
+- **Proxy Listen Port**: Port for RaceChroнo to connect (default: 35000)
+- **Timeout (ms)**: OBD2 response timeout (default: 4500ms, max: 4500ms)
+
+### System Settings
+
+- **Log Level**: off, error, warn, info, debug
+- **Total LEDs**: Number of LEDs in your strip
+- **LED GPIO Pin**: GPIO pin for WS2812B data (default: 48, requires restart)
+- **Reboot Device**: Restart the ESP32-S3
 
 ### Configuring RPM Thresholds
 
-Each threshold has three parameters:
+Each threshold defines LED behavior at a specific RPM:
 
-#### 1. RPM Value
-- The minimum RPM to activate this threshold
-- Enter a whole number (e.g., 3000, 4000, 5000)
-- Thresholds should be in ascending order for best results
+#### Threshold Fields
+- **Name**: Human-readable label (e.g., "Green", "Shift")
+- **RPM**: Minimum RPM to activate this threshold
+- **Start LED**: First LED in the range (0-indexed)
+- **End LED**: Last LED in the range (0-indexed)
+- **Color**: RGB color picker
+- **Blink**: Enable/disable blinking
+- **Blink ms**: Blink interval in milliseconds
 
-#### 2. Color
-- Click the color picker to select an RGB color
-- Colors can be:
-  - Green (0, 255, 0) for low RPM
-  - Yellow (255, 255, 0) for mid RPM
-  - Red (255, 0, 0) for high RPM
-  - Or any custom color you prefer
+#### Threshold Logic
+- Thresholds are evaluated in order
+- The **last matching threshold** (by RPM) determines LED behavior
+- Use multiple thresholds at the same RPM for different LED ranges
 
-#### 3. Number of LEDs
-- How many LEDs to light up at this threshold
-- Should generally increase with higher thresholds
-- Cannot exceed the total number of LEDs
+#### Managing Thresholds
+- **Add Threshold**: Creates a new threshold with defaults
+- **Remove**: Deletes a threshold
+- **Move Up/Down**: Reorder thresholds
 
-### Adding a Threshold
+### Saving Configuration
 
-1. Click the "Add Threshold" button
-2. A new threshold will appear with default values
-3. Adjust the RPM, color, and LED count as needed
-
-### Removing a Threshold
-
-1. Locate the threshold you want to remove
-2. Click the "Remove" button for that threshold
-3. The threshold will be deleted immediately
-
-### Blink Configuration
-
-The blink feature makes all LEDs flash rapidly when RPM exceeds a certain value.
-
-- **Blink RPM**: The RPM at which blinking starts
-- Typically set above your highest threshold
-- Blink rate is 4Hz (250ms on/off)
-
-### Total LEDs Setting
-
-- Enter the total number of LEDs in your strip
-- This determines the maximum number of LEDs that can be lit
-- Common values: 8, 16, 30, 60
-
-## Saving Configuration
-
-1. Make all desired changes to thresholds, colors, and settings
-2. Click the "Save Configuration" button
-3. A success message will appear if saved correctly
+1. Make all desired changes
+2. Click **Save Configuration**
+3. A success/error message appears
 4. Changes take effect immediately
+5. Settings persist across reboots (NVS storage)
 
-## Reloading Configuration
+### Debug Section
 
-- Click "Reload" to refresh the UI with the current device configuration
-- Useful if you've made changes but want to revert to the saved state
-- Also helpful if multiple people are configuring the device
+Collapsible section with:
+- **Memory Stats**: Free heap, minimum free heap
+- **AT Commands**: Log of ELM327 AT commands received
+- **OBD2 PIDs**: Log of PIDs requested by clients
+- **Benchmark**: Performance testing tool
+
+### Raw Config JSON
+
+For advanced users:
+- View/edit the complete configuration as JSON
+- Format JSON for readability
+- Useful for backup/restore or bulk edits
 
 ## Example Configurations
 
-### Conservative Racing Setup
+### Simple Shift Light (1 LED)
 ```
-Threshold 1: 2500 RPM, Green, 2 LEDs
-Threshold 2: 3500 RPM, Yellow, 4 LEDs
-Threshold 3: 4500 RPM, Red, 6 LEDs
-Blink: 5500 RPM
-Total LEDs: 8
-```
-
-### Aggressive Racing Setup
-```
-Threshold 1: 4000 RPM, Green, 2 LEDs
-Threshold 2: 5000 RPM, Yellow, 4 LEDs
-Threshold 3: 6000 RPM, Red, 8 LEDs
-Blink: 7000 RPM
-Total LEDs: 8
+Threshold 1: Off - 0 RPM, LED 0-0, Black, No blink
+Threshold 2: Green - 5000 RPM, LED 0-0, Green, No blink  
+Threshold 3: Yellow - 6000 RPM, LED 0-0, Yellow, No blink
+Threshold 4: Red - 6500 RPM, LED 0-0, Red, No blink
+Threshold 5: Shift - 7000 RPM, LED 0-0, Blue, Blink 200ms
 ```
 
-### Street Driving Setup
+### Progressive Bar (8 LEDs)
 ```
-Threshold 1: 2000 RPM, Blue, 2 LEDs
-Threshold 2: 3000 RPM, Green, 4 LEDs
-Threshold 3: 4000 RPM, Yellow, 6 LEDs
-Blink: 5000 RPM
-Total LEDs: 8
+Threshold 1: Off - 0 RPM, LED 0-7, Black, No blink
+Threshold 2: Low - 3000 RPM, LED 0-1, Green, No blink
+Threshold 3: Mid - 4000 RPM, LED 0-3, Green, No blink
+Threshold 4: High - 5000 RPM, LED 0-5, Yellow, No blink
+Threshold 5: Max - 6000 RPM, LED 0-7, Red, No blink
+Threshold 6: Shift - 6500 RPM, LED 0-7, Red, Blink 150ms
 ```
 
-### Progressive Bar Effect
+### Center-Out Pattern (8 LEDs)
 ```
-Threshold 1: 2000 RPM, Green, 2 LEDs
-Threshold 2: 3000 RPM, Green, 4 LEDs
-Threshold 3: 4000 RPM, Yellow, 6 LEDs
-Threshold 4: 5000 RPM, Yellow, 8 LEDs
-Threshold 5: 6000 RPM, Red, 10 LEDs
-Blink: 7000 RPM
-Total LEDs: 12
+Threshold 1: Off - 0 RPM, LED 0-7, Black, No blink
+Threshold 2: Start - 3000 RPM, LED 3-4, Green, No blink
+Threshold 3: Expand - 4000 RPM, LED 2-5, Yellow, No blink
+Threshold 4: Full - 5000 RPM, LED 1-6, Orange, No blink
+Threshold 5: Max - 6000 RPM, LED 0-7, Red, No blink
+Threshold 6: Shift - 6500 RPM, LED 0-7, White, Blink 100ms
 ```
 
 ## Tips and Best Practices
 
-### Threshold Spacing
-- Space thresholds evenly for smooth transitions
-- Typical spacing: 500-1000 RPM apart
-- Adjust based on your engine's power band
+### Threshold Design
+- Start with an "Off" threshold at 0 RPM to clear LEDs at idle
+- Space thresholds evenly across your usable RPM range
+- Set blink threshold 500-1000 RPM before redline
+- Use distinct colors for quick recognition
+
+### LED Range Configuration
+- `start_led` and `end_led` are 0-indexed
+- For a single LED, use the same value for both
+- Ranges are inclusive: 0-2 lights LEDs 0, 1, and 2
+- Ensure `total_leds` matches your actual strip length
 
 ### Color Choices
-- Use green for safe/optimal RPM range
-- Yellow for approaching shift point
-- Red for shift now
-- Keep colors distinct and easy to see
+- Green: Safe/optimal RPM range
+- Yellow/Orange: Approaching shift point
+- Red: Shift now
+- Blue/White: Over-rev warning (blinking)
 
-### LED Count Progression
-- Increase LED count with each threshold
-- Makes it easy to see RPM at a glance
-- Avoid large gaps in LED count between thresholds
-
-### Blink Setting
-- Set 500-1000 RPM above your highest threshold
-- Indicates over-rev or urgent shift needed
-- Very visible even in peripheral vision
-
-### Testing
-1. Start with conservative values
-2. Test in a safe environment
-3. Adjust based on your preferences and vehicle
-4. Save when you find a configuration you like
+### Blink Settings
+- 100-200ms: Very fast, urgent
+- 250-500ms: Moderate, noticeable
+- 500-1000ms: Slow, subtle
 
 ## Troubleshooting
 
+### Can't Access Web UI
+- **AP Mode**: Connect to TachTalk-XXXX, go to 192.168.71.1
+- **Client Mode**: Check device IP in serial output, or try tachtalk.local
+- Ensure you're on the correct network
+- Clear browser cache or try incognito mode
+
 ### Changes Not Saving
-- Check browser console for errors (F12)
-- Verify network connection to ESP32
-- Try reloading the page
-- Check serial monitor for server errors
+- Check the status message after clicking Save
+- Look for error messages in the browser console (F12)
+- Verify NVS storage is working (check serial output)
 
-### Colors Look Wrong
-- Verify LED strip is WS2812B compatible
-- Check power supply voltage (should be 5V)
-- Adjust brightness if colors seem dim
+### Real-time Updates Not Working
+- SSE connection may have dropped; refresh the page
+- Check browser console for connection errors
+- Ensure you're not behind a proxy that blocks SSE
 
-### LEDs Not Responding to Configuration
-- Ensure configuration was saved successfully
-- Check that RPM data is being received
-- Verify LED strip is properly connected to GPIO48
-- Review serial monitor for error messages
+### LEDs Not Responding
+- Verify GPIO pin setting matches your wiring
+- Check total_leds matches your strip
+- Verify power supply is adequate
+- Check serial output for LED controller errors
 
-## Advanced Usage
+## API Endpoints
 
-### Multiple Configurations
-Currently, only one configuration can be stored. To switch between setups:
-1. Note down your current configuration
-2. Update with new values
-3. Save
-4. To switch back, manually re-enter previous values
+For programmatic access:
 
-### Integration with RaceChroнo
-1. Configure TachTalk as desired
-2. Set RaceChroнo OBD2 connection to ESP32 IP:35000
-3. LEDs will respond to real-time RPM data
-4. Thresholds can be adjusted during breaks without reconnecting
-
-### Using Without RaceChroнo
-- TachTalk will automatically poll for RPM at 10Hz
-- Connect Vgate dongle to your vehicle's OBD2 port
-- Power on ESP32-S3
-- LEDs will display RPM without any app connection required
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/` | GET | Web UI HTML |
+| `/api/config` | GET | Current configuration (JSON) |
+| `/api/config` | POST | Update configuration |
+| `/api/mode` | GET | Current WiFi mode (ap/client) |
+| `/api/wifi/scan` | GET | Scan for WiFi networks |
+| `/api/wifi` | POST | Connect to WiFi network |
+| `/api/reboot` | POST | Reboot the device |
+| `/api/benchmark` | GET | Run OBD2 benchmark |
+| `/events` | GET | SSE stream for real-time updates |

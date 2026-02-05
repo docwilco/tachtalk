@@ -1,6 +1,6 @@
 # TachTalk
 
-Firmware for proxying OBD2 requests between RaceChroно and a Vgate iCar 2 Wi-Fi OBD2 dongle, extracting RPM data to display on WS2812B LED shift lights.
+Firmware for proxying OBD2 requests between RaceChroно and a Wi-Fi OBD2 dongle (e.g., Vgate iCar 2), extracting RPM data to display on WS2812B LED shift lights.
 
 ## 🚀 Quick Start
 
@@ -10,23 +10,25 @@ Get up and running in 15 minutes with step-by-step instructions!
 
 ## Features
 
-- **OBD2 Proxy**: Proxies requests between RaceChroнo app and Vgate iCar 2 Wi-Fi dongle
+- **OBD2 Proxy**: Proxies requests between RaceChroнo app and Wi-Fi OBD2 dongle
 - **RPM Extraction**: Extracts RPM data from OBD2 requests/responses
 - **Shift Lights**: Controls WS2812B LED strip based on configurable RPM thresholds
-- **10Hz Polling**: Automatically polls for RPM at 10Hz when no active requests
-- **Web UI**: Configure RPM thresholds, colors, LED counts, and blink threshold
+- **Automatic Polling**: Polls for RPM when no active requests
+- **Web UI**: Full configuration interface with real-time status
+- **Access Point Mode**: Creates WiFi hotspot for initial setup
+- **mDNS Discovery**: Access via `http://tachtalk.local` when in client mode
+- **NVS Storage**: Configuration persists across reboots
 - **ESP32-S3**: Optimized for ESP32-S3 hardware
 
 ## Hardware Requirements
 
 - ESP32-S3 development board
 - WS2812B LED strip
-- Vgate iCar 2 Wi-Fi OBD2 dongle
-- WiFi network
+- Wi-Fi OBD2 dongle (e.g., Vgate iCar 2)
 
 ## Pin Configuration
 
-- GPIO48: WS2812B LED data line (configurable in `src/main.rs`)
+- GPIO48: WS2812B LED data line (configurable via Web UI)
 
 ## Setup
 
@@ -41,67 +43,67 @@ Get up and running in 15 minutes with step-by-step instructions!
    ```
 3. Install additional tools:
    ```bash
-   cargo install ldproxy
-   cargo install espflash
+   cargo install ldproxy espflash
    ```
 
-### Build Configuration
-
-1. Copy the environment file and configure WiFi:
-   ```bash
-   cp .env.example .env
-   # Edit .env with your WiFi credentials
-   ```
-
-2. Set environment variables:
-   ```bash
-   export WIFI_SSID="your_ssid"
-   export WIFI_PASSWORD="your_password"
-   ```
-
-### Building
+### Building and Flashing
 
 ```bash
-cargo build --release
-```
-
-### Flashing
-
-```bash
+cd tachtalk-firmware
 cargo run --release
 ```
 
 Or manually:
 ```bash
+cargo build --release
 espflash flash target/xtensa-esp32s3-espidf/release/tachtalk
 ```
 
+## First Boot Setup
+
+1. **Power on** the ESP32-S3 with TachTalk firmware
+2. **Connect to the WiFi hotspot** `TachTalk-XXXX` (where XXXX is derived from the device MAC address)
+3. **Open a browser** to `http://192.168.71.1` (captive portal should redirect automatically)
+4. **Configure WiFi** credentials for your OBD2 dongle's network (default: "V-LINK")
+5. **Save & Connect** — the device will reboot and connect to the configured network
+6. **Access the Web UI** at the device's new IP address or `http://tachtalk.local`
+
 ## Usage
 
-1. Power on the ESP32-S3 with TachTalk firmware
-2. The device will connect to your configured WiFi network
-3. Access the web UI at `http://<device-ip>` (check serial output for IP address)
-4. Configure your RPM thresholds, colors, and LED settings
-5. Point RaceChroнo to connect to the ESP32-S3 IP on port 35000
-6. The Vgate iCar 2 dongle should be at 192.168.0.10:35000 (default)
+### Standalone Mode (without RaceChroно)
+1. Plug the OBD2 dongle into your vehicle's OBD2 port
+2. Power on the ESP32-S3
+3. The device connects to the dongle's WiFi network
+4. LEDs display RPM automatically via polling
 
-## Configuration
+### Proxy Mode (with RaceChroнo)
+1. Configure RaceChroнo to connect to the ESP32-S3 IP on port 35000
+2. The device proxies OBD2 requests and extracts RPM for the shift lights
+3. Both RaceChroнo and shift lights work simultaneously
 
-The web UI allows you to configure:
+## Web UI Configuration
 
-- **RPM Thresholds**: Multiple thresholds with different colors
-- **Colors**: RGB color for each threshold
-- **Number of LEDs**: How many LEDs to light up at each threshold
-- **Blink RPM**: RPM at which all LEDs start blinking
-- **Total LEDs**: Total number of LEDs in the strip
+Access the configuration interface at `http://tachtalk.local` or the device IP. The Web UI allows you to configure:
 
-## Default Configuration
+- **RPM Thresholds**: Multiple thresholds with name, RPM value, LED range, color, and blink settings
+- **Brightness**: Global LED brightness control (0-255)
+- **WiFi Settings**: SSID, password, DHCP or static IP configuration
+- **Access Point Settings**: Custom AP SSID and password
+- **OBD2 Settings**: Dongle IP, port, listen port, timeout
+- **System Settings**: Log level, total LEDs, LED GPIO pin
+- **Connection Status**: Real-time view of OBD2 dongle and client connections
 
-- Threshold 1: 3000 RPM, Green (0,255,0), 2 LEDs
-- Threshold 2: 4000 RPM, Yellow (255,255,0), 4 LEDs
-- Threshold 3: 5000 RPM, Red (255,0,0), 6 LEDs
-- Blink: 6000 RPM
-- Total LEDs: 8
+## Default Thresholds
+
+| Name   | RPM   | Color  | Blink |
+|--------|-------|--------|-------|
+| Off    | 0     | Black  | No    |
+| Blue   | 1000  | Blue   | No    |
+| Green  | 1500  | Green  | No    |
+| Yellow | 2000  | Yellow | No    |
+| Red    | 2500  | Red    | No    |
+| Off    | 3000  | Black  | No    |
+| Shift  | 3000  | Blue   | Yes   |
 
 ## Documentation
 

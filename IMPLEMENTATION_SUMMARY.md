@@ -2,66 +2,77 @@
 
 ## ✅ Completed Implementation
 
-The TachTalk firmware has been fully implemented according to the problem statement requirements.
+The TachTalk firmware has been fully implemented with comprehensive features beyond the original requirements.
 
 ### Project Statistics
 
-- **Total Lines of Code**: 804 lines (Rust)
-- **Modules**: 5 (main, config, leds, obd2, web_server)
-- **Documentation**: 5 comprehensive guides (15,000+ words)
-- **Security**: 0 vulnerabilities detected
-- **Build System**: Complete ESP32-S3 configuration
+- **Total Lines of Code**: ~2,900 lines (Rust, firmware only)
+- **Source Files**: 10 modules in firmware
+- **Library Crates**: 2 (`tachtalk-elm327-lib`, `tachtalk-shift-lights-lib`)
+- **Additional Tools**: `tachtalk-mock-elm327-server`, `tachtalk-benchmark-client`
+- **Documentation**: 5 comprehensive guides
+- **Build System**: Complete ESP32-S3 configuration with NVS persistence
 
 ### Core Features Implemented
 
 #### 1. OBD2 Proxy ✅
-- **File**: `src/obd2.rs` (214 lines)
-- Listens on port 35000 for RaceChroнo connections
-- Forwards requests to Vgate iCar 2 dongle at 192.168.0.10:35000
+- **File**: `src/obd2.rs` (~800 lines)
+- Listens on configurable port (default 35000) for client connections
+- Connects to OBD2 dongle at configurable IP/port
 - Extracts RPM from OBD2 responses (PID 0x0C)
-- Handles both request and response RPM extraction
-- Multi-threaded for concurrent connections
+- ELM327 AT command emulation for compatibility
+- Multi-client support with connection tracking
 
-#### 2. 10Hz RPM Polling ✅
-- **Implementation**: Background poller thread
-- Automatically requests RPM when idle (>100ms since last request)
-- Uses OBD2 command "010C\r" for RPM request
+#### 2. Automatic RPM Polling ✅
+- **Implementation**: Background polling when idle
+- Requests RPM when no active client requests
 - Ensures shift lights always display current RPM
 - Non-blocking operation
 
 #### 3. WS2812B LED Control ✅
-- **File**: `src/leds.rs` (119 lines)
+- **File**: `src/leds.rs` (~75 lines)
 - Uses ESP32 RMT peripheral for precise timing
-- Supports WS2812B protocol (GRB color order)
 - Configurable GPIO pin (default: GPIO48)
-- Smooth threshold-based display
-- 4Hz blink rate for high RPM warning
+- Brightness control (0-255)
+- Per-threshold blink support with configurable rate
 
 #### 4. Configuration System ✅
-- **File**: `src/config.rs` (75 lines)
-- Multiple RPM thresholds support
-- RGB color per threshold
-- LEDs per threshold
-- Blink RPM threshold
-- Total LED count configuration
-- Serializable JSON format
+- **File**: `src/config.rs` (~330 lines)
+- NVS-backed persistent storage
+- WiFi, IP, OBD2, LED, and threshold settings
+- JSON serialization for Web UI
+- Validation and defaults
 
 #### 5. Web Configuration UI ✅
-- **File**: `src/web_server.rs` (297 lines)
+- **File**: `src/web_server.rs` (~530 lines)
 - Modern, responsive HTML interface
 - Dark theme optimized for automotive use
-- Real-time configuration updates
-- RESTful API (GET/POST /api/config)
-- Add/remove thresholds dynamically
-- Color picker for easy color selection
-- Status notifications
+- Real-time status via Server-Sent Events
+- RESTful API for configuration management
+- WiFi scanning and configuration
+- Connection status visualization
 
-#### 6. ESP32-S3 Platform ✅
-- **Files**: Build configuration, toolchain setup
+#### 6. Access Point Mode ✅
+- **File**: `src/main.rs` (~630 lines)
+- Creates `TachTalk-XXXX` hotspot for initial setup
+- Captive portal DNS server (`src/dns.rs`, ~180 lines)
+- Automatic redirect to configuration page
+
+#### 7. mDNS Discovery ✅
+- Advertises as `tachtalk.local` in client mode
+- Easy access without knowing IP address
+
+#### 8. Server-Sent Events ✅
+- **File**: `src/sse_server.rs` (~180 lines)
+- Real-time RPM updates to Web UI
+- Connection status streaming
+- Debug information (heap, AT commands, PIDs)
+
+#### 9. ESP32-S3 Platform ✅
 - esp-idf framework integration
 - Rust nightly toolchain for Xtensa target
-- WiFi connectivity
-- Multi-threading support
+- WiFi AP and STA modes
+- Multi-threading with watchdog support
 - Proper peripheral initialization
 
 ### Technical Architecture
@@ -69,52 +80,38 @@ The TachTalk firmware has been fully implemented according to the problem statem
 #### Module Breakdown
 
 ```
-main.rs (99 lines)
-├─ WiFi initialization & connection
-├─ Peripheral setup (GPIO, RMT)
-├─ Thread spawning
-└─ Main loop
+tachtalk-firmware/src/
+├── main.rs       (~630 lines) - Entry point, WiFi, task management
+├── obd2.rs       (~800 lines) - OBD2 proxy, ELM327 emulation
+├── web_server.rs (~530 lines) - HTTP server, REST API, HTML UI
+├── config.rs     (~330 lines) - Configuration, NVS storage
+├── sse_server.rs (~180 lines) - Server-Sent Events
+├── dns.rs        (~180 lines) - Captive portal DNS
+├── cpu_stats.rs  (~120 lines) - CPU monitoring
+├── leds.rs       (~75 lines)  - WS2812B LED control
+├── watchdog.rs   (~65 lines)  - Task watchdog
+├── thread_util.rs(~45 lines)  - Thread utilities
+└── index.html   (~1600 lines) - Web UI (compiled into binary)
 
-config.rs (75 lines)
-├─ Configuration structures
-├─ Default values
-├─ Serialization support
-└─ Future NVS storage hooks
+tachtalk-elm327-lib/
+└── lib.rs        - ELM327 command parsing
 
-leds.rs (119 lines)
-├─ LED controller
-├─ RMT driver integration
-├─ Threshold logic
-├─ Blink implementation
-└─ WS2812B protocol
-
-obd2.rs (214 lines)
-├─ Proxy server
-├─ Client handler
-├─ RPM extraction
-├─ Background poller
-└─ OBD2 protocol parsing
-
-web_server.rs (297 lines)
-├─ HTTP server
-├─ HTML interface
-├─ RESTful API
-├─ JavaScript frontend
-└─ Configuration management
+tachtalk-shift-lights-lib/
+└── lib.rs        - Threshold types and LED logic
 ```
 
-#### Dependencies
+#### Key Dependencies
 
 ```toml
-esp-idf-svc = "0.49"     # ESP-IDF service wrappers
-esp-idf-hal = "0.44"     # Hardware abstraction
-esp-idf-sys = "0.35"     # Low-level bindings
-embedded-svc = "0.28"    # Embedded services
-anyhow = "1.0"           # Error handling
-serde = "1.0"            # Serialization
-serde_json = "1.0"       # JSON support
-smart-leds = "0.4"       # LED abstractions
-ws2812-esp32-rmt-driver = "0.9"  # WS2812B driver
+esp-idf-svc = "0.51.0"     # ESP-IDF service wrappers
+esp-idf-hal = "0.45.2"     # Hardware abstraction
+esp-idf-sys = "0.36.1"     # Low-level bindings
+embedded-svc = "0.28.1"    # Embedded services
+anyhow = "1.0"             # Error handling
+serde = "1.0"              # Serialization
+serde_json = "1.0"         # JSON support
+smart-leds = "0.4"         # LED abstractions
+ws2812-esp32-rmt-driver = "0.13.1"  # WS2812B driver
 ```
 
 ### Documentation Delivered
@@ -125,46 +122,44 @@ ws2812-esp32-rmt-driver = "0.9"  # WS2812B driver
 4. **WIRING_GUIDE.md** - Hardware connections and safety
 5. **WEBUI_GUIDE.md** - Configuration interface manual
 
-### Configuration Examples
+### Configuration Structure
 
-#### Default Configuration
 ```json
 {
+  "wifi": { "ssid": "V-LINK", "password": null },
+  "ip": { "use_dhcp": true, "ip": null, "gateway": null, "subnet": null, "dns": null },
+  "obd2": { "dongle_ip": "192.168.0.10", "dongle_port": 35000, "listen_port": 35000 },
+  "ap_ssid": null,
+  "ap_password": null,
+  "log_level": "info",
   "thresholds": [
-    {"rpm": 3000, "color": {"r": 0, "g": 255, "b": 0}, "num_leds": 2},
-    {"rpm": 4000, "color": {"r": 255, "g": 255, "b": 0}, "num_leds": 4},
-    {"rpm": 5000, "color": {"r": 255, "g": 0, "b": 0}, "num_leds": 6}
+    { "name": "Off", "rpm": 0, "start_led": 0, "end_led": 0, "color": {"r":0,"g":0,"b":0}, "blink": false, "blink_ms": 500 },
+    { "name": "Blue", "rpm": 1000, "start_led": 0, "end_led": 0, "color": {"r":0,"g":0,"b":255}, "blink": false, "blink_ms": 500 },
+    { "name": "Green", "rpm": 1500, "start_led": 0, "end_led": 0, "color": {"r":0,"g":255,"b":0}, "blink": false, "blink_ms": 500 },
+    { "name": "Yellow", "rpm": 2000, "start_led": 0, "end_led": 0, "color": {"r":255,"g":255,"b":0}, "blink": false, "blink_ms": 500 },
+    { "name": "Red", "rpm": 2500, "start_led": 0, "end_led": 0, "color": {"r":255,"g":0,"b":0}, "blink": false, "blink_ms": 500 },
+    { "name": "Off", "rpm": 3000, "start_led": 0, "end_led": 0, "color": {"r":0,"g":0,"b":0}, "blink": false, "blink_ms": 500 },
+    { "name": "Shift", "rpm": 3000, "start_led": 0, "end_led": 0, "color": {"r":0,"g":0,"b":255}, "blink": true, "blink_ms": 500 }
   ],
-  "blink_rpm": 6000,
-  "total_leds": 8
+  "total_leds": 1,
+  "led_gpio": 48,
+  "obd2_timeout_ms": 4500,
+  "brightness": 255
 }
 ```
 
 ### Web UI Features
 
-The web configuration interface includes:
-
-- **Threshold Management**
-  - Add/remove thresholds dynamically
-  - RPM value input
-  - Color picker for RGB selection
-  - LED count per threshold
-
-- **Visual Design**
-  - Dark theme for night visibility
-  - Green accent colors
-  - Responsive layout
-  - Touch-friendly controls
-
-- **Status Feedback**
-  - Success/error notifications
-  - Real-time configuration updates
-  - Reload capability
-
-- **API Endpoints**
-  - `GET /` - Serve web interface
-  - `GET /api/config` - Retrieve configuration
-  - `POST /api/config` - Update configuration
+- **Connection Status Diagram**: Visual representation of OBD2 dongle and client connections
+- **Real-time RPM Display**: Current RPM via SSE
+- **Brightness Slider**: Live brightness adjustment
+- **Threshold Management**: Add/remove/reorder thresholds with name, RPM, LED range, color, blink
+- **WiFi Configuration**: SSID, password, DHCP/static IP, network scanning
+- **AP Configuration**: Custom SSID and password for setup mode
+- **OBD2 Configuration**: Dongle IP/port, listen port, timeout
+- **System Settings**: Log level, total LEDs, LED GPIO pin, reboot button
+- **Debug Section**: Heap stats, AT command log, PID log, benchmark tool
+- **Raw Config Editor**: Direct JSON editing for advanced users
 
 ### Data Flow
 
@@ -173,10 +168,10 @@ The web configuration interface includes:
 │ RaceChroнo   │
 │     App      │
 └──────┬───────┘
-       │ OBD2 Request
+       │ OBD2 Request (port 35000)
        ▼
 ┌──────────────┐
-│   ESP32-S3   │◄────── Web UI (Config)
+│   ESP32-S3   │◄────── Web UI (HTTP/SSE)
 │   TachTalk   │
 └──┬────────┬──┘
    │        │
@@ -190,29 +185,21 @@ The web configuration interface includes:
    │ Forward Request
    ▼
 ┌──────────────┐
-│ Vgate iCar 2 │
-│   Dongle     │
+│  Wi-Fi OBD2  │
+│    Dongle    │
 └──────────────┘
 ```
 
 ### Key Implementation Decisions
 
-1. **Multi-threading**: Separate threads for proxy, web server, and polling
-2. **Arc<Mutex<T>>**: Shared state between threads
-3. **RMT Peripheral**: Hardware timing for WS2812B
-4. **Embedded Web UI**: HTML served from firmware (no external files)
-5. **JSON API**: RESTful interface for configuration
-6. **Background Polling**: Ensures LEDs always show current RPM
-
-### Testing Considerations
-
-While hardware testing is required, the implementation includes:
-
-- Proper error handling throughout
-- Logging at all critical points
-- Safe unwrapping with context
-- Mutex-protected shared state
-- Non-blocking operations
+1. **Access Point for Setup**: No environment variables needed; configure via captive portal
+2. **NVS Persistence**: Configuration survives reboots
+3. **Multi-threading**: Separate tasks for proxy, web server, SSE, LED control
+4. **Arc<Mutex<T>>**: Shared state between threads
+5. **RMT Peripheral**: Hardware timing for WS2812B
+6. **Embedded Web UI**: HTML compiled into firmware (no external files)
+7. **Server-Sent Events**: Efficient real-time updates without polling
+8. **Captive Portal DNS**: Seamless redirect in AP mode
 
 ### Build Requirements
 
@@ -222,86 +209,35 @@ To build this project, you need:
 2. ESP-IDF tools (espup)
 3. Xtensa target support
 4. ldproxy and espflash tools
-5. Environment variables: WIFI_SSID, WIFI_PASSWORD
 
 ### Hardware Requirements
 
 - ESP32-S3 development board
-- WS2812B LED strip (8+ LEDs recommended)
-- 5V power supply (2A+ for LEDs)
-- Vgate iCar 2 Wi-Fi OBD2 dongle
-- WiFi network (2.4GHz)
+- WS2812B LED strip
+- 5V power supply for LEDs
+- Wi-Fi OBD2 dongle (e.g., Vgate iCar 2)
 
 ### Future Enhancement Opportunities
 
-While not in the current scope, potential additions:
-
-- [ ] NVS storage for persistent configuration
-- [x] mDNS/Bonjour for easy device discovery (tachtalk.local in client mode)
-- [ ] Bluetooth configuration option
-- [ ] Multiple LED zones/patterns
+- [ ] Multi-zone LED patterns
 - [ ] Additional OBD2 parameters (coolant temp, speed, etc.)
 - [ ] Data logging capability
-- [ ] Mobile app integration
 - [ ] Over-the-air (OTA) updates
-
-### Security Analysis
-
-✅ **CodeQL Analysis**: 0 vulnerabilities found
-
-The implementation:
-- Uses safe Rust practices
-- No unsafe blocks in business logic
-- Proper input validation
-- No known CVEs in dependencies
-- Network security via WiFi
-
-### Success Criteria Met
-
-✅ All requirements from problem statement implemented:
-
-1. ✅ Firmware in Rust using esp-idf-template
-2. ✅ ESP32-S3 hardware target
-3. ✅ Proxy between RaceChroнo and Vgate iCar 2
-4. ✅ RPM data extraction
-5. ✅ WS2812B LED control
-6. ✅ Web UI for configuration
-7. ✅ Configurable RPM thresholds
-8. ✅ Configurable colors
-9. ✅ Configurable number of LEDs per threshold
-10. ✅ Blink threshold configuration
-11. ✅ 10Hz RPM polling when idle
+- [ ] Bluetooth configuration option
+- [x] NVS storage for persistent configuration
+- [x] mDNS/Bonjour for easy device discovery
+- [x] Access Point mode for initial setup
+- [x] Captive portal for seamless configuration
+- [x] Server-Sent Events for real-time Web UI
 
 ## Summary
 
-The TachTalk firmware is a complete, production-ready implementation of an OBD2 proxy with shift light functionality. It successfully combines:
+TachTalk is a production-ready OBD2 proxy with shift light functionality. Key highlights:
 
-- Network proxying
-- Real-time data extraction
-- Hardware control (LEDs)
-- Web-based configuration
-- Automatic polling
+- **Zero-config first boot**: AP mode with captive portal
+- **Persistent settings**: NVS storage
+- **Real-time Web UI**: SSE-powered status updates
+- **Flexible thresholds**: Named thresholds with LED ranges and per-threshold blink
+- **Network flexibility**: DHCP or static IP, configurable dongle address
 
-All code is well-structured, documented, and follows Rust best practices. The system is ready for hardware testing and deployment.
-
-### File Manifest
-
-- `.cargo/config.toml` - Cargo build configuration
-- `.env.example` - Environment variable template
-- `.gitignore` - Git ignore rules
-- `Cargo.toml` - Project dependencies
-- `build.rs` - Build script
-- `rust-toolchain.toml` - Rust toolchain specification
-- `sdkconfig.defaults` - ESP-IDF configuration
-- `src/main.rs` - Main entry point
-- `src/config.rs` - Configuration structures
-- `src/leds.rs` - LED controller
-- `src/obd2.rs` - OBD2 proxy implementation
-- `src/web_server.rs` - Web server and UI
-- `README.md` - Project documentation
-- `QUICKSTART.md` - Quick start guide
-- `ARCHITECTURE.md` - Architecture documentation
-- `WIRING_GUIDE.md` - Hardware wiring guide
-- `WEBUI_GUIDE.md` - Web UI usage guide
-
-**Total**: 18 files committed to repository
+All code follows Rust best practices with proper error handling and is ready for deployment.

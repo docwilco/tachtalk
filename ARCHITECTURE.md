@@ -4,8 +4,8 @@
 
 ```
 ┌─────────────┐         ┌──────────────┐         ┌─────────────┐
-│ RaceChroно  │ <-----> │  ESP32-S3    │ <-----> │  Vgate iCar │
-│     App     │  WiFi   │  TachTalk    │  WiFi   │  2 Dongle   │
+│ RaceChroно  │ <-----> │  ESP32-S3    │ <-----> │  Wi-Fi OBD2 │
+│     App     │  WiFi   │  TachTalk    │  WiFi   │   Dongle    │
 └─────────────┘         └──────────────┘         └─────────────┘
                                │
                                │
@@ -16,74 +16,130 @@
                         └──────────────┘
 ```
 
+## Operating Modes
+
+### Access Point Mode (Setup)
+On first boot or when no WiFi is configured, TachTalk creates a WiFi hotspot:
+- SSID: `TachTalk-XXXX` (XXXX derived from MAC address, customizable)
+- IP: `192.168.71.1`
+- Captive portal redirects to configuration page
+- Configure dongle WiFi credentials via Web UI
+
+### Client Mode (Normal Operation)
+After WiFi is configured, TachTalk connects to the dongle's network:
+- Connects to configured SSID (default: "V-LINK")
+- DHCP or static IP as configured
+- mDNS advertises as `tachtalk.local`
+- Proxies OBD2 traffic and controls LEDs
+
 ## Component Details
+
+### Source Files
+
+| File | Lines | Description |
+|------|-------|-------------|
+| `main.rs` | ~630 | Entry point, WiFi management, task spawning |
+| `obd2.rs` | ~800 | OBD2 proxy, ELM327 emulation, RPM extraction |
+| `web_server.rs` | ~530 | HTTP server, REST API, configuration endpoints |
+| `config.rs` | ~330 | Configuration structures, NVS persistence |
+| `sse_server.rs` | ~180 | Server-Sent Events for real-time Web UI updates |
+| `dns.rs` | ~180 | Captive portal DNS server for AP mode |
+| `cpu_stats.rs` | ~120 | CPU usage monitoring |
+| `leds.rs` | ~75 | WS2812B LED control via RMT peripheral |
+| `watchdog.rs` | ~65 | Task watchdog management |
+| `thread_util.rs` | ~45 | Thread spawning utilities |
+
+### Library Crates
+
+| Crate | Description |
+|-------|-------------|
+| `tachtalk-elm327-lib` | ELM327 command parsing and response generation |
+| `tachtalk-shift-lights-lib` | Threshold configuration types and LED logic |
 
 ### Main Components
 
-1. **OBD2 Proxy** (`src/obd2.rs`)
-   - Listens on port 35000 for connections from RaceChroнo
-   - Forwards requests to Vgate iCar 2 dongle at 192.168.0.10:35000
-   - Extracts RPM data from OBD2 responses
-   - Polls for RPM at 10Hz when idle
+1. **WiFi Connection Manager** (`src/main.rs`)
+   - Manages AP and STA modes
+   - Handles reconnection logic
+   - Static IP or DHCP configuration
 
-2. **LED Controller** (`src/leds.rs`)
+2. **OBD2 Proxy** (`src/obd2.rs`)
+   - Listens on configurable port (default: 35000) for client connections
+   - Connects to OBD2 dongle (default: 192.168.0.10:35000)
+   - Extracts RPM data from OBD2 responses
+   - Polls for RPM when idle
+   - ELM327 AT command emulation
+
+3. **LED Controller** (`src/leds.rs`)
    - Controls WS2812B LED strip via RMT peripheral
    - Updates LEDs based on current RPM and thresholds
-   - Handles blinking at high RPM
-   - Default pin: GPIO48
+   - Supports per-threshold blink with configurable rate
+   - Configurable GPIO pin (default: GPIO48)
+   - Brightness control (0-255)
 
-3. **Web Server** (`src/web_server.rs`)
+4. **Web Server** (`src/web_server.rs`)
    - Serves configuration UI on port 80
    - RESTful API for configuration management
-   - GET/POST endpoints for config updates
+   - Real-time status via SSE
+   - WiFi scanning endpoint
 
-4. **Configuration** (`src/config.rs`)
-   - Manages RPM thresholds, colors, and LED counts
-   - Serializable configuration structure
-   - Default values for initial setup
+5. **SSE Server** (`src/sse_server.rs`)
+   - Server-Sent Events on configurable port
+   - Streams RPM, connection status, debug info
+   - Powers real-time Web UI updates
+
+6. **DNS Server** (`src/dns.rs`)
+   - Active only in AP mode
+   - Captive portal: responds to all queries with device IP
+   - Enables automatic redirect to configuration page
+
+7. **Configuration** (`src/config.rs`)
+   - NVS-backed persistent storage
+   - WiFi, IP, OBD2, LED, threshold settings
+   - JSON serialization for Web UI
 
 ## Data Flow
 
 ### Request Proxying
-1. RaceChroнo sends OBD2 request → ESP32
-2. ESP32 forwards request → Vgate iCar 2
-3. Vgate responds with OBD2 data → ESP32
+1. RaceChroнo sends OBD2 request → ESP32 (port 35000)
+2. ESP32 forwards request → OBD2 dongle
+3. Dongle responds with OBD2 data → ESP32
 4. ESP32 extracts RPM from response
 5. ESP32 updates LED strip based on RPM
 6. ESP32 forwards response → RaceChroнo
 
 ### Idle Polling
-1. When no requests received for >100ms:
-2. ESP32 sends "010C\r" (RPM request) → Vgate
-3. Vgate responds with RPM data
+1. When no requests received for a timeout period:
+2. ESP32 sends RPM request → OBD2 dongle
+3. Dongle responds with RPM data
 4. ESP32 updates LED strip
-5. Repeat at 10Hz (every 100ms)
 
-## LED Display Logic
+## Threshold Configuration
 
-```
-RPM Range        │ LEDs Lit │ Color
-─────────────────┼──────────┼────────
-0 - 2999         │ None     │ Off
-3000 - 3999      │ 2        │ Green
-4000 - 4999      │ 4        │ Yellow
-5000 - 5999      │ 6        │ Red
-6000+            │ All      │ Blinking
-```
+Each threshold defines:
+- **Name**: Human-readable label
+- **RPM**: Minimum RPM to activate
+- **Start LED / End LED**: LED range to light (0-indexed)
+- **Color**: RGB color
+- **Blink**: Whether to blink at this threshold
+- **Blink ms**: Blink interval in milliseconds
 
-## Configuration Options
+The highest matching threshold (by RPM) is active. Thresholds are evaluated in order, so the last matching threshold wins.
 
-### Thresholds
-- RPM value
-- RGB color (0-255 per channel)
-- Number of LEDs to light up
+## Network Configuration
 
-### Blink Configuration
-- Blink RPM threshold
-- Blink rate: 250ms on/off (4Hz)
+### Default Settings
+- **Dongle SSID**: V-LINK
+- **Dongle IP**: 192.168.0.10
+- **Dongle Port**: 35000
+- **Listen Port**: 35000
+- **AP IP**: 192.168.71.1
+- **AP SSID**: TachTalk-XXXX (auto-generated from MAC)
 
-### Global Settings
-- Total number of LEDs in strip
+### Static IP Defaults (when not using DHCP)
+- **IP**: 192.168.0.20
+- **Gateway**: 192.168.0.1
+- **Subnet**: 255.255.255.0
 
 ## OBD2 Protocol
 
@@ -102,29 +158,23 @@ where A and B are the two hex bytes in response
 ## Hardware Setup
 
 ### Pinout
-- GPIO48: WS2812B data line (RMT Channel 0)
+- GPIO48: WS2812B data line (configurable via Web UI)
 - Power: 5V for LED strip, 3.3V for ESP32
 
 ### LED Strip Connection
 ```
-ESP32 GPIO48 ──> LED Strip Data In
+ESP32 GPIO ───> LED Strip Data In
 GND ──────────> LED Strip GND
 5V ───────────> LED Strip VCC
 ```
 
-### Network Configuration
-- ESP32: DHCP client on your WiFi network
-- Vgate: Should be at 192.168.0.10
-- RaceChroнo: Configure to connect to ESP32 IP on port 35000
-
 ## Building and Flashing
 
-See main README.md for detailed build instructions.
+See main [README.md](README.md) for detailed build instructions.
 
 ### Quick Start
 ```bash
-export WIFI_SSID="your_network"
-export WIFI_PASSWORD="your_password"
+cd tachtalk-firmware
 cargo build --release
 cargo run --release
 ```
@@ -132,25 +182,30 @@ cargo run --release
 ## Troubleshooting
 
 ### LEDs not working
-- Check GPIO pin assignment in `src/main.rs`
+- Check GPIO pin assignment in Web UI (System Settings)
 - Verify LED strip power supply
 - Check data line connection
 
 ### Can't connect to dongle
-- Verify dongle IP (should be 192.168.0.10)
-- Check WiFi connectivity
+- Verify dongle IP in Web UI (OBD2 Configuration)
+- Check WiFi connectivity (Connection Status shows SSID/IP)
 - Ensure dongle is powered on
 
 ### RaceChroнo can't connect
-- Check ESP32 IP address in serial output
-- Verify port 35000 is accessible
-- Ensure WiFi network allows device-to-device communication
+- Check ESP32 IP address in Web UI or serial output
+- Verify port 35000 is configured (OBD2 Configuration)
+- Ensure devices are on the same network
+
+### Can't access Web UI
+- In AP mode: connect to TachTalk-XXXX, go to 192.168.71.1
+- In client mode: use device IP or tachtalk.local
 
 ## Future Enhancements
 
-- [ ] NVS storage for persistent configuration
 - [ ] Multi-zone LED support
 - [ ] Alternative display modes (progress bar, etc.)
 - [ ] Support for additional OBD2 parameters
 - [ ] Bluetooth support for configuration
-- [x] mDNS/Bonjour for easy discovery (tachtalk.local in client mode)
+- [ ] Over-the-air (OTA) updates
+- [x] NVS storage for persistent configuration
+- [x] mDNS/Bonjour for easy discovery (tachtalk.local)
