@@ -545,7 +545,7 @@ mod tests {
         assert!(state.has_blinking);
         // All LEDs should be black (off)
         for i in 0..6 {
-            assert_eq!(state.leds[i], RGB8::new(0, 0, 0), "LED {} should be off", i);
+            assert_eq!(state.leds[i], RGB8::new(0, 0, 0), "LED {i} should be off");
         }
     }
 

@@ -31,6 +31,14 @@ struct WifiRequest {
     ip: Option<IpConfigRequest>,
 }
 
+/// Brightness change request from web UI
+#[derive(serde::Deserialize)]
+struct BrightnessRequest {
+    brightness: u8,
+    #[serde(default)]
+    save: bool,
+}
+
 /// WiFi network scan result
 #[derive(serde::Serialize)]
 struct Network {
@@ -233,13 +241,6 @@ pub fn start_server(state: &Arc<State>, ap_hostname: Option<String>) -> Result<(
         debug!("HTTP: POST /api/brightness");
         let mut buf = [0u8; 32];
         let bytes_read = req.read(&mut buf)?;
-        
-        #[derive(serde::Deserialize)]
-        struct BrightnessRequest {
-            brightness: u8,
-            #[serde(default)]
-            save: bool,
-        }
         
         if let Ok(brightness_req) = serde_json::from_slice::<BrightnessRequest>(&buf[..bytes_read]) {
             debug!("Brightness update: {} (save={})", brightness_req.brightness, brightness_req.save);
@@ -529,15 +530,18 @@ pub fn start_server(state: &Arc<State>, ap_hostname: Option<String>) -> Result<(
             }
         }
         
+        // Truncation is acceptable: benchmark duration is 10 seconds, well under u64::MAX milliseconds
+        #[allow(clippy::cast_possible_truncation)]
         let duration_ms = start.elapsed().as_millis() as u64;
+        // Precision loss is acceptable for human-readable benchmark statistics
+        #[allow(clippy::cast_precision_loss)]
         let queries_per_second = if duration_ms > 0 {
-            (successful_queries as f64) * 1000.0 / (duration_ms as f64)
+            f64::from(successful_queries) * 1000.0 / (duration_ms as f64)
         } else {
             0.0
         };
         
-        info!("Benchmark complete: {} successful, {} failed, {:.2} queries/sec",
-              successful_queries, failed_queries, queries_per_second);
+        info!("Benchmark complete: {successful_queries} successful, {failed_queries} failed, {queries_per_second:.2} queries/sec");
         
         let result = BenchmarkResult {
             duration_ms,
