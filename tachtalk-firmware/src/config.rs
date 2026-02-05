@@ -165,10 +165,17 @@ pub struct Config {
     pub led_gpio: u8,
     #[serde(default = "default_obd2_timeout_ms")]
     pub obd2_timeout_ms: u64,
+    /// LED brightness (0-255)
+    #[serde(default = "default_brightness")]
+    pub brightness: u8,
 }
 
 const fn default_led_gpio() -> u8 {
     48
+}
+
+const fn default_brightness() -> u8 {
+    255
 }
 
 /// Maximum OBD2 timeout to avoid triggering watchdog in dongle task
@@ -255,6 +262,7 @@ impl Default for Config {
             total_leds: 1,
             led_gpio: 48,
             obd2_timeout_ms: MAX_OBD2_TIMEOUT_MS,
+            brightness: 255,
         }
     }
 }

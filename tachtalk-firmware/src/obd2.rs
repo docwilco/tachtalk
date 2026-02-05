@@ -114,6 +114,8 @@ pub enum RpmTaskMessage {
     Rpm(u32),
     /// Config changed, recalculate render interval
     ConfigChanged,
+    /// Brightness changed (0-255), apply immediately
+    Brightness(u8),
 }
 
 /// Channel sender for messages to the LED task
@@ -515,6 +517,11 @@ pub fn rpm_led_task(
             Ok(RpmTaskMessage::ConfigChanged) => {
                 blink_interval_ms = compute_blink_interval(&state.config.lock().unwrap());
                 should_render = true; // Config changed, re-render
+            }
+            Ok(RpmTaskMessage::Brightness(brightness)) => {
+                debug!("Received brightness: {brightness}");
+                led_controller.set_brightness(brightness);
+                should_render = true; // Re-render with new brightness
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 if should_render_on_timeout {

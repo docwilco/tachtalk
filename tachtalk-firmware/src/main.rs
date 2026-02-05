@@ -234,7 +234,8 @@ fn init_led_controller<C: esp_idf_hal::rmt::RmtChannel>(
     rmt_channel: impl esp_idf_hal::peripheral::Peripheral<P = C> + 'static,
 ) -> Result<LedController> {
     let led_gpio = config.led_gpio;
-    info!("Initializing LED controller on GPIO {led_gpio}...");
+    let brightness = config.brightness;
+    info!("Initializing LED controller on GPIO {led_gpio} with brightness {brightness}...");
 
     // Reset the GPIO pin to clear any residual RMT configuration from previous boot
     // This ensures clean initialization when GPIO pin is changed via config
@@ -244,7 +245,7 @@ fn init_led_controller<C: esp_idf_hal::rmt::RmtChannel>(
 
     // SAFETY: We trust the user-configured GPIO pin number is valid for this board
     let led_pin = unsafe { AnyIOPin::new(i32::from(led_gpio)) };
-    LedController::new(led_pin, rmt_channel)
+    LedController::new(led_pin, rmt_channel, brightness)
 }
 
 /// Initialize WiFi driver and network interfaces

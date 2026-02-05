@@ -3,7 +3,7 @@ use esp_idf_hal::gpio::OutputPin;
 use esp_idf_hal::peripheral::Peripheral;
 use esp_idf_hal::rmt::RmtChannel;
 use log::debug;
-use smart_leds::{SmartLedsWrite, RGB8};
+use smart_leds::{brightness, gamma, SmartLedsWrite, RGB8};
 use tachtalk_shift_lights_lib::compute_led_state;
 use ws2812_esp32_rmt_driver::Ws2812Esp32Rmt;
 
@@ -11,19 +11,27 @@ use crate::config::Config;
 
 pub struct LedController {
     driver: Ws2812Esp32Rmt<'static>,
+    brightness: u8,
 }
 
 impl LedController {
     pub fn new<C: RmtChannel, P: OutputPin>(
         pin: impl Peripheral<P = P> + 'static,
         channel: impl Peripheral<P = C> + 'static,
+        initial_brightness: u8,
     ) -> Result<Self> {
-        debug!("Creating LED controller");
+        debug!("Creating LED controller with brightness {initial_brightness}");
         let driver = Ws2812Esp32Rmt::new(channel, pin)?;
 
         Ok(Self {
             driver,
+            brightness: initial_brightness,
         })
+    }
+
+    /// Set brightness level (0-255)
+    pub fn set_brightness(&mut self, brightness: u8) {
+        self.brightness = brightness;
     }
 
     pub fn update(&mut self, rpm: u32, config: &Config, timestamp_ms: u64) -> Result<()> {
@@ -35,7 +43,9 @@ impl LedController {
     }
 
     fn write_leds(&mut self, leds: &[RGB8]) -> Result<()> {
-        self.driver.write(leds.iter().copied())?;
+        // Apply gamma correction first, then brightness reduction
+        // as recommended by smart-leds docs
+        self.driver.write(brightness(gamma(leds.iter().copied()), self.brightness))?;
         Ok(())
     }
 

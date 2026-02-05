@@ -378,6 +378,55 @@
             border-radius: 10px;
             margin: 20px 0;
         }
+        .brightness-control {
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+            background-color: #2a2a2a;
+            padding: 15px 20px;
+            border-radius: 10px;
+            margin: 10px 0 20px 0;
+        }
+        .brightness-control .brightness-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        .brightness-control label {
+            width: auto;
+            font-weight: bold;
+        }
+        .brightness-control input[type="range"] {
+            width: 100%;
+            height: 8px;
+            -webkit-appearance: none;
+            appearance: none;
+            background: linear-gradient(to right, #333 0%, #00ff00 100%);
+            border-radius: 4px;
+            cursor: pointer;
+        }
+        .brightness-control input[type="range"]::-webkit-slider-thumb {
+            -webkit-appearance: none;
+            appearance: none;
+            width: 20px;
+            height: 20px;
+            background: #00ff00;
+            border-radius: 50%;
+            cursor: pointer;
+        }
+        .brightness-control input[type="range"]::-moz-range-thumb {
+            width: 20px;
+            height: 20px;
+            background: #00ff00;
+            border-radius: 50%;
+            cursor: pointer;
+            border: none;
+        }
+        .brightness-control button {
+            padding: 8px 15px;
+            margin: 0;
+            font-size: 0.9em;
+        }
         select {
             padding: 5px;
             border: 1px solid #444;
@@ -493,6 +542,15 @@
         
         <div class="rpm-display">
             <div>RPM: <span id="currentRpm">---</span></div>
+        </div>
+        
+        <!-- Brightness Slider -->
+        <div class="brightness-control">
+            <div class="brightness-header">
+                <label for="brightnessSlider">💡 Brightness: <span id="brightnessValue">255</span></label>
+                <button id="btnSaveBrightness" onclick="saveBrightness()">Save</button>
+            </div>
+            <input type="range" id="brightnessSlider" min="0" max="255" value="255" oninput="updateBrightness(this.value)">
         </div>
         
         <!-- Connection Diagram -->
@@ -929,6 +987,64 @@
             }
         }
 
+        // Throttle state for brightness slider
+        let lastBrightnessUpdate = 0;
+        let pendingBrightnessValue = null;
+        let brightnessThrottleTimer = null;
+
+        function updateBrightness(value) {
+            document.getElementById('brightnessValue').textContent = value;
+            
+            const now = Date.now();
+            const elapsed = now - lastBrightnessUpdate;
+            
+            if (elapsed >= 30) {
+                // Enough time has passed, send immediately
+                lastBrightnessUpdate = now;
+                sendBrightnessUpdate(value);
+            } else {
+                // Throttled: schedule update for remaining time
+                pendingBrightnessValue = value;
+                if (!brightnessThrottleTimer) {
+                    brightnessThrottleTimer = setTimeout(() => {
+                        brightnessThrottleTimer = null;
+                        lastBrightnessUpdate = Date.now();
+                        sendBrightnessUpdate(pendingBrightnessValue);
+                    }, 30 - elapsed);
+                }
+            }
+        }
+
+        function sendBrightnessUpdate(value) {
+            fetch('/api/brightness', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ brightness: parseInt(value), save: false })
+            }).catch(err => console.error('Brightness update failed:', err));
+        }
+
+        async function saveBrightness() {
+            const brightness = parseInt(document.getElementById('brightnessSlider').value);
+            setButtonLoading('btnSaveBrightness', true, 'Saving...');
+            try {
+                const response = await fetch('/api/brightness', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ brightness: brightness, save: true })
+                });
+                
+                if (response.ok) {
+                    showStatus('Brightness saved!', false);
+                } else {
+                    showStatus('Failed to save brightness', true);
+                }
+            } catch (error) {
+                showStatus('Error: ' + error.message, true);
+            } finally {
+                setButtonLoading('btnSaveBrightness', false);
+            }
+        }
+
         async function saveWifi() {
             const ssid = document.getElementById('wifiSsid').value;
             const password = document.getElementById('wifiPassword').value;
@@ -1062,6 +1178,11 @@
                     
                     // OBD2 timeout
                     document.getElementById('obd2TimeoutMs').value = config.obd2_timeout_ms || 4500;
+                    
+                    // Brightness
+                    const brightness = config.brightness !== undefined ? config.brightness : 255;
+                    document.getElementById('brightnessSlider').value = brightness;
+                    document.getElementById('brightnessValue').textContent = brightness;
                     
                     renderThresholds();
                     showStatus('Configuration loaded!', false);

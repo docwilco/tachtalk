@@ -214,6 +214,44 @@ pub fn start_server(state: &Arc<State>, ap_hostname: Option<String>) -> Result<(
         Ok(())
     })?;
 
+    // POST brightness endpoint - immediate brightness change without saving
+    let state_clone = state.clone();
+    server.fn_handler("/api/brightness", Method::Post, move |mut req| -> Result<(), esp_idf_svc::io::EspIOError> {
+        debug!("HTTP: POST /api/brightness");
+        let mut buf = [0u8; 32];
+        let bytes_read = req.read(&mut buf)?;
+        
+        #[derive(serde::Deserialize)]
+        struct BrightnessRequest {
+            brightness: u8,
+            #[serde(default)]
+            save: bool,
+        }
+        
+        if let Ok(brightness_req) = serde_json::from_slice::<BrightnessRequest>(&buf[..bytes_read]) {
+            debug!("Brightness update: {} (save={})", brightness_req.brightness, brightness_req.save);
+            
+            // Send brightness to LED task immediately
+            let _ = state_clone.rpm_tx.send(RpmTaskMessage::Brightness(brightness_req.brightness));
+            
+            // Optionally save to config
+            if brightness_req.save {
+                let mut cfg = state_clone.config.lock().unwrap();
+                cfg.brightness = brightness_req.brightness;
+                if let Err(e) = cfg.save() {
+                    warn!("Failed to save brightness config: {e}");
+                }
+            }
+            
+            req.into_ok_response()?;
+        } else {
+            warn!("Invalid brightness JSON received");
+            req.into_status_response(400)?;
+        }
+        
+        Ok(())
+    })?;
+
     // POST wifi endpoint - save wifi and restart
     let state_clone = state.clone();
     server.fn_handler("/api/wifi", Method::Post, move |mut req| -> Result<(), esp_idf_svc::io::EspIOError> {
