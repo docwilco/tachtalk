@@ -50,6 +50,33 @@ struct NetworkStatus {
     rssi: Option<i8>,
 }
 
+/// Connection status for the diagram
+#[derive(serde::Serialize)]
+struct ConnectionStatus {
+    /// WiFi connected to OBD2 dongle network
+    wifi_connected: bool,
+    /// TCP connection to OBD2 dongle established
+    dongle_tcp_connected: bool,
+    /// Number of downstream OBD2 clients connected
+    obd2_client_count: u32,
+}
+
+/// TCP connection info for a single connection
+#[derive(serde::Serialize)]
+struct TcpConnectionInfo {
+    local: String,
+    remote: String,
+}
+
+/// TCP connections status
+#[derive(serde::Serialize)]
+struct TcpStatus {
+    /// Dongle connection (if connected)
+    dongle: Option<TcpConnectionInfo>,
+    /// Client connections
+    clients: Vec<TcpConnectionInfo>,
+}
+
 /// Debug info response
 #[derive(serde::Serialize)]
 struct DebugInfo {
@@ -315,6 +342,57 @@ pub fn start_server(state: &Arc<State>, ap_hostname: Option<String>) -> Result<(
             rssi,
         };
         
+        let json = serde_json::to_string(&status).unwrap_or_else(|_| "{}".to_string());
+        
+        let mut response = req.into_ok_response()?;
+        response.write_all(json.as_bytes())?;
+        Ok(())
+    })?;
+
+    // GET connection status endpoint for diagram
+    let state_clone = state.clone();
+    server.fn_handler("/api/status", Method::Get, move |req| -> Result<(), esp_idf_svc::io::EspIOError> {
+        use std::sync::atomic::Ordering;
+        
+        debug!("HTTP: GET /api/status");
+        
+        let wifi_connected = state_clone.wifi.lock().unwrap().is_connected().unwrap_or(false);
+        let dongle_tcp_connected = state_clone.dongle_connected.load(Ordering::Relaxed);
+        let obd2_client_count = state_clone.obd2_client_count.load(Ordering::Relaxed);
+        
+        let status = ConnectionStatus {
+            wifi_connected,
+            dongle_tcp_connected,
+            obd2_client_count,
+        };
+        
+        let json = serde_json::to_string(&status).unwrap_or_else(|_| "{}".to_string());
+        
+        let mut response = req.into_ok_response()?;
+        response.write_all(json.as_bytes())?;
+        Ok(())
+    })?;
+
+    // GET TCP connection details endpoint
+    let state_clone = state.clone();
+    server.fn_handler("/api/tcp", Method::Get, move |req| -> Result<(), esp_idf_svc::io::EspIOError> {
+        debug!("HTTP: GET /api/tcp");
+        
+        let dongle = state_clone.dongle_tcp_info.lock().unwrap()
+            .map(|(local, remote)| TcpConnectionInfo {
+                local: local.to_string(),
+                remote: remote.to_string(),
+            });
+        
+        let clients: Vec<TcpConnectionInfo> = state_clone.client_tcp_info.lock().unwrap()
+            .iter()
+            .map(|(local, remote)| TcpConnectionInfo {
+                local: local.to_string(),
+                remote: remote.to_string(),
+            })
+            .collect();
+        
+        let status = TcpStatus { dongle, clients };
         let json = serde_json::to_string(&status).unwrap_or_else(|_| "{}".to_string());
         
         let mut response = req.into_ok_response()?;

@@ -16,6 +16,7 @@ use esp_idf_svc::ipv4::{
 };
 use log::{debug, info, warn, error};
 use std::collections::HashSet;
+use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -34,6 +35,8 @@ use config::Config;
 use leds::LedController;
 use obd2::{dongle_task, rpm_led_task, DongleSender, Obd2Proxy, RpmTaskSender};
 use sse_server::{sse_server_task, SseSender};
+
+use std::sync::atomic::{AtomicBool, AtomicU32};
 
 const AP_SSID_PREFIX: &str = "TachTalk-";
 
@@ -56,6 +59,14 @@ pub struct State {
     pub shared_rpm: Mutex<Option<u32>>,
     pub at_command_log: Mutex<HashSet<String>>,
     pub pid_log: Mutex<HashSet<String>>,
+    /// Whether we have an active TCP connection to the OBD2 dongle
+    pub dongle_connected: AtomicBool,
+    /// TCP connection info for dongle: (`local_addr`, `remote_addr`)
+    pub dongle_tcp_info: Mutex<Option<(SocketAddr, SocketAddr)>>,
+    /// Number of currently connected OBD2 clients (downstream)
+    pub obd2_client_count: AtomicU32,
+    /// TCP connection info for each client: (`local_addr`, `remote_addr`)
+    pub client_tcp_info: Mutex<Vec<(SocketAddr, SocketAddr)>>,
 }
 
 /// Convert a subnet mask string (e.g., "255.255.255.0") to CIDR prefix length (e.g., 24)
@@ -308,6 +319,10 @@ fn main() -> Result<()> {
         shared_rpm: Mutex::new(None),
         at_command_log: Mutex::new(HashSet::new()),
         pid_log: Mutex::new(HashSet::new()),
+        dongle_connected: AtomicBool::new(false),
+        dongle_tcp_info: Mutex::new(None),
+        obd2_client_count: AtomicU32::new(0),
+        client_tcp_info: Mutex::new(Vec::new()),
     });
 
     // Start DNS server for captive portal

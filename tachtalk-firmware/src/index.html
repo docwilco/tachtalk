@@ -147,6 +147,212 @@
             background-color: #00ff00;
             color: #000;
         }
+        /* Connection diagram styles */
+        .connection-diagram {
+            background-color: #1a1a1a;
+            padding: 12px;
+            margin: 15px 0;
+            border-radius: 8px;
+            border: 1px solid #333;
+        }
+        .connection-diagram h2 {
+            margin-top: 0;
+            margin-bottom: 10px;
+            font-size: 1.1em;
+        }
+        .diagram-container {
+            display: grid;
+            grid-template-columns: auto auto auto;
+            grid-template-rows: auto auto auto;
+            gap: 2px;
+            align-items: center;
+            justify-items: center;
+            justify-content: center;
+            max-width: 340px;
+            margin: 0 auto;
+        }
+        /* Horizontal connectors in top middle cell */
+        .horizontal-connectors {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 2px;
+            min-width: 50px;
+            cursor: pointer;
+        }
+        .horizontal-connectors:hover .connector-line {
+            opacity: 0.8;
+        }
+        .horizontal-connectors .diagram-connector {
+            padding: 0;
+            width: 100%;
+        }
+        .diagram-node {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            padding: 6px;
+            background-color: #2a2a2a;
+            border-radius: 6px;
+            border: 2px solid #444;
+            min-width: 60px;
+            text-align: center;
+        }
+        .diagram-node.active {
+            border-color: #00ff00;
+        }
+        .diagram-node .icon {
+            font-size: 1.4em;
+            margin-bottom: 2px;
+        }
+        .diagram-node .label {
+            font-size: 0.7em;
+            color: #aaa;
+        }
+        .diagram-node .count-large {
+            font-size: 1.5em;
+            font-weight: bold;
+            color: #666;
+        }
+        .diagram-node.active .count-large {
+            color: #00ff00;
+        }
+        .diagram-connector {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            padding: 2px 0;
+            min-width: 40px;
+        }
+        .connector-line {
+            width: 100%;
+            height: 2px;
+            background-color: #444;
+            position: relative;
+        }
+        .connector-line.active {
+            background-color: #00ff00;
+        }
+        .connector-line.error {
+            background: repeating-linear-gradient(
+                90deg,
+                #ff4444 0px,
+                #ff4444 6px,
+                transparent 6px,
+                transparent 10px
+            );
+        }
+        .connector-label {
+            font-size: 0.65em;
+            color: #666;
+            margin-top: 3px;
+            white-space: nowrap;
+        }
+        .connector-label.active {
+            color: #00ff00;
+        }
+        .connector-label.error {
+            color: #ff4444;
+        }
+        /* Horizontal parallel connectors (WiFi + TCP) */
+        .parallel-connectors-h {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 2px;
+            min-width: 50px;
+            cursor: pointer;
+        }
+        .parallel-connectors-h:hover .connector-line {
+            opacity: 0.8;
+        }
+        .parallel-connectors-h .diagram-connector {
+            padding: 0;
+            min-width: 100%;
+        }
+        /* Vertical parallel connectors (HTTP + SSE) */
+        .parallel-connectors-v {
+            display: flex;
+            flex-direction: row;
+            align-items: flex-start;
+            gap: 6px;
+            justify-content: center;
+        }
+        .parallel-connectors-v .diagram-connector {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+        }
+        .parallel-connectors-v .connector-line {
+            width: 2px;
+            height: 20px;
+        }
+        /* Vertical connector for OBD2 */
+        .vertical-connector {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+        }
+        .vertical-connector .connector-line {
+            width: 2px;
+            height: 20px;
+        }
+        /* Diagonal connector (top-right to bottom-left) */
+        .diagonal-connector {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            width: 45px;
+            height: 45px;
+            position: relative;
+            cursor: pointer;
+        }
+        .diagonal-connector .connector-line {
+            width: 2px;
+            height: 55px;
+            transform: rotate(45deg);
+            position: absolute;
+        }
+        .diagonal-connector .connector-label {
+            position: absolute;
+            font-size: 0.6em;
+            color: #666;
+            background-color: rgba(26, 26, 26, 0.9);
+            padding: 1px 3px;
+            border-radius: 2px;
+        }
+        .diagonal-connector .connector-label.active {
+            color: #00ff00;
+        }
+        .diagram-node.clickable {
+            cursor: pointer;
+            transition: background-color 0.2s;
+        }
+        .diagram-node.clickable:hover {
+            background-color: #3a3a3a;
+        }
+        /* Network details popup */
+        .network-details-popup {
+            display: none;
+            background-color: #2a3a2a;
+            padding: 15px;
+            margin-top: 15px;
+            border-radius: 5px;
+            border-left: 4px solid #00ff00;
+        }
+        .network-details-popup.visible {
+            display: block;
+        }
+        .network-details-popup .info-row {
+            display: flex;
+            justify-content: space-between;
+            padding: 5px 0;
+            border-bottom: 1px solid #444;
+        }
+        .network-details-popup .info-row:last-child {
+            border-bottom: none;
+        }
         .network-info {
             background-color: #2a3a2a;
             padding: 15px;
@@ -277,7 +483,7 @@
 </head>
 <body>
     <div class="container">
-        <h1>📈 TachTalk Configuration <span id="modeIndicator" class="mode-indicator"></span></h1>
+        <h1>📈 TachTalk Configuration</h1>
         
         <div id="apBanner" class="ap-mode-banner" style="display: none;">
             ⚠️ Running in Setup Mode - Configure WiFi below to connect to your network
@@ -289,15 +495,84 @@
             <div>RPM: <span id="currentRpm">---</span></div>
         </div>
         
-        <div class="network-info">
-            <h2>🌐 Network Status</h2>
-            <div class="info-row"><span>SSID:</span><span id="netSsid">---</span></div>
-            <div class="info-row"><span>IP Address:</span><span id="netIp">---</span></div>
-            <div class="info-row"><span>Gateway:</span><span id="netGateway">---</span></div>
-            <div class="info-row"><span>Subnet Mask:</span><span id="netSubnet">---</span></div>
-            <div class="info-row"><span>DNS:</span><span id="netDns">---</span></div>
-            <div class="info-row"><span>MAC Address:</span><span id="netMac">---</span></div>
-            <div class="info-row"><span>Signal:</span><span id="netRssi">---</span></div>
+        <!-- Connection Diagram -->
+        <div class="connection-diagram">
+            <h2>🔗 Connection Status</h2>
+            <div class="diagram-container">
+                <!-- Row 1: OBD2 Dongle | WiFi/TCP | TachTalk -->
+                <div class="diagram-node" id="nodeDongle">
+                    <span class="icon">🔌</span>
+                    <span class="label">OBD2 Dongle</span>
+                </div>
+                <div class="horizontal-connectors">
+                    <div class="diagram-connector" onclick="toggleNetworkDetails()">
+                        <div class="connector-line" id="connWifi"></div>
+                        <span class="connector-label" id="labelWifi">WiFi</span>
+                    </div>
+                    <div class="diagram-connector" onclick="toggleTcpDetails()">
+                        <div class="connector-line" id="connTcp"></div>
+                        <span class="connector-label" id="labelTcp">TCP</span>
+                    </div>
+                </div>
+                <div class="diagram-node" id="nodeDevice">
+                    <span class="icon">📡</span>
+                    <span class="label">TachTalk</span>
+                </div>
+                
+                <!-- Row 2: (empty) | Diagonal TCP to clients | HTTP/SSE connectors -->
+                <div></div>
+                <div class="diagonal-connector" onclick="toggleTcpDetails()">
+                    <div class="connector-line" id="connTcpClient"></div>
+                    <span class="connector-label" id="labelTcpClient">TCP</span>
+                </div>
+                <div class="parallel-connectors-v">
+                    <div class="vertical-connector">
+                        <div class="connector-line active" id="connHttp"></div>
+                        <span class="connector-label active" id="labelHttp">HTTP</span>
+                    </div>
+                    <div class="vertical-connector">
+                        <div class="connector-line" id="connSse"></div>
+                        <span class="connector-label" id="labelSse">SSE</span>
+                    </div>
+                </div>
+                
+                <!-- Row 3: OBD2 Clients | (empty) | Browser -->
+                <div class="diagram-node" id="nodeObd2Client">
+                    <span class="count-large" id="obd2ClientCount">0</span>
+                    <span class="label">OBD2 Clients</span>
+                </div>
+                <div></div>
+                <div class="diagram-node active" id="nodeBrowser">
+                    <span class="icon">🌐</span>
+                    <span class="label">Browser</span>
+                </div>
+            </div>
+            
+            <!-- Network details (shown on click) -->
+            <div class="network-details-popup" id="networkDetails">
+                <h3 style="margin-top: 0;">📊 Network Details</h3>
+                <div class="info-row"><span>SSID:</span><span id="netSsid">---</span></div>
+                <div class="info-row"><span>IP Address:</span><span id="netIp">---</span></div>
+                <div class="info-row"><span>Gateway:</span><span id="netGateway">---</span></div>
+                <div class="info-row"><span>Subnet Mask:</span><span id="netSubnet">---</span></div>
+                <div class="info-row"><span>DNS:</span><span id="netDns">---</span></div>
+                <div class="info-row"><span>MAC Address:</span><span id="netMac">---</span></div>
+                <div class="info-row"><span>Signal:</span><span id="netRssi">---</span></div>
+            </div>
+            
+            <!-- TCP connection details (shown on click) -->
+            <div class="network-details-popup" id="tcpDetails">
+                <h3 style="margin-top: 0;">🔌 TCP Connections</h3>
+                <div id="tcpDongleConnection">
+                    <strong>Dongle:</strong>
+                    <div class="info-row"><span>Remote:</span><span id="tcpDongleRemote">---</span></div>
+                    <div class="info-row"><span>Local:</span><span id="tcpDongleLocal">---</span></div>
+                </div>
+                <div id="tcpClientConnections" style="margin-top: 10px;">
+                    <strong>OBD2 Clients:</strong>
+                    <div id="tcpClientList">No clients connected</div>
+                </div>
+            </div>
         </div>
         
         <details class="debug-section">
@@ -805,15 +1080,10 @@
                 const response = await fetch('/api/mode');
                 if (response.ok) {
                     const data = await response.json();
-                    const indicator = document.getElementById('modeIndicator');
                     const banner = document.getElementById('apBanner');
                     if (data.mode === 'ap') {
-                        indicator.textContent = 'Setup Mode';
-                        indicator.className = 'mode-indicator mode-ap';
                         banner.style.display = 'block';
                     } else {
-                        indicator.textContent = 'Connected';
-                        indicator.className = 'mode-indicator mode-client';
                         banner.style.display = 'none';
                     }
                 }
@@ -822,10 +1092,144 @@
             }
         }
 
+        // Track SSE connection state for diagram
+        let sseConnected = false;
+        // Track HTTP connection state (based on API response success)
+        let httpConnected = true;
+
+        function updateHttpStatus(connected) {
+            const wasDisconnected = !httpConnected;
+            httpConnected = connected;
+            document.getElementById('connHttp').className = 'connector-line' + (connected ? ' active' : ' error');
+            document.getElementById('labelHttp').className = 'connector-label' + (connected ? ' active' : ' error');
+            
+            // When HTTP is down, set everything else to unknown (grey)
+            if (!connected) {
+                // WiFi - unknown
+                document.getElementById('connWifi').className = 'connector-line';
+                document.getElementById('labelWifi').className = 'connector-label';
+                // TCP to dongle - unknown
+                document.getElementById('connTcp').className = 'connector-line';
+                document.getElementById('labelTcp').className = 'connector-label';
+                // Nodes - unknown
+                document.getElementById('nodeDongle').className = 'diagram-node';
+                document.getElementById('nodeDevice').className = 'diagram-node';
+                // OBD2 client TCP - unknown
+                document.getElementById('connTcpClient').className = 'connector-line';
+                document.getElementById('labelTcpClient').className = 'connector-label';
+                document.getElementById('nodeObd2Client').className = 'diagram-node';
+                document.getElementById('obd2ClientCount').textContent = '?';
+                // SSE - will be handled by its own error handler
+                document.getElementById('connSse').className = 'connector-line';
+                document.getElementById('labelSse').className = 'connector-label';
+                // Browser node stays active (we're running in it)
+            } else if (wasDisconnected) {
+                // HTTP just came back online - refresh connection status immediately
+                loadConnectionStatus();
+            }
+        }
+
+        function updateConnectionDiagram(status) {
+            // Only update if HTTP is connected (otherwise status is stale/unknown)
+            if (!httpConnected) return;
+            
+            // Update WiFi connection - error if explicitly disconnected
+            const wifiActive = status.wifi_connected;
+            document.getElementById('connWifi').className = 'connector-line' + (wifiActive ? ' active' : ' error');
+            document.getElementById('labelWifi').className = 'connector-label' + (wifiActive ? ' active' : ' error');
+            
+            // Update TCP connection to dongle - error if explicitly disconnected
+            const tcpActive = status.dongle_tcp_connected;
+            document.getElementById('connTcp').className = 'connector-line' + (tcpActive ? ' active' : ' error');
+            document.getElementById('labelTcp').className = 'connector-label' + (tcpActive ? ' active' : ' error');
+            
+            // Update dongle node (active if TCP connected)
+            document.getElementById('nodeDongle').className = 'diagram-node' + (tcpActive ? ' active' : '');
+            
+            // Update device node (active if WiFi connected)
+            document.getElementById('nodeDevice').className = 'diagram-node' + (wifiActive ? ' active' : '');
+            
+            // Update OBD2 client TCP connection (diagonal) - grey when no clients (not error)
+            const clientCount = status.obd2_client_count || 0;
+            const clientActive = clientCount > 0;
+            document.getElementById('connTcpClient').className = 'connector-line' + (clientActive ? ' active' : '');
+            document.getElementById('labelTcpClient').className = 'connector-label' + (clientActive ? ' active' : '');
+            document.getElementById('nodeObd2Client').className = 'diagram-node' + (clientActive ? ' active' : '');
+            document.getElementById('obd2ClientCount').textContent = clientCount;
+            
+            // Update SSE connection
+            document.getElementById('connSse').className = 'connector-line' + (sseConnected ? ' active' : '');
+            document.getElementById('labelSse').className = 'connector-label' + (sseConnected ? ' active' : '');
+        }
+
+        async function loadConnectionStatus() {
+            try {
+                const controller = new AbortController();
+                const timeout = setTimeout(() => controller.abort(), 3000);
+                const response = await fetch('/api/status', { signal: controller.signal });
+                clearTimeout(timeout);
+                if (response.ok) {
+                    const status = await response.json();
+                    updateConnectionDiagram(status);
+                }
+            } catch (error) {
+                console.error('Failed to load connection status:', error);
+            }
+        }
+
+        function toggleNetworkDetails() {
+            const details = document.getElementById('networkDetails');
+            const tcpDetails = document.getElementById('tcpDetails');
+            tcpDetails.classList.remove('visible');
+            details.classList.toggle('visible');
+        }
+
+        function toggleTcpDetails() {
+            const details = document.getElementById('tcpDetails');
+            const netDetails = document.getElementById('networkDetails');
+            netDetails.classList.remove('visible');
+            details.classList.toggle('visible');
+            if (details.classList.contains('visible')) {
+                loadTcpStatus();
+            }
+        }
+
+        async function loadTcpStatus() {
+            try {
+                const response = await fetch('/api/tcp');
+                if (response.ok) {
+                    const data = await response.json();
+                    // Dongle connection
+                    if (data.dongle) {
+                        document.getElementById('tcpDongleRemote').textContent = data.dongle.remote || '---';
+                        document.getElementById('tcpDongleLocal').textContent = data.dongle.local || '---';
+                    } else {
+                        document.getElementById('tcpDongleRemote').textContent = 'Not connected';
+                        document.getElementById('tcpDongleLocal').textContent = '---';
+                    }
+                    // Client connections
+                    const clientList = document.getElementById('tcpClientList');
+                    if (data.clients && data.clients.length > 0) {
+                        clientList.innerHTML = data.clients.map((c, i) => 
+                            `<div class="info-row"><span>#${i+1}:</span><span>${c.remote} → ${c.local}</span></div>`
+                        ).join('');
+                    } else {
+                        clientList.textContent = 'No clients connected';
+                    }
+                }
+            } catch (error) {
+                console.error('Failed to load TCP status:', error);
+            }
+        }
+
         async function loadNetworkStatus() {
             try {
-                const response = await fetch('/api/network');
+                const controller = new AbortController();
+                const timeout = setTimeout(() => controller.abort(), 3000);
+                const response = await fetch('/api/network', { signal: controller.signal });
+                clearTimeout(timeout);
                 if (response.ok) {
+                    updateHttpStatus(true);
                     const data = await response.json();
                     document.getElementById('netSsid').textContent = data.ssid || '---';
                     document.getElementById('netIp').textContent = data.ip || '---';
@@ -844,17 +1248,43 @@
                     } else {
                         document.getElementById('netRssi').textContent = '---';
                     }
+                } else {
+                    updateHttpStatus(false);
                 }
             } catch (error) {
                 console.error('Failed to load network status:', error);
+                updateHttpStatus(false);
             }
         }
 
         async function loadRpm() {
-            // RPM is now handled via SSE, this is just a fallback
+            try {
+                const response = await fetch('/api/rpm');
+                if (response.ok) {
+                    const data = await response.json();
+                    document.getElementById('currentRpm').textContent = data.rpm !== null ? data.rpm : '---';
+                }
+            } catch (error) {
+                console.error('Failed to poll RPM:', error);
+            }
         }
 
         let rpmEventSource = null;
+        let rpmPollInterval = null;
+
+        function startRpmPolling() {
+            if (!rpmPollInterval) {
+                rpmPollInterval = setInterval(loadRpm, 500);
+                loadRpm(); // Immediate first poll
+            }
+        }
+
+        function stopRpmPolling() {
+            if (rpmPollInterval) {
+                clearInterval(rpmPollInterval);
+                rpmPollInterval = null;
+            }
+        }
 
         function setupRpmEventSource() {
             // Close existing connection if any
@@ -866,13 +1296,26 @@
             // SSE runs on a separate port to avoid blocking the HTTP server
             const sseUrl = `http://${window.location.hostname}:${SSE_PORT}/`;
             rpmEventSource = new EventSource(sseUrl);
+            rpmEventSource.onopen = function() {
+                sseConnected = true;
+                stopRpmPolling(); // SSE connected, stop polling
+                // Update diagram immediately
+                document.getElementById('connSse').className = 'connector-line active';
+                document.getElementById('labelSse').className = 'connector-label active';
+            };
             rpmEventSource.onmessage = function(event) {
+                sseConnected = true;
+                stopRpmPolling(); // SSE working, ensure polling stopped
                 const data = JSON.parse(event.data);
                 document.getElementById('currentRpm').textContent = data.rpm !== null ? data.rpm : '---';
             };
             rpmEventSource.onerror = function() {
-                document.getElementById('currentRpm').textContent = '---';
-                // EventSource will automatically reconnect, no need to manually reconnect
+                sseConnected = false;
+                startRpmPolling(); // SSE failed, start polling fallback
+                // Update diagram immediately
+                document.getElementById('connSse').className = 'connector-line';
+                document.getElementById('labelSse').className = 'connector-label';
+                // EventSource will automatically reconnect
             };
         }
 
@@ -982,6 +1425,7 @@
         loadConfig();
         loadMode();
         loadNetworkStatus();
+        loadConnectionStatus();
         setupRpmEventSource();
         loadDebugInfo();
         
@@ -994,8 +1438,9 @@
             });
         });
         
-        // Poll network status (RPM uses SSE now)
+        // Poll network status and connection status
         setInterval(loadNetworkStatus, 5000);
+        setInterval(loadConnectionStatus, 2000);
         // Poll debug info every second (only when debug section is open)
         setInterval(() => {
             const debugSection = document.querySelector('.debug-section:has(#freeHeap)');

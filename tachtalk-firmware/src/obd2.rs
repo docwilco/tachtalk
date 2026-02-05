@@ -174,6 +174,8 @@ pub type DongleReceiver = Receiver<DongleRequest>;
 
 /// Run the dongle task - owns the connection and processes requests
 pub fn dongle_task(state: &Arc<State>, rx: &DongleReceiver) {
+    use std::sync::atomic::Ordering;
+    
     info!("OBD2 dongle task starting...");
 
     let mut connection: Option<DongleState> = None;
@@ -204,7 +206,17 @@ pub fn dongle_task(state: &Arc<State>, rx: &DongleReceiver) {
             };
             if should_try {
                 last_connect_attempt = Some(Instant::now());
-                connection = try_connect(&dongle_ip, dongle_port, timeout, &watchdog);
+                if let Some((dongle_state, local_addr, remote_addr)) = 
+                    try_connect(&dongle_ip, dongle_port, timeout, &watchdog) 
+                {
+                    connection = Some(dongle_state);
+                    // Update shared connection status and TCP info
+                    state.dongle_connected.store(true, Ordering::Relaxed);
+                    *state.dongle_tcp_info.lock().unwrap() = Some((local_addr, remote_addr));
+                } else {
+                    state.dongle_connected.store(false, Ordering::Relaxed);
+                    *state.dongle_tcp_info.lock().unwrap() = None;
+                }
             }
         }
 
@@ -215,8 +227,8 @@ pub fn dongle_task(state: &Arc<State>, rx: &DongleReceiver) {
                     "Dongle request: {:?}",
                     String::from_utf8_lossy(&request.command)
                 );
-                let result = if let Some(ref mut state) = connection {
-                    state.execute_with_repeat(&request.command, timeout)
+                let result = if let Some(ref mut dongle_state) = connection {
+                    dongle_state.execute_with_repeat(&request.command, timeout)
                 } else {
                     Err(DongleError::NotConnected)
                 };
@@ -228,6 +240,8 @@ pub fn dongle_task(state: &Arc<State>, rx: &DongleReceiver) {
                 ) {
                     warn!("Dongle connection lost, will reconnect");
                     connection = None;
+                    state.dongle_connected.store(false, Ordering::Relaxed);
+                    *state.dongle_tcp_info.lock().unwrap() = None;
                 }
 
                 if let Err(ref e) = result {
@@ -263,12 +277,13 @@ pub fn dongle_task(state: &Arc<State>, rx: &DongleReceiver) {
 }
 
 /// Try to connect to the dongle and initialize it
+/// Returns (`DongleState`, `local_addr`, `remote_addr`) on success
 fn try_connect(
     dongle_ip: &str,
     dongle_port: u16,
     timeout: Duration,
     watchdog: &WatchdogHandle,
-) -> Option<DongleState> {
+) -> Option<(DongleState, SocketAddr, SocketAddr)> {
     info!(
         "Connecting to OBD2 dongle at {dongle_ip}:{dongle_port} (timeout: {}ms)",
         timeout.as_millis()
@@ -282,6 +297,10 @@ fn try_connect(
             return None;
         }
     };
+
+    // Get socket addresses before any potential failures
+    let local_addr = stream.local_addr().ok()?;
+    let remote_addr = stream.peer_addr().ok()?;
 
     // Feed watchdog after potentially long connect timeout
     watchdog.feed();
@@ -320,11 +339,11 @@ fn try_connect(
 
     info!("Connected to OBD2 dongle");
 
-    Some(DongleState {
+    Some((DongleState {
         stream,
         supports_repeat: None, // Will be tested lazily on first repeat opportunity
         last_command: None,
-    })
+    }, local_addr, remote_addr))
 }
 
 /// Execute a command on the dongle and return the response
@@ -434,6 +453,8 @@ pub fn send_command_async(dongle_tx: &DongleSender, command: &[u8]) {
 /// - Updates LEDs based on current RPM
 /// - Sends RPM to SSE clients
 /// - Updates shared RPM for HTTP polling fallback
+// Receiver is intentionally moved into this task for exclusive ownership
+#[allow(clippy::needless_pass_by_value)]
 pub fn rpm_led_task(
     state: &Arc<State>,
     mut led_controller: LedController,
@@ -540,6 +561,20 @@ pub struct Obd2Proxy {
     state: Arc<State>,
 }
 
+/// RAII guard to decrement client count and remove TCP info on drop
+struct ClientCountGuard<'a> {
+    state: &'a State,
+    tcp_info: (SocketAddr, SocketAddr),
+}
+
+impl Drop for ClientCountGuard<'_> {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering;
+        self.state.obd2_client_count.fetch_sub(1, Ordering::Relaxed);
+        self.state.client_tcp_info.lock().unwrap().retain(|&x| x != self.tcp_info);
+    }
+}
+
 impl Obd2Proxy {
     pub fn new(state: Arc<State>) -> Self {
         Self { state }
@@ -588,8 +623,21 @@ impl Obd2Proxy {
 
     #[allow(clippy::needless_pass_by_value)] // TcpStream is consumed by BufReader
     fn handle_client(client_stream: TcpStream, state: &Arc<State>) -> Result<()> {
+        use std::sync::atomic::Ordering;
+        
         let peer = client_stream.peer_addr()?;
+        let local = client_stream.local_addr()?;
         info!("OBD2 client connected: {peer}");
+        
+        // Track connection info
+        let tcp_info = (local, peer);
+        state.client_tcp_info.lock().unwrap().push(tcp_info);
+        
+        // Increment client count
+        state.obd2_client_count.fetch_add(1, Ordering::Relaxed);
+        
+        // Use a guard to ensure we decrement and remove TCP info on any exit path
+        let _guard = ClientCountGuard { state, tcp_info };
 
         // Get timeout from config for socket operations
         let timeout = Duration::from_millis(state.config.lock().unwrap().obd2_timeout_ms);

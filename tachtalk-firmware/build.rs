@@ -15,12 +15,12 @@ fn main() {
 
     // Split at the {{SSE_PORT}} placeholder
     let parts: Vec<&str> = html.split("{{SSE_PORT}}").collect();
-    if parts.len() != 2 {
-        panic!(
-            "Expected exactly one {{{{SSE_PORT}}}} placeholder in index.html, found {}",
-            parts.len() - 1
-        );
-    }
+    assert_eq!(
+        parts.len(),
+        2,
+        "Expected exactly one {{{{SSE_PORT}}}} placeholder in index.html, found {}",
+        parts.len() - 1
+    );
 
     let out_path = Path::new(&out_dir);
     fs::write(out_path.join("index_start.html"), parts[0]).expect("Failed to write index_start.html");
