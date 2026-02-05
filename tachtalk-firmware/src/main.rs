@@ -212,12 +212,145 @@ fn start_wifi(
     Ok(wifi)
 }
 
+/// Initialize logging and load configuration from NVS
+fn init_logging_and_config(nvs: EspDefaultNvsPartition) -> Result<Config> {
+    config::init_nvs(nvs)?;
+    let config = Config::load_or_default();
+
+    // Apply configured log level
+    let level = config.log_level.as_level_filter();
+    if let Err(e) = esp_idf_svc::log::set_target_level("*", level) {
+        warn!("Failed to set log level: {e}");
+    } else {
+        info!("Log level set to {:?}", config.log_level);
+    }
+
+    Ok(config)
+}
+
+/// Initialize LED controller with GPIO from config
+fn init_led_controller<C: esp_idf_hal::rmt::RmtChannel>(
+    config: &Config,
+    rmt_channel: impl esp_idf_hal::peripheral::Peripheral<P = C> + 'static,
+) -> Result<LedController> {
+    let led_gpio = config.led_gpio;
+    info!("Initializing LED controller on GPIO {led_gpio}...");
+
+    // Reset the GPIO pin to clear any residual RMT configuration from previous boot
+    // This ensures clean initialization when GPIO pin is changed via config
+    unsafe {
+        esp_idf_svc::sys::gpio_reset_pin(i32::from(led_gpio));
+    }
+
+    // SAFETY: We trust the user-configured GPIO pin number is valid for this board
+    let led_pin = unsafe { AnyIOPin::new(i32::from(led_gpio)) };
+    LedController::new(led_pin, rmt_channel)
+}
+
+/// Initialize WiFi driver and network interfaces
+fn init_wifi(
+    config: &Config,
+    modem: esp_idf_hal::modem::Modem,
+    sys_loop: EspSystemEventLoop,
+    nvs: EspDefaultNvsPartition,
+) -> Result<(EspWifi<'static>, String)> {
+    info!("Initializing WiFi...");
+
+    let wifi_driver = WifiDriver::new(modem, sys_loop, Some(nvs))?;
+    let sta_netif = create_sta_netif(config)?;
+    let ap_netif = create_ap_netif()?;
+    let wifi = EspWifi::wrap_all(wifi_driver, sta_netif, ap_netif)?;
+
+    // Generate AP SSID: use config override or derive from MAC address
+    let mac = wifi.sta_netif().get_mac()?;
+    let ap_ssid = config.ap_ssid.clone().unwrap_or_else(|| {
+        format!("{}{:02X}{:02X}", AP_SSID_PREFIX, mac[4], mac[5])
+    });
+
+    // Get AP password from config
+    let ap_password = config.ap_password.clone();
+    let ap_auth_method = match &ap_password {
+        Some(pw) if !pw.is_empty() => AuthMethod::WPA2Personal,
+        _ => AuthMethod::None,
+    };
+
+    // Start WiFi in Mixed mode
+    let wifi = start_wifi(config, wifi, &ap_ssid, ap_password.as_deref(), ap_auth_method)?;
+
+    let ap_ip_info = wifi.ap_netif().get_ip_info()?;
+    info!("AP started - connect to '{ap_ssid}' and navigate to http://{}", ap_ip_info.ip);
+
+    Ok((wifi, ap_ssid))
+}
+
+/// Spawn all background tasks (DNS, SSE, OBD2, web server, etc.)
+fn spawn_background_tasks(
+    state: &Arc<State>,
+    led_controller: LedController,
+    sse_rx: std::sync::mpsc::Receiver<sse_server::SseMessage>,
+    dongle_rx: std::sync::mpsc::Receiver<obd2::DongleRequest>,
+    rpm_rx: std::sync::mpsc::Receiver<obd2::RpmTaskMessage>,
+    ap_hostname: String,
+) {
+    // Start DNS server for captive portal
+    dns::start_dns_server();
+
+    // Start SSE server for RPM streaming (on port 8081)
+    thread_util::spawn_named(c"sse_srv", move || {
+        sse_server_task(&sse_rx);
+    });
+
+    // Start OBD2 dongle task
+    {
+        let state = state.clone();
+        thread_util::spawn_named(c"dongle", move || {
+            dongle_task(&state, &dongle_rx);
+        });
+    }
+
+    // Start the combined RPM poller and LED update task
+    {
+        let state = state.clone();
+        thread_util::spawn_named(c"rpm_led", move || {
+            rpm_led_task(&state, led_controller, rpm_rx);
+        });
+    }
+
+    // Start web server
+    {
+        let state = state.clone();
+        thread_util::spawn_named(c"web_srv", move || {
+            if let Err(e) = web_server::start_server(&state, Some(ap_hostname)) {
+                error!("Web server error: {e:?}");
+            }
+        });
+    }
+
+    // Start OBD2 proxy
+    {
+        let state = state.clone();
+        thread_util::spawn_named(c"obd2_proxy", move || {
+            let proxy = Obd2Proxy::new(state);
+            if let Err(e) = proxy.run() {
+                error!("OBD2 proxy error: {e:?}");
+            }
+        });
+    }
+    info!("OBD2 proxy started");
+
+    // Start WiFi connection manager
+    {
+        let state = state.clone();
+        thread_util::spawn_named(c"wifi_mgr", move || {
+            wifi_connection_manager(&state);
+        });
+    }
+}
+
 fn main() -> Result<()> {
     // It is necessary to call this function once. Otherwise some patches to the runtime
     // implemented by esp-idf-sys might not link properly. See https://github.com/esp-rs/esp-idf-template/issues/71
     esp_idf_svc::sys::link_patches();
-
-    // Bind the log crate to the ESP Logging facilities
     esp_idf_svc::log::EspLogger::initialize_default();
 
     info!("Starting tachtalk firmware...");
@@ -228,77 +361,11 @@ fn main() -> Result<()> {
     let sys_loop = EspSystemEventLoop::take()?;
     let nvs = EspDefaultNvsPartition::take()?;
 
-    // Initialize NVS for config storage
-    config::init_nvs(nvs.clone())?;
+    let config = init_logging_and_config(nvs.clone())?;
+    let led_controller = init_led_controller(&config, peripherals.rmt.channel0)?;
+    let (wifi, ap_ssid) = init_wifi(&config, peripherals.modem, sys_loop, nvs)?;
 
-    // Load configuration
-    let config = Config::load_or_default();
-
-    // Apply configured log level
-    {
-        let level = config.log_level.as_level_filter();
-        // Set for all targets (use "*" for global)
-        if let Err(e) = esp_idf_svc::log::set_target_level("*", level) {
-            warn!("Failed to set log level: {e}");
-        } else {
-            info!("Log level set to {:?}", config.log_level);
-        }
-    }
-
-    // Initialize LED controller with GPIO from config
-    let led_gpio = config.led_gpio;
-    info!("Initializing LED controller on GPIO {led_gpio}...");
-    // Reset the GPIO pin to clear any residual RMT configuration from previous boot
-    // This ensures clean initialization when GPIO pin is changed via config
-    unsafe {
-        esp_idf_svc::sys::gpio_reset_pin(i32::from(led_gpio));
-    }
-    // SAFETY: We trust the user-configured GPIO pin number is valid for this board
-    let led_pin = unsafe { AnyIOPin::new(i32::from(led_gpio)) };
-    let led_controller = LedController::new(
-        led_pin,
-        peripherals.rmt.channel0,
-    )?;
-
-    // Initialize WiFi with custom AP configuration for captive portal DNS
-    info!("Initializing WiFi...");
-    
-    // Create WiFi driver
-    let wifi_driver = WifiDriver::new(peripherals.modem, sys_loop.clone(), Some(nvs.clone()))?;
-    
-    // Create STA netif - static IP or DHCP based on config
-    let sta_netif = create_sta_netif(&config)?;
-    
-    // Create AP netif with captive portal DNS
-    let ap_netif = create_ap_netif()?;
-    
-    let wifi = EspWifi::wrap_all(wifi_driver, sta_netif, ap_netif)?;
-
-    // Generate AP SSID: use config override or derive from MAC address
-    let mac = wifi.sta_netif().get_mac()?;
-    let ap_ssid = config.ap_ssid.clone().unwrap_or_else(|| {
-        format!("{}{:02X}{:02X}", AP_SSID_PREFIX, mac[4], mac[5])
-    });
     let ap_hostname = ap_ssid.to_lowercase();
-
-    // Get AP password from config
-    let ap_password = config.ap_password.clone();
-    let ap_auth_method = match &ap_password {
-        Some(pw) if !pw.is_empty() => AuthMethod::WPA2Personal,
-        _ => AuthMethod::None,
-    };
-
-    // Start WiFi in Mixed mode
-    let wifi = start_wifi(
-        &config,
-        wifi,
-        &ap_ssid,
-        ap_password.as_deref(),
-        ap_auth_method,
-    )?;
-
-    let ap_ip_info = wifi.ap_netif().get_ip_info()?;
-    info!("AP started - connect to '{ap_ssid}' and navigate to http://{}", ap_ip_info.ip);
 
     // Create all channels upfront
     let (sse_tx, sse_rx) = std::sync::mpsc::channel();
@@ -323,77 +390,18 @@ fn main() -> Result<()> {
         client_tcp_info: Mutex::new(Vec::new()),
     });
 
-    // Start DNS server for captive portal
-    dns::start_dns_server();
-
-    // Start SSE server for RPM streaming (on port 8081)
-    {
-        thread_util::spawn_named(c"sse_srv", move || {
-            sse_server_task(&sse_rx);
-        });
-    }
-
-    // Start OBD2 dongle task
-    {
-        let state = state.clone();
-        thread_util::spawn_named(c"dongle", move || {
-            dongle_task(&state, &dongle_rx);
-        });
-    }
-
-    // Start the combined RPM poller and LED update task
-    {
-        let state = state.clone();
-        thread_util::spawn_named(c"rpm_led", move || {
-            rpm_led_task(&state, led_controller, rpm_rx);
-        });
-    }
-
-    // Start web server
-    {
-        let state = state.clone();
-        let ap_hostname_clone = ap_hostname.clone();
-        thread_util::spawn_named(c"web_srv", move || {
-            if let Err(e) = web_server::start_server(&state, Some(ap_hostname_clone)) {
-                error!("Web server error: {e:?}");
-            }
-        });
-    }
-
-    info!("Web server started - configuration available at http://{}", ap_ip_info.ip);
+    spawn_background_tasks(&state, led_controller, sse_rx, dongle_rx, rpm_rx, ap_hostname);
 
     // Start mDNS for local discovery (tachtalk.local)
     let _mdns = setup_mdns();
 
-    // Start OBD2 proxy
-    {
-        let state = state.clone();
-        thread_util::spawn_named(c"obd2_proxy", move || {
-            let proxy = Obd2Proxy::new(state);
-            if let Err(e) = proxy.run() {
-                error!("OBD2 proxy error: {e:?}");
-            }
-        });
-    }
-    info!("OBD2 proxy started");
-
-    // Start WiFi connection manager
-    {
-        let state = state.clone();
-        thread_util::spawn_named(c"wifi_mgr", move || {
-            wifi_connection_manager(&state);
-        });
-    }
-
     info!("All systems running!");
 
-    // CPU usage monitoring
+    // Main loop - CPU usage monitoring
     let mut cpu_snapshots = std::collections::HashMap::new();
     let mut cpu_total = 0u64;
 
-    // Main loop - keep alive and print CPU stats
     loop {
-        // Sleep for 5 seconds (5 iterations of 1s)
         for _ in 0..5 {
             FreeRtos::delay_ms(1000);
         }
