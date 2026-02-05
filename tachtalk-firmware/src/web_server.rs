@@ -308,10 +308,10 @@ pub fn start_server(state: &Arc<State>, ap_hostname: Option<String>) -> Result<(
         info!("HTTP: GET /api/network");
         let wifi = state_clone.wifi.lock().unwrap();
         
-        let sta_netif = wifi.wifi().sta_netif();
+        let sta_netif = wifi.sta_netif();
         let ip_info = sta_netif.get_ip_info().ok();
         
-        let mac_bytes = wifi.wifi().get_mac(esp_idf_svc::wifi::WifiDeviceId::Sta).unwrap_or([0u8; 6]);
+        let mac_bytes = wifi.driver().get_mac(esp_idf_svc::wifi::WifiDeviceId::Sta).unwrap_or([0u8; 6]);
         let mac = format!("{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
             mac_bytes[0], mac_bytes[1], mac_bytes[2],
             mac_bytes[3], mac_bytes[4], mac_bytes[5]);
