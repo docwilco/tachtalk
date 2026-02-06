@@ -7,14 +7,18 @@ use log::{debug, error, info, warn};
 use smallvec::SmallVec;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::sync::atomic::Ordering;
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::watchdog::WatchdogHandle;
+use crate::State;
 
 /// Port for the SSE server (separate from main HTTP server)
 pub const SSE_PORT: u16 = 81;
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
+const METRICS_INTERVAL: Duration = Duration::from_secs(2);
 const MAX_SSE_CLIENTS: usize = 3;
 
 /// Message types for SSE server
@@ -28,14 +32,14 @@ pub type SseSender = Sender<SseMessage>;
 pub type SseReceiver = Receiver<SseMessage>;
 
 /// Run the SSE server task
-pub fn sse_server_task(rx: &SseReceiver) {
-    if let Err(e) = run_sse_server(rx) {
+pub fn sse_server_task(rx: &SseReceiver, state: &Arc<State>) {
+    if let Err(e) = run_sse_server(rx, state) {
         error!("SSE server error: {e}");
     }
 }
 
 /// SSE server main loop
-fn run_sse_server(rx: &Receiver<SseMessage>) -> std::io::Result<()> {
+fn run_sse_server(rx: &Receiver<SseMessage>, state: &Arc<State>) -> std::io::Result<()> {
     info!("SSE server starting on port {SSE_PORT}...");
 
     let listener = TcpListener::bind(("0.0.0.0", SSE_PORT))?;
@@ -48,6 +52,7 @@ fn run_sse_server(rx: &Receiver<SseMessage>) -> std::io::Result<()> {
     let mut clients: SmallVec<[TcpStream; MAX_SSE_CLIENTS]> = SmallVec::new();
     let mut current_rpm: Option<u32> = None;
     let mut last_heartbeat = Instant::now();
+    let mut last_metrics = Instant::now();
 
     loop {
         watchdog.feed();
@@ -92,6 +97,24 @@ fn run_sse_server(rx: &Receiver<SseMessage>) -> std::io::Result<()> {
                 info!("SSE: Heartbeat removed {removed} dead clients, {} remaining", clients.len());
             }
             last_heartbeat = Instant::now();
+        }
+
+        // Send metrics periodically
+        if last_metrics.elapsed() >= METRICS_INTERVAL && !clients.is_empty() {
+            let metrics = &state.polling_metrics;
+            let msg = format!(
+                "event: metrics\ndata: {{\"fast_pids\":{},\"slow_pids\":{},\"reqs_per_sec\":{}}}\n\n",
+                metrics.fast_pid_count.load(Ordering::Relaxed),
+                metrics.slow_pid_count.load(Ordering::Relaxed),
+                metrics.dongle_requests_per_sec.load(Ordering::Relaxed),
+            );
+            let before = clients.len();
+            clients.retain(|client| send_to_client(client, msg.as_bytes()).is_ok());
+            let removed = before - clients.len();
+            if removed > 0 {
+                debug!("SSE: Removed {removed} dead clients during metrics broadcast, {} remaining", clients.len());
+            }
+            last_metrics = Instant::now();
         }
 
         // Process incoming messages

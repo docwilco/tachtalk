@@ -3,6 +3,7 @@ use embedded_svc::http::Method;
 use embedded_svc::io::Write;
 use esp_idf_svc::http::server::{Configuration, EspHttpServer};
 use log::{debug, error, info, warn};
+use std::sync::atomic::Ordering;
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
 use std::sync::Arc;
@@ -99,17 +100,16 @@ struct DebugInfo {
     min_free_heap: u32,
 }
 
-/// Benchmark result response
+/// Polling metrics response
 #[derive(serde::Serialize)]
-struct BenchmarkResult {
-    /// Total duration in milliseconds
-    duration_ms: u64,
-    /// Number of successful RPM queries
-    successful_queries: u32,
-    /// Number of failed queries
-    failed_queries: u32,
-    /// Queries per second
-    queries_per_second: f64,
+struct PollingMetricsResponse {
+    fast_pid_count: u32,
+    slow_pid_count: u32,
+    promotions: u32,
+    demotions: u32,
+    removals: u32,
+    dongle_requests_total: u32,
+    dongle_requests_per_sec: u32,
 }
 
 // HTML split into two parts to inject SSE_PORT without runtime allocation
@@ -482,50 +482,23 @@ pub fn start_server(state: &Arc<State>, ap_hostname: Option<String>, ap_ip: Ipv4
         Ok(())
     })?;
 
-    // POST benchmark endpoint - run RPM query benchmark
+    // GET polling metrics endpoint
     let state_clone = state.clone();
-    server.fn_handler("/api/benchmark", Method::Post, move |req| -> Result<(), esp_idf_svc::io::EspIOError> {
-        info!("HTTP: POST /api/benchmark - Starting 10-second RPM benchmark");
+    server.fn_handler("/api/metrics", Method::Get, move |req| -> Result<(), esp_idf_svc::io::EspIOError> {
+        debug!("HTTP: GET /api/metrics");
         
-        let timeout = {
-            let cfg = state_clone.config.lock().unwrap();
-            std::time::Duration::from_millis(cfg.obd2_timeout_ms)
+        let metrics = &state_clone.polling_metrics;
+        let response_data = PollingMetricsResponse {
+            fast_pid_count: metrics.fast_pid_count.load(Ordering::Relaxed),
+            slow_pid_count: metrics.slow_pid_count.load(Ordering::Relaxed),
+            promotions: metrics.promotions.load(Ordering::Relaxed),
+            demotions: metrics.demotions.load(Ordering::Relaxed),
+            removals: metrics.removals.load(Ordering::Relaxed),
+            dongle_requests_total: metrics.dongle_requests_total.load(Ordering::Relaxed),
+            dongle_requests_per_sec: metrics.dongle_requests_per_sec.load(Ordering::Relaxed),
         };
         
-        let start = std::time::Instant::now();
-        let benchmark_duration = std::time::Duration::from_secs(10);
-        let mut successful_queries: u32 = 0;
-        let mut failed_queries: u32 = 0;
-        
-        // Run benchmark for 10 seconds
-        while start.elapsed() < benchmark_duration {
-            match crate::obd2::send_command(&state_clone.dongle_tx, b"010C", timeout) {
-                Ok(_) => successful_queries += 1,
-                Err(_) => failed_queries += 1,
-            }
-        }
-        
-        // Truncation is acceptable: benchmark duration is 10 seconds, well under u64::MAX milliseconds
-        #[allow(clippy::cast_possible_truncation)]
-        let duration_ms = start.elapsed().as_millis() as u64;
-        // Precision loss is acceptable for human-readable benchmark statistics
-        #[allow(clippy::cast_precision_loss)]
-        let queries_per_second = if duration_ms > 0 {
-            f64::from(successful_queries) * 1000.0 / (duration_ms as f64)
-        } else {
-            0.0
-        };
-        
-        info!("Benchmark complete: {successful_queries} successful, {failed_queries} failed, {queries_per_second:.2} queries/sec");
-        
-        let result = BenchmarkResult {
-            duration_ms,
-            successful_queries,
-            failed_queries,
-            queries_per_second,
-        };
-        
-        let json = serde_json::to_string(&result).unwrap_or_else(|_| r#"{"error":"serialization failed"}"#.to_string());
+        let json = serde_json::to_string(&response_data).unwrap_or_else(|_| r#"{"error":"serialization failed"}"#.to_string());
         let mut response = req.into_ok_response()?;
         response.write_all(json.as_bytes())?;
         Ok(())

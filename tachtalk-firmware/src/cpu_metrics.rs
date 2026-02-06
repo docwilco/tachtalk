@@ -1,4 +1,4 @@
-//! CPU usage monitoring using FreeRTOS runtime stats
+//! CPU usage monitoring using FreeRTOS runtime metrics
 //!
 //! Tracks per-task CPU time deltas and prints usage percentages.
 

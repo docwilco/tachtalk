@@ -1,30 +1,259 @@
-//! OBD2 proxy with dedicated dongle task.
+//! OBD2 proxy with proactive PID caching.
 //!
 //! Architecture:
-//! - Dongle task: owns the single TCP connection to the OBD2 dongle, handles
-//!   connection setup, reconnection, and processes OBD2 data commands
-//! - Proxy server: accepts client connections, forwards OBD2 commands via channel
+//! - Dongle task: owns the TCP connection, polls PIDs based on fast/slow queues
+//! - Cache manager task: receives responses, updates per-client caches, manages PID priority
+//! - Proxy server: accepts client connections, reads from cache
 //! - AT commands (ATE0, ATZ, etc.) are handled locally per connection using `tachtalk_elm327`
 
 use anyhow::{Context, Result};
 use log::{debug, error, info, warn};
 use smallvec::SmallVec;
+use std::collections::HashMap;
 use std::io::{BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::Arc;
-
-use crate::rpm_leds::RpmTaskMessage;
+use std::sync::atomic::Ordering;
+use std::sync::mpsc::{Receiver, Sender};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
 use tachtalk_elm327_lib::ClientState;
 
+use crate::rpm_leds::RpmTaskMessage;
 use crate::watchdog::WatchdogHandle;
 use crate::State;
 
-pub const IDLE_POLL_INTERVAL_MS: u64 = 100;
-/// How long after a client RPM update before background poller resumes
-pub const CLIENT_ACTIVITY_BACKOFF: Duration = Duration::from_millis(250);
 const RECONNECT_DELAY: Duration = Duration::from_secs(1);
+/// Maintenance interval for checking promotion/demotion/removal
+const MAINTENANCE_INTERVAL: Duration = Duration::from_millis(500);
+/// RPM PID command (always polled)
+const RPM_PID: &[u8] = b"010C";
+
+/// Type alias for small OBD2 command/response buffers
+pub type Obd2Buffer = SmallVec<[u8; 12]>;
+
+/// Supported PID query commands (0100, 0120, 0140, 0160, 0180, 01A0, 01C0, 01E0)
+const SUPPORTED_PID_QUERIES: [&[u8]; 8] = [
+    b"0100", b"0120", b"0140", b"0160", b"0180", b"01A0", b"01C0", b"01E0",
+];
+
+/// Check if a command is a supported PIDs query, returns index (0-7) if so
+fn supported_pids_index(cmd: &[u8]) -> Option<usize> {
+    SUPPORTED_PID_QUERIES
+        .iter()
+        .position(|&q| cmd.eq_ignore_ascii_case(q))
+}
+
+/// Check if a specific PID is supported based on a supported PIDs response.
+///
+/// The response format is "41XX YYYYYYYY" where XX is the base PID (00, 20, 40, ...)
+/// and the 4 bytes form a bitmask for PIDs (base+1) through (base+32).
+///
+/// For example, response to 0100 is "4100..." covering PIDs 01-20,
+/// response to 0120 is "4120..." covering PIDs 21-40, etc.
+///
+/// Returns `false` if the response cannot be parsed or the PID is out of range.
+fn is_pid_supported_in_response(response: &[u8], pid: u8) -> bool {
+    // Parse response to find header and data (format: "41XXYYYYYYYY" - spaces disabled via ATS0)
+    let response_str = String::from_utf8_lossy(response).to_ascii_uppercase();
+
+    // Find "41" and extract the base PID from the next 2 hex chars
+    let Some(header_pos) = response_str.find("41") else {
+        return false;
+    };
+
+    // Need at least 4 chars for header (41XX)
+    if response_str.len() < header_pos + 4 {
+        return false;
+    }
+
+    let base_str = &response_str[header_pos + 2..header_pos + 4];
+    let Ok(base_pid) = u8::from_str_radix(base_str, 16) else {
+        return false;
+    };
+
+    // Check if pid is in range for this response (base+1 to base+0x20)
+    if pid <= base_pid || pid > base_pid.saturating_add(0x20) {
+        return false;
+    }
+
+    // Parse the 4 data bytes after the header
+    let data_bytes = parse_hex_bytes(&response_str[header_pos + 4..]);
+
+    if data_bytes.len() < 4 {
+        return false;
+    }
+
+    // Calculate bit position: PID (base+1) is bit 7 of byte 0, (base+8) is bit 0 of byte 0
+    // (base+9) is bit 7 of byte 1, etc.
+    let offset = pid - base_pid - 1; // 0-indexed offset from base+1
+    let byte_index = offset / 8;
+    let bit_index = 7 - (offset % 8);
+
+    (data_bytes[byte_index as usize] >> bit_index) & 1 == 1
+}
+
+/// Parse up to 4 hex bytes from a string, ignoring any non-hex characters
+fn parse_hex_bytes(s: &str) -> Vec<u8> {
+    let hex_chars: String = s.chars().filter(char::is_ascii_hexdigit).collect();
+    hex_chars
+        .as_bytes()
+        .chunks(2)
+        .take(4)
+        .filter_map(|chunk| {
+            if chunk.len() == 2 {
+                let s = std::str::from_utf8(chunk).ok()?;
+                u8::from_str_radix(s, 16).ok()
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// Normalize an OBD2 command for caching purposes.
+///
+/// Strips trailing " 1" (single response count) since it's equivalent to no count.
+/// Commands with other response counts (e.g., " 2") are kept as-is since they
+/// expect multiple ECU responses.
+fn normalize_obd_command(cmd: &[u8]) -> Obd2Buffer {
+    if cmd.len() >= 2 && cmd.ends_with(b" 1") {
+        cmd[..cmd.len() - 2].into()
+    } else {
+        cmd.into()
+    }
+}
+
+// ============================================================================
+// Cache Types
+// ============================================================================
+
+/// Entry in a per-client PID cache
+pub enum CacheEntry {
+    /// Fresh value ready to be consumed
+    Fresh(Obd2Buffer),
+    /// No value available (consumed or not yet received)
+    Empty,
+    /// Client is waiting for this PID
+    Waiting(oneshot::Sender<()>),
+}
+
+/// Per-client cache of PID values
+pub struct ClientCache {
+    entries: HashMap<Obd2Buffer, CacheEntry>,
+}
+
+impl ClientCache {
+    fn new() -> Self {
+        Self {
+            entries: HashMap::new(),
+        }
+    }
+}
+
+/// Unique identifier for a client
+type ClientId = u64;
+
+/// Priority level for PID polling
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PidPriority {
+    Fast,
+    Slow,
+}
+
+/// Tracking info for a PID
+struct PidInfo {
+    /// Last time any client had to wait for this PID
+    last_waiter_time: Option<Instant>,
+    /// Last time any client consumed this PID
+    last_consumed_time: Option<Instant>,
+    /// Current priority
+    priority: PidPriority,
+    /// Request count since last maintenance (for rate logging)
+    request_count: u32,
+}
+
+// ============================================================================
+// Channel Types
+// ============================================================================
+
+/// Message to cache manager (from dongle task and client handlers)
+pub enum CacheManagerMessage {
+    /// Response from dongle task
+    DongleResponse {
+        /// The PID that was polled
+        pid: Obd2Buffer,
+        /// The response (or error)
+        response: Result<Obd2Buffer, DongleError>,
+    },
+    /// Client registered a waiter for this PID (promote to fast)
+    Waiting(Obd2Buffer),
+    /// Client consumed this PID (None = cache hit, Some = cache miss with wait duration)
+    Consumed {
+        pid: Obd2Buffer,
+        wait_duration: Option<Duration>,
+    },
+    /// Register a new client, returns their cache
+    RegisterClient(oneshot::Sender<(ClientId, Arc<Mutex<ClientCache>>)>),
+    /// Unregister a client
+    UnregisterClient(ClientId),
+}
+
+/// Sender for cache manager messages
+pub type CacheManagerSender = Sender<CacheManagerMessage>;
+
+// ============================================================================
+// Dongle Types
+// ============================================================================
+
+/// Request to the dongle task (for polling control)
+pub enum DongleMessage {
+    /// Add or update a PID's priority
+    SetPidPriority(Obd2Buffer, bool), // (pid, is_fast)
+    /// Remove a PID from polling
+    RemovePid(Obd2Buffer),
+}
+
+pub type DongleSender = Sender<DongleMessage>;
+pub type DongleReceiver = Receiver<DongleMessage>;
+
+/// Errors from the dongle task
+#[derive(Debug, Clone)]
+pub enum DongleError {
+    NotConnected,
+    Timeout,
+    Disconnected,
+    IoError(String),
+}
+
+impl std::fmt::Display for DongleError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotConnected => write!(f, "Not connected to dongle"),
+            Self::Timeout => write!(f, "Dongle timeout"),
+            Self::Disconnected => write!(f, "Dongle disconnected"),
+            Self::IoError(e) => write!(f, "IO error: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for DongleError {}
+
+impl DongleError {
+    /// Convert to ELM327-style error message
+    pub fn to_elm327_error(&self) -> &'static str {
+        match self {
+            Self::NotConnected => "UNABLE TO CONNECT",
+            Self::Timeout => "NO DATA",
+            Self::Disconnected => "CAN ERROR",
+            Self::IoError(_) => "BUS ERROR",
+        }
+    }
+}
+
+// ============================================================================
+// Dongle Connection State
+// ============================================================================
 
 /// State for the dongle connection
 struct DongleState {
@@ -59,11 +288,10 @@ impl DongleState {
                     // Repeat not supported, mark and resend full command
                     info!("Dongle does not support repeat command");
                     self.supports_repeat = Some(false);
-                    // Update last_command before sending (dongle will have this as its last)
                     self.last_command = Some(command.clone());
                     execute_command(&mut self.stream, command, timeout)
                 } else {
-                    // Repeat worked! last_command stays the same (we repeated it)
+                    // Repeat worked! last_command stays the same
                     if self.supports_repeat.is_none() {
                         info!("Dongle supports repeat command");
                         self.supports_repeat = Some(true);
@@ -71,18 +299,16 @@ impl DongleState {
                     repeat_result
                 }
             } else {
-                // Repeat failed with error - clear last_command since we don't
-                // know if dongle processed it
+                // Repeat failed with error - clear last_command
                 self.last_command = None;
                 repeat_result
             }
         } else {
-            // Update last_command before sending (dongle will have this as its last)
+            // Update last_command before sending
             if !command.starts_with(b"AT") {
                 self.last_command = Some(command.clone());
             }
             let result = execute_command(&mut self.stream, command, timeout);
-            // If command failed, clear last_command since we don't know if dongle processed it
             if result.is_err() {
                 self.last_command = None;
             }
@@ -91,67 +317,100 @@ impl DongleState {
     }
 }
 
-/// Type alias for small OBD2 command/response buffers
-pub type Obd2Buffer = SmallVec<[u8; 12]>;
+// ============================================================================
+// Dongle Task
+// ============================================================================
 
-/// Request to the dongle task
-pub struct DongleRequest {
-    /// The OBD2 command to send (without terminator)
-    pub command: Obd2Buffer,
-    /// Channel to send the response back (None = fire-and-forget)
-    pub response_tx: Option<oneshot::Sender<Result<Obd2Buffer, DongleError>>>,
+/// Polling state for the dongle task
+struct PollingState {
+    fast_pids: Vec<Obd2Buffer>,
+    slow_pids: Vec<Obd2Buffer>,
+    fast_index: usize,
+    slow_index: usize,
+    last_slow_poll: Instant,
 }
 
-/// Shared context for processing OBD2 commands (reduces parameter count)
-struct CommandContext<'a> {
-    state: &'a Arc<State>,
-}
+impl PollingState {
+    fn new() -> Self {
+        // Always start with RPM in fast queue
+        Self {
+            fast_pids: vec![RPM_PID.into()],
+            slow_pids: Vec::new(),
+            fast_index: 0,
+            slow_index: 0,
+            last_slow_poll: Instant::now(),
+        }
+    }
 
-/// Errors from the dongle task
-#[derive(Debug, Clone)]
-pub enum DongleError {
-    NotConnected,
-    Timeout,
-    Disconnected,
-    IoError(String),
-}
+    fn next_fast_pid(&mut self) -> Option<Obd2Buffer> {
+        if self.fast_pids.is_empty() {
+            return None;
+        }
+        let pid = self.fast_pids[self.fast_index].clone();
+        self.fast_index = (self.fast_index + 1) % self.fast_pids.len();
+        Some(pid)
+    }
 
-impl std::fmt::Display for DongleError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::NotConnected => write!(f, "Not connected to dongle"),
-            Self::Timeout => write!(f, "Dongle timeout"),
-            Self::Disconnected => write!(f, "Dongle disconnected"),
-            Self::IoError(e) => write!(f, "IO error: {e}"),
+    fn next_slow_pid(&mut self) -> Option<Obd2Buffer> {
+        if self.slow_pids.is_empty() {
+            return None;
+        }
+        let pid = self.slow_pids[self.slow_index].clone();
+        self.slow_index = (self.slow_index + 1) % self.slow_pids.len();
+        Some(pid)
+    }
+
+    fn set_pid_priority(&mut self, pid: Obd2Buffer, is_fast: bool) {
+        // Remove from both lists first
+        self.fast_pids.retain(|p| p != &pid);
+        self.slow_pids.retain(|p| p != &pid);
+
+        // Add to appropriate list
+        if is_fast {
+            self.fast_pids.push(pid);
+        } else {
+            self.slow_pids.push(pid);
+        }
+
+        self.fix_indices();
+    }
+
+    fn remove_pid(&mut self, pid: &Obd2Buffer) {
+        self.fast_pids.retain(|p| p != pid);
+        self.slow_pids.retain(|p| p != pid);
+        self.fix_indices();
+    }
+
+    fn fix_indices(&mut self) {
+        if self.fast_pids.is_empty() {
+            self.fast_index = 0;
+        } else {
+            self.fast_index %= self.fast_pids.len();
+        }
+        if self.slow_pids.is_empty() {
+            self.slow_index = 0;
+        } else {
+            self.slow_index %= self.slow_pids.len();
         }
     }
 }
 
-impl std::error::Error for DongleError {}
-
-impl DongleError {
-    /// Convert to ELM327-style error message
-    fn to_elm327_error(&self) -> &'static str {
-        match self {
-            Self::NotConnected => "UNABLE TO CONNECT",
-            Self::Timeout => "NO DATA",
-            Self::Disconnected => "CAN ERROR",
-            Self::IoError(_) => "BUS ERROR",
-        }
-    }
-}
-
-pub type DongleSender = Sender<DongleRequest>;
-pub type DongleReceiver = Receiver<DongleRequest>;
-
-/// Run the dongle task - owns the connection and processes requests
-pub fn dongle_task(state: &Arc<State>, rx: &DongleReceiver) {
-    use std::sync::atomic::Ordering;
-    
+/// Run the dongle task - owns the connection and polls PIDs
+#[allow(clippy::too_many_lines)]
+pub fn dongle_task(
+    state: &Arc<State>,
+    cache_manager_tx: &CacheManagerSender,
+    control_rx: &DongleReceiver,
+) {
     info!("OBD2 dongle task starting...");
 
     let mut connection: Option<DongleState> = None;
     let mut last_connect_attempt: Option<Instant> = None;
+    let mut polling = PollingState::new();
+
+    // For requests/sec calculation
+    let mut requests_this_second: u32 = 0;
+    let mut last_rate_update = Instant::now();
 
     let watchdog = WatchdogHandle::register("obd2_dongle");
 
@@ -161,14 +420,27 @@ pub fn dongle_task(state: &Arc<State>, rx: &DongleReceiver) {
         watchdog.feed();
 
         // Get config values
-        let (timeout, dongle_ip, dongle_port) = {
+        let (timeout, dongle_ip, dongle_port, slow_poll_interval) = {
             let cfg = state.config.lock().unwrap();
             (
                 Duration::from_millis(cfg.obd2_timeout_ms),
                 cfg.obd2.dongle_ip.clone(),
                 cfg.obd2.dongle_port,
+                Duration::from_millis(cfg.obd2.slow_poll_interval_ms),
             )
         };
+
+        // Process control messages (non-blocking)
+        while let Ok(msg) = control_rx.try_recv() {
+            match msg {
+                DongleMessage::SetPidPriority(pid, is_fast) => {
+                    polling.set_pid_priority(pid, is_fast);
+                }
+                DongleMessage::RemovePid(pid) => {
+                    polling.remove_pid(&pid);
+                }
+            }
+        }
 
         // Try to ensure we have a connection (with reconnect delay)
         if connection.is_none() {
@@ -178,11 +450,10 @@ pub fn dongle_task(state: &Arc<State>, rx: &DongleReceiver) {
             };
             if should_try {
                 last_connect_attempt = Some(Instant::now());
-                if let Some((dongle_state, local_addr, remote_addr)) = 
-                    try_connect(&dongle_ip, dongle_port, timeout, &watchdog) 
+                if let Some((dongle_state, local_addr, remote_addr)) =
+                    try_connect(&dongle_ip, dongle_port, timeout, &watchdog, state)
                 {
                     connection = Some(dongle_state);
-                    // Update shared connection status and TCP info
                     state.dongle_connected.store(true, Ordering::Relaxed);
                     *state.dongle_tcp_info.lock().unwrap() = Some((local_addr, remote_addr));
                 } else {
@@ -192,69 +463,378 @@ pub fn dongle_task(state: &Arc<State>, rx: &DongleReceiver) {
             }
         }
 
-        // Process requests with a timeout so we can check connection health
-        match rx.recv_timeout(Duration::from_millis(100)) {
-            Ok(request) => {
-                debug!(
-                    "Dongle request: {:?}",
-                    String::from_utf8_lossy(&request.command)
-                );
-                let result = if let Some(ref mut dongle_state) = connection {
-                    dongle_state.execute_with_repeat(&request.command, timeout)
-                } else {
-                    Err(DongleError::NotConnected)
-                };
+        // Poll PIDs if connected
+        if let Some(ref mut dongle_state) = connection {
+            let mut polled = false;
 
-                // If we got a disconnect error, drop the connection
-                if matches!(
-                    result,
-                    Err(DongleError::Disconnected | DongleError::IoError(_))
-                ) {
-                    warn!("Dongle connection lost, will reconnect");
-                    connection = None;
-                    state.dongle_connected.store(false, Ordering::Relaxed);
-                    *state.dongle_tcp_info.lock().unwrap() = None;
-                }
+            // Always try to poll a fast PID
+            if let Some(pid) = polling.next_fast_pid() {
+                let result = dongle_state.execute_with_repeat(&pid, timeout);
+                handle_connection_error(&result, &mut connection, state);
 
-                if let Err(ref e) = result {
-                    debug!("Dongle response error: {e}");
-                } else {
-                    debug!("Dongle response: {} bytes", result.as_ref().unwrap().len());
+                let _ = cache_manager_tx.send(CacheManagerMessage::DongleResponse {
+                    pid: pid.clone(),
+                    response: result,
+                });
 
-                    // Extract RPM from successful 010C responses and send to rpm_led task
-                    if request.command.starts_with(b"010C") {
-                        if let Some(rpm) =
-                            tachtalk_elm327_lib::extract_rpm_from_response(result.as_ref().unwrap())
-                        {
-                            debug!("Dongle extracted RPM: {rpm}");
-                            let _ = state.rpm_tx.send(RpmTaskMessage::Rpm(rpm));
-                        }
+                requests_this_second += 1;
+                state
+                    .polling_metrics
+                    .dongle_requests_total
+                    .fetch_add(1, Ordering::Relaxed);
+                polled = true;
+            }
+
+            // Poll slow PID if interval elapsed
+            if polling.last_slow_poll.elapsed() >= slow_poll_interval {
+                if let Some(pid) = polling.next_slow_pid() {
+                    // Re-check connection after potential fast poll failure
+                    if let Some(ref mut dongle_state) = connection {
+                        let result = dongle_state.execute_with_repeat(&pid, timeout);
+                        handle_connection_error(&result, &mut connection, state);
+
+                        let _ = cache_manager_tx.send(CacheManagerMessage::DongleResponse {
+                            pid: pid.clone(),
+                            response: result,
+                        });
+
+                        requests_this_second += 1;
+                        state
+                            .polling_metrics
+                            .dongle_requests_total
+                            .fetch_add(1, Ordering::Relaxed);
                     }
                 }
+                polling.last_slow_poll = Instant::now();
+            }
 
-                // Send response if caller is waiting (fire-and-forget has None)
-                if let Some(response_tx) = request.response_tx {
-                    let _ = response_tx.send(result);
-                }
-            }
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                // No request, just keep the loop alive
-            }
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                info!("Dongle task channel closed, shutting down");
-                break;
-            }
+            // RPM is always in fast queue, so we should always poll something
+            debug_assert!(
+                polled,
+                "Expected to poll at least RPM, but fast_pids is empty"
+            );
+        } else {
+            // Not connected, sleep before retry
+            std::thread::sleep(Duration::from_millis(100));
+        }
+
+        // Update requests/sec counter
+        if last_rate_update.elapsed() >= Duration::from_secs(1) {
+            state
+                .polling_metrics
+                .dongle_requests_per_sec
+                .store(requests_this_second, Ordering::Relaxed);
+            requests_this_second = 0;
+            last_rate_update = Instant::now();
+        }
+
+        // Update PID counts and lists
+        state.polling_metrics.fast_pid_count.store(
+            polling.fast_pids.len().try_into().unwrap_or(u32::MAX),
+            Ordering::Relaxed,
+        );
+        state.polling_metrics.slow_pid_count.store(
+            polling.slow_pids.len().try_into().unwrap_or(u32::MAX),
+            Ordering::Relaxed,
+        );
+        if let Ok(mut fast) = state.polling_metrics.fast_pids.lock() {
+            *fast = polling
+                .fast_pids
+                .iter()
+                .map(|p| String::from_utf8_lossy(p).into_owned())
+                .collect();
+        }
+        if let Ok(mut slow) = state.polling_metrics.slow_pids.lock() {
+            *slow = polling
+                .slow_pids
+                .iter()
+                .map(|p| String::from_utf8_lossy(p).into_owned())
+                .collect();
         }
     }
 }
 
+fn handle_connection_error(
+    result: &Result<Obd2Buffer, DongleError>,
+    connection: &mut Option<DongleState>,
+    state: &Arc<State>,
+) {
+    if matches!(
+        result,
+        Err(DongleError::Disconnected | DongleError::IoError(_))
+    ) {
+        warn!("Dongle connection lost, will reconnect");
+        *connection = None;
+        state.dongle_connected.store(false, Ordering::Relaxed);
+        *state.dongle_tcp_info.lock().unwrap() = None;
+    }
+}
+
+// ============================================================================
+// Cache Manager Task
+// ============================================================================
+
+/// Run the cache manager task
+#[allow(clippy::too_many_lines)]
+pub fn cache_manager_task(
+    state: &Arc<State>,
+    manager_rx: &Receiver<CacheManagerMessage>,
+    dongle_tx: &DongleSender,
+) {
+    info!("Cache manager task starting...");
+
+    let watchdog = WatchdogHandle::register("cache_manager");
+
+    let mut clients: HashMap<ClientId, Arc<Mutex<ClientCache>>> = HashMap::new();
+    let mut pid_info: HashMap<Obd2Buffer, PidInfo> = HashMap::new();
+    let mut next_client_id: ClientId = 1;
+    let mut last_maintenance = Instant::now();
+
+    // Cache hit/miss stats
+    let mut cache_hits: u32 = 0;
+    let mut cache_misses: u32 = 0;
+    let mut total_wait_time = Duration::ZERO;
+
+    // Initialize RPM PID info
+    pid_info.insert(
+        RPM_PID.into(),
+        PidInfo {
+            last_waiter_time: None,
+            last_consumed_time: Some(Instant::now()),
+            priority: PidPriority::Fast,
+            request_count: 0,
+        },
+    );
+
+    info!("Cache manager task started");
+
+    loop {
+        watchdog.feed();
+
+        // Process messages with timeout (wakes immediately on message, or after maintenance interval)
+        match manager_rx.recv_timeout(MAINTENANCE_INTERVAL) {
+            Ok(CacheManagerMessage::DongleResponse { pid, response }) => {
+                if let Ok(ref data) = response {
+                    // Update all client caches
+                    for client_cache in clients.values() {
+                        let mut cache_guard = client_cache.lock().unwrap();
+                        match cache_guard.entries.get_mut(&pid) {
+                            Some(CacheEntry::Waiting(_)) => {
+                                // Take the sender, replace with Fresh, then send wake
+                                let old = std::mem::replace(
+                                    cache_guard.entries.get_mut(&pid).unwrap(),
+                                    CacheEntry::Fresh(data.clone()),
+                                );
+                                if let CacheEntry::Waiting(tx) = old {
+                                    let _ = tx.send(());
+                                }
+                            }
+                            Some(entry) => {
+                                *entry = CacheEntry::Fresh(data.clone());
+                            }
+                            None => {
+                                cache_guard
+                                    .entries
+                                    .insert(pid.clone(), CacheEntry::Fresh(data.clone()));
+                            }
+                        }
+                    }
+
+                    // Extract RPM and send to LED task
+                    if pid.as_slice() == RPM_PID {
+                        if let Some(rpm) = tachtalk_elm327_lib::extract_rpm_from_response(data) {
+                            debug!("Cache manager extracted RPM: {rpm}");
+                            let _ = state.rpm_tx.send(RpmTaskMessage::Rpm(rpm));
+                            *state.shared_rpm.lock().unwrap() = Some(rpm);
+                        }
+                    }
+                }
+            }
+            Ok(CacheManagerMessage::Waiting(pid)) => {
+                // Update or create PID info
+                let is_new = !pid_info.contains_key(&pid);
+                let info = pid_info.entry(pid.clone()).or_insert_with(|| PidInfo {
+                    last_waiter_time: None,
+                    last_consumed_time: None,
+                    priority: PidPriority::Fast,
+                    request_count: 0,
+                });
+                info.last_waiter_time = Some(Instant::now());
+
+                // Promote to fast if it was slow
+                if info.priority == PidPriority::Slow {
+                    info.priority = PidPriority::Fast;
+                    state
+                        .polling_metrics
+                        .promotions
+                        .fetch_add(1, Ordering::Relaxed);
+                    info!("PID {:?}: promoted to fast", String::from_utf8_lossy(&pid));
+                    let _ = dongle_tx.send(DongleMessage::SetPidPriority(pid.clone(), true));
+                } else if is_new {
+                    // New PID
+                    info!("PID {:?}: added to fast queue", String::from_utf8_lossy(&pid));
+                    let _ = dongle_tx.send(DongleMessage::SetPidPriority(pid.clone(), true));
+                }
+            }
+            Ok(CacheManagerMessage::Consumed { pid, wait_duration }) => {
+                if let Some(info) = pid_info.get_mut(&pid) {
+                    info.last_consumed_time = Some(Instant::now());
+                    info.request_count += 1;
+                }
+                if let Some(duration) = wait_duration {
+                    cache_misses += 1;
+                    total_wait_time += duration;
+                } else {
+                    cache_hits += 1;
+                }
+            }
+            Ok(CacheManagerMessage::RegisterClient(reply_tx)) => {
+                let id = next_client_id;
+                next_client_id += 1;
+                let cache = Arc::new(Mutex::new(ClientCache::new()));
+                clients.insert(id, cache.clone());
+                let _ = reply_tx.send((id, cache));
+                debug!("Registered client {id}");
+            }
+            Ok(CacheManagerMessage::UnregisterClient(id)) => {
+                clients.remove(&id);
+                debug!("Unregistered client {id}");
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                // Normal timeout, continue to maintenance
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                error!("Cache manager channel disconnected, exiting");
+                break;
+            }
+        }
+
+        // Periodic maintenance: check promotion/demotion/removal
+        if last_maintenance.elapsed() >= MAINTENANCE_INTERVAL {
+            let (fast_demotion_ms, pid_inactive_removal_ms) = {
+                let cfg = state.config.lock().unwrap();
+                (
+                    Duration::from_millis(cfg.obd2.fast_demotion_ms),
+                    Duration::from_millis(cfg.obd2.pid_inactive_removal_ms),
+                )
+            };
+
+            let mut pids_to_remove = Vec::new();
+            let mut pids_to_demote = Vec::new();
+
+            for (pid, info) in &mut pid_info {
+                // Skip RPM - always fast, never removed
+                if pid.as_slice() == RPM_PID {
+                    continue;
+                }
+
+                // Check removal: no recent consumption AND no recent waiters
+                // (need both conditions to handle newly added PIDs that haven't been polled yet)
+                let no_recent_consumption = info
+                    .last_consumed_time
+                    .map_or(true, |t| t.elapsed() > pid_inactive_removal_ms);
+                let no_recent_waiters = info
+                    .last_waiter_time
+                    .map_or(true, |t| t.elapsed() > pid_inactive_removal_ms);
+                if no_recent_consumption && no_recent_waiters {
+                    pids_to_remove.push(pid.clone());
+                    continue;
+                }
+
+                // Check demotion (no waiters recently)
+                if info.priority == PidPriority::Fast {
+                    let should_demote = info
+                        .last_waiter_time
+                        .map_or(true, |t| t.elapsed() > fast_demotion_ms);
+                    if should_demote {
+                        pids_to_demote.push(pid.clone());
+                    }
+                }
+            }
+
+            // Demote PIDs
+            for pid in pids_to_demote {
+                if let Some(info) = pid_info.get_mut(&pid) {
+                    info.priority = PidPriority::Slow;
+                }
+                state
+                    .polling_metrics
+                    .demotions
+                    .fetch_add(1, Ordering::Relaxed);
+                info!("PID {:?}: demoted to slow", String::from_utf8_lossy(&pid));
+                let _ = dongle_tx.send(DongleMessage::SetPidPriority(pid, false));
+            }
+
+            // Remove inactive PIDs
+            for pid in pids_to_remove {
+                pid_info.remove(&pid);
+                state
+                    .polling_metrics
+                    .removals
+                    .fetch_add(1, Ordering::Relaxed);
+                info!("PID {:?}: removed (inactive)", String::from_utf8_lossy(&pid));
+                let _ = dongle_tx.send(DongleMessage::RemovePid(pid));
+            }
+
+            // Log client request rates and reset counters
+            // Values reset every MAINTENANCE_INTERVAL (500ms), so they stay small enough
+            // that u32 -> f32 precision loss is irrelevant
+            #[allow(clippy::cast_precision_loss)]
+            let elapsed_secs = last_maintenance.elapsed().as_secs_f32();
+            let mut rates: Vec<_> = pid_info
+                .iter_mut()
+                .filter(|(_, info)| info.request_count > 0)
+                .map(|(pid, info)| {
+                    #[allow(clippy::cast_precision_loss)]
+                    let rate = info.request_count as f32 / elapsed_secs;
+                    let pid_str = String::from_utf8_lossy(pid).to_string();
+                    info.request_count = 0;
+                    (pid_str, rate)
+                })
+                .collect();
+            rates.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            if !rates.is_empty() {
+                let rate_strs: Vec<_> = rates.iter().map(|(p, r)| format!("{p}:{r:.1}")).collect();
+                info!("Client req/s: {}", rate_strs.join(", "));
+            }
+
+            // Log cache hit/miss stats
+            let total_requests = cache_hits + cache_misses;
+            if total_requests > 0 {
+                #[allow(clippy::cast_precision_loss)]
+                let hit_rate = 100.0 * cache_hits as f32 / total_requests as f32;
+                #[allow(clippy::cast_precision_loss)]
+                let avg_wait_ms = if cache_misses > 0 {
+                    total_wait_time.as_secs_f32() * 1000.0 / cache_misses as f32
+                } else {
+                    0.0
+                };
+                info!(
+                    "Cache: {cache_hits} hits, {cache_misses} misses ({hit_rate:.1}% hit rate), avg wait {avg_wait_ms:.1}ms"
+                );
+            }
+            cache_hits = 0;
+            cache_misses = 0;
+            total_wait_time = Duration::ZERO;
+
+            last_maintenance = Instant::now();
+        }
+    }
+}
+
+// ============================================================================
+// Helper Functions
+// ============================================================================
+
 /// Try to connect to the dongle and initialize it
-/// Returns (`DongleState`, `local_addr`, `remote_addr`) on success
+/// Attempt to connect to the OBD2 dongle and initialize it
+#[allow(clippy::too_many_lines)]
 fn try_connect(
     dongle_ip: &str,
     dongle_port: u16,
     timeout: Duration,
     watchdog: &WatchdogHandle,
+    state: &Arc<State>,
 ) -> Option<(DongleState, SocketAddr, SocketAddr)> {
     info!(
         "Connecting to OBD2 dongle at {dongle_ip}:{dongle_port} (timeout: {}ms)",
@@ -270,11 +850,9 @@ fn try_connect(
         }
     };
 
-    // Get socket addresses before any potential failures
     let local_addr = stream.local_addr().ok()?;
     let remote_addr = stream.peer_addr().ok()?;
 
-    // Feed watchdog after potentially long connect timeout
     watchdog.feed();
 
     if let Err(e) = stream.set_read_timeout(Some(timeout)) {
@@ -288,13 +866,13 @@ fn try_connect(
 
     let mut stream = stream;
 
-    // Initialize the dongle - disable echo, set protocol auto
+    // Initialize the dongle
     let init_commands = [
-        b"ATZ\r".as_slice(),   // Reset
-        b"ATE0\r".as_slice(),  // Echo off
-        b"ATL0\r".as_slice(),  // Linefeeds off
-        b"ATS0\r".as_slice(),  // Spaces off (compact responses)
-        b"ATSP0\r".as_slice(), // Protocol auto
+        b"ATZ\r".as_slice(),
+        b"ATE0\r".as_slice(),
+        b"ATL0\r".as_slice(),
+        b"ATS0\r".as_slice(),
+        b"ATSP0\r".as_slice(),
     ];
 
     for cmd in init_commands {
@@ -303,19 +881,147 @@ fn try_connect(
             error!("Failed to send init command: {e}");
             return None;
         }
-        // Read and discard the response
         let mut buf = [0u8; 256];
         std::thread::sleep(Duration::from_millis(100));
         let _ = stream.read(&mut buf);
     }
 
+    info!("Connected to OBD2 dongle, querying supported PIDs...");
+
+    // Query supported PIDs and store in state
+    let mut supported_pids_guard = state.supported_pids.lock().unwrap();
+    for (idx, query) in SUPPORTED_PID_QUERIES.iter().enumerate() {
+        watchdog.feed();
+        match execute_command(&mut stream, query, timeout) {
+            Ok(response) => {
+                debug!(
+                    "Supported PIDs query {:?}: {:?}",
+                    String::from_utf8_lossy(query),
+                    String::from_utf8_lossy(&response)
+                );
+                supported_pids_guard[idx] = Some(response);
+            }
+            Err(e) => {
+                debug!(
+                    "Supported PIDs query {:?} failed: {e}",
+                    String::from_utf8_lossy(query)
+                );
+                supported_pids_guard[idx] = None;
+            }
+        }
+    }
+    drop(supported_pids_guard);
+
+    // Test multi-PID query support by requesting RPM (0C) and vehicle speed (0D) together
+    // Only test if enabled in config and both PIDs are supported according to the 0100 response
+    if state.config.lock().unwrap().obd2.test_multi_pid {
+        info!("Testing multi-PID query support...");
+        watchdog.feed();
+        let supports_multi_pid =
+            if let Some(supported_0100) = &state.supported_pids.lock().unwrap()[0] {
+                // Check if PIDs 0C and 0D are supported in the 0100 bitmask
+                // Response format: "41 00 XX XX XX XX" - we need to parse the 4 data bytes
+                let pids_0c_0d_supported = is_pid_supported_in_response(supported_0100, 0x0C)
+                    && is_pid_supported_in_response(supported_0100, 0x0D);
+
+                if pids_0c_0d_supported {
+                    match execute_command(&mut stream, b"010C0D", timeout) {
+                        Ok(response) => {
+                            // Multi-PID responses can be:
+                            // 1. Separate headers: "410CXXXX410DYY" (each PID has its own 41 prefix)
+                            // 2. Concatenated: "410CXXXX0DYY" (only first PID has header)
+                            // Either way, a successful multi-PID response will have 410C followed
+                            // by RPM data (2 bytes = 4 hex chars), then 0D data somewhere after
+                            let response_str =
+                                String::from_utf8_lossy(&response).to_ascii_uppercase();
+                            let has_rpm = response_str.contains("410C");
+
+                            // After 410C there should be 4 hex chars of RPM data, then either
+                            // "410D" (separate) or "0D" (concatenated) followed by speed data
+                            let has_speed = if let Some(pos) = response_str.find("410C") {
+                                let after_rpm = &response_str[pos + 4..]; // skip "410C"
+                                // RPM is 2 bytes = 4 hex chars, then look for 0D or 410D
+                                after_rpm.len() >= 4 && {
+                                    let after_rpm_data = &after_rpm[4..]; // skip RPM data
+                                    after_rpm_data.starts_with("410D")
+                                        || after_rpm_data.starts_with("0D")
+                                }
+                            } else {
+                                false
+                            };
+
+                            let supported = has_rpm && has_speed;
+                            if supported {
+                                info!("ECU supports multi-PID queries");
+
+                                // Test if repeat command works with multi-PID queries
+                                match execute_command(&mut stream, b"1", timeout) {
+                                    Ok(repeat_response) => {
+                                        let repeat_str =
+                                            String::from_utf8_lossy(&repeat_response)
+                                                .to_ascii_uppercase();
+                                        // Same detection logic for repeat response
+                                        let repeat_valid =
+                                            if let Some(pos) = repeat_str.find("410C") {
+                                                let after_rpm = &repeat_str[pos + 4..];
+                                                after_rpm.len() >= 4 && {
+                                                    let after_rpm_data = &after_rpm[4..];
+                                                    after_rpm_data.starts_with("410D")
+                                                        || after_rpm_data.starts_with("0D")
+                                                }
+                                            } else {
+                                                false
+                                            };
+                                        if repeat_valid {
+                                            info!("Repeat command works with multi-PID queries");
+                                        } else if repeat_str.contains('?') {
+                                            info!("Repeat command not supported");
+                                        } else {
+                                            info!(
+                                            "Repeat command gave unexpected response for multi-PID: {repeat_str:?}"
+                                        );
+                                        }
+                                    }
+                                    Err(e) => {
+                                        info!("Repeat command test failed: {e}");
+                                    }
+                                }
+                            } else {
+                                info!(
+                                    "ECU does not support multi-PID queries (response: {response_str:?})"
+                                );
+                            }
+                            supported
+                        }
+                        Err(e) => {
+                            info!("Multi-PID query test failed: {e}, assuming not supported");
+                            false
+                        }
+                    }
+                } else {
+                    info!("PIDs 0C and/or 0D not supported, skipping multi-PID test");
+                    false
+                }
+            } else {
+                info!("No 0100 response available, skipping multi-PID test");
+                false
+            };
+        state
+            .supports_multi_pid
+            .store(supports_multi_pid, Ordering::Relaxed);
+    }
+
     info!("Connected to OBD2 dongle");
 
-    Some((DongleState {
-        stream,
-        supports_repeat: None, // Will be tested lazily on first repeat opportunity
-        last_command: None,
-    }, local_addr, remote_addr))
+    Some((
+        DongleState {
+            stream,
+            supports_repeat: None,
+            last_command: None,
+        },
+        local_addr,
+        remote_addr,
+    ))
 }
 
 /// Execute a command on the dongle and return the response
@@ -324,7 +1030,6 @@ fn execute_command(
     command: &[u8],
     timeout: Duration,
 ) -> Result<Obd2Buffer, DongleError> {
-    // Send command with carriage return
     let mut cmd_with_cr: Obd2Buffer = command.into();
     if !cmd_with_cr.ends_with(b"\r") {
         cmd_with_cr.push(b'\r');
@@ -339,7 +1044,6 @@ fn execute_command(
         .write_all(&cmd_with_cr)
         .map_err(|e| DongleError::IoError(e.to_string()))?;
 
-    // Read response
     let mut buffer = [0u8; 64];
     let mut response = Obd2Buffer::new();
     let start = Instant::now();
@@ -350,7 +1054,6 @@ fn execute_command(
             Ok(n) => {
                 response.extend_from_slice(&buffer[..n]);
                 debug!("Read {} bytes from dongle, total: {}", n, response.len());
-                // Check if we have a complete response (ends with >)
                 if response.contains(&b'>') {
                     debug!(
                         "Complete response: {:?}",
@@ -360,6 +1063,7 @@ fn execute_command(
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                warn!("Unexpected WouldBlock on blocking socket - lwIP quirk?");
                 if start.elapsed() > timeout {
                     return Err(DongleError::Timeout);
                 }
@@ -375,73 +1079,52 @@ fn execute_command(
     Ok(response)
 }
 
-/// Send a command to the dongle and wait for response
-pub fn send_command(
-    dongle_tx: &DongleSender,
-    command: &[u8],
-    timeout: Duration,
-) -> Result<Obd2Buffer, DongleError> {
-    let (response_tx, response_rx) = oneshot::channel();
-    let request = DongleRequest {
-        command: command.into(),
-        response_tx: Some(response_tx),
-    };
-
-    dongle_tx
-        .send(request)
-        .map_err(|_| DongleError::NotConnected)?;
-
-    response_rx
-        .recv_timeout(timeout)
-        .map_err(|_| DongleError::Timeout)?
-}
-
-/// Send a command to the dongle without waiting for response (fire-and-forget)
-/// RPM extraction happens in the dongle task and is sent via `rpm_tx`
-pub fn send_command_async(dongle_tx: &DongleSender, command: &[u8]) {
-    let request = DongleRequest {
-        command: command.into(),
-        response_tx: None,
-    };
-    let _ = dongle_tx.send(request);
-}
+// ============================================================================
+// Proxy Server
+// ============================================================================
 
 pub struct Obd2Proxy {
     state: Arc<State>,
+    cache_manager_tx: CacheManagerSender,
 }
 
 /// RAII guard to decrement client count and remove TCP info on drop
 struct ClientCountGuard<'a> {
     state: &'a State,
     tcp_info: (SocketAddr, SocketAddr),
+    cache_manager_tx: CacheManagerSender,
+    client_id: ClientId,
 }
 
 impl Drop for ClientCountGuard<'_> {
     fn drop(&mut self) {
-        use std::sync::atomic::Ordering;
         self.state.obd2_client_count.fetch_sub(1, Ordering::Relaxed);
-        self.state.client_tcp_info.lock().unwrap().retain(|&x| x != self.tcp_info);
+        self.state
+            .client_tcp_info
+            .lock()
+            .unwrap()
+            .retain(|&x| x != self.tcp_info);
+        let _ = self
+            .cache_manager_tx
+            .send(CacheManagerMessage::UnregisterClient(self.client_id));
     }
 }
 
 impl Obd2Proxy {
-    pub fn new(state: Arc<State>) -> Self {
-        Self { state }
+    pub fn new(state: Arc<State>, cache_manager_tx: CacheManagerSender) -> Self {
+        Self {
+            state,
+            cache_manager_tx,
+        }
     }
 
     pub fn run(self) -> Result<()> {
         info!("OBD2 proxy starting...");
 
-        // Get listen port from config
         let listen_port = self.state.config.lock().unwrap().obd2.listen_port;
-
-        // Start proxy server
         let listener = TcpListener::bind(format!("0.0.0.0:{listen_port}"))?;
-
-        // Register watchdog for this thread (the proxy accept loop)
         let watchdog = WatchdogHandle::register("obd2_proxy");
 
-        // Set non-blocking with timeout so we can feed the watchdog
         listener.set_nonblocking(true)?;
 
         info!("OBD2 proxy started on port {listen_port}");
@@ -452,15 +1135,15 @@ impl Obd2Proxy {
             match listener.accept() {
                 Ok((stream, _)) => {
                     let state = self.state.clone();
+                    let cache_manager_tx = self.cache_manager_tx.clone();
 
                     crate::thread_util::spawn_named(c"obd2_client", move || {
-                        if let Err(e) = Self::handle_client(stream, &state) {
+                        if let Err(e) = Self::handle_client(stream, &state, cache_manager_tx) {
                             error!("Error handling client: {e:?}");
                         }
                     });
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    // No connection waiting, sleep briefly and try again
                     std::thread::sleep(Duration::from_millis(100));
                 }
                 Err(e) => {
@@ -470,47 +1153,51 @@ impl Obd2Proxy {
         }
     }
 
-    #[allow(clippy::needless_pass_by_value)] // TcpStream is consumed by BufReader
-    fn handle_client(client_stream: TcpStream, state: &Arc<State>) -> Result<()> {
-        use std::sync::atomic::Ordering;
-        
+    #[allow(clippy::needless_pass_by_value)]
+    fn handle_client(
+        client_stream: TcpStream,
+        state: &Arc<State>,
+        cache_manager_tx: CacheManagerSender,
+    ) -> Result<()> {
         let peer = client_stream.peer_addr()?;
         let local = client_stream.local_addr()?;
         info!("OBD2 client connected: {peer}");
-        
+
+        // Register with cache manager
+        let (reply_tx, reply_rx) = oneshot::channel();
+        cache_manager_tx
+            .send(CacheManagerMessage::RegisterClient(reply_tx))
+            .map_err(|_| anyhow::anyhow!("Cache manager channel closed"))?;
+        let (client_id, client_cache) = reply_rx
+            .recv()
+            .map_err(|_| anyhow::anyhow!("Failed to register with cache manager"))?;
+
         // Track connection info
         let tcp_info = (local, peer);
         state.client_tcp_info.lock().unwrap().push(tcp_info);
-        
-        // Increment client count
         state.obd2_client_count.fetch_add(1, Ordering::Relaxed);
-        
-        // Use a guard to ensure we decrement and remove TCP info on any exit path
-        let _guard = ClientCountGuard { state, tcp_info };
 
-        // Get timeout from config for socket operations
+        let _guard = ClientCountGuard {
+            state,
+            tcp_info,
+            cache_manager_tx: cache_manager_tx.clone(),
+            client_id,
+        };
+
         let timeout = Duration::from_millis(state.config.lock().unwrap().obd2_timeout_ms);
         client_stream.set_read_timeout(Some(timeout))?;
         client_stream.set_write_timeout(Some(timeout))?;
 
-        // Register watchdog for this client handler
         let watchdog = WatchdogHandle::register("obd2_client");
 
-        // Use BufReader for efficient reading, but keep reference to stream for writing
         let mut reader = BufReader::new(&client_stream);
         let mut writer = &client_stream;
-
-        // Track per-connection ELM327 state
         let mut client_state = ClientState::default();
-
-        // Command buffer for accumulating characters
         let mut cmd_buffer = Vec::with_capacity(64);
 
         loop {
             watchdog.feed();
 
-            // Read one byte at a time for character-by-character echo
-            // BufReader batches actual reads internally for efficiency
             let mut byte = [0u8; 1];
             match reader.read(&mut byte) {
                 Ok(0) => {
@@ -520,38 +1207,33 @@ impl Obd2Proxy {
                 Ok(_) => {
                     let ch = byte[0];
 
-                    // Echo character immediately if enabled
                     if client_state.echo_enabled {
                         writer.write_all(&byte)?;
                     }
 
-                    // CR is command terminator
                     if ch == b'\r' {
-                        // Process the accumulated command
                         let command = String::from_utf8_lossy(&cmd_buffer);
                         let command = command.trim();
 
                         if !command.is_empty() {
                             debug!("OBD2 client command: {command:?}");
-                            let ctx = CommandContext { state };
                             Self::process_command(
                                 command,
                                 &cmd_buffer,
                                 &mut writer,
                                 &mut client_state,
-                                &ctx,
+                                state,
+                                &cache_manager_tx,
+                                &client_cache,
                             )?;
                         }
 
                         cmd_buffer.clear();
                     } else if ch != b'\n' {
-                        // Accumulate non-LF characters (ignore LF per ELM327 spec)
                         cmd_buffer.push(ch);
                     }
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
-                    // Client timeout, keep connection alive
-                }
+                Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {}
                 Err(e) => {
                     error!("Error reading from client: {e:?}");
                     break;
@@ -567,14 +1249,15 @@ impl Obd2Proxy {
         raw_command: &[u8],
         writer: &mut &TcpStream,
         client_state: &mut ClientState,
-        ctx: &CommandContext<'_>,
+        state: &Arc<State>,
+        cache_manager_tx: &CacheManagerSender,
+        client_cache: &Arc<Mutex<ClientCache>>,
     ) -> Result<()> {
-        // Check if this is an AT command (handle locally)
+        // Handle AT commands locally
         if command.to_uppercase().starts_with("AT") {
             debug!("Handling AT command locally");
 
-            // Record unique AT commands (store uppercase for dedup)
-            if let Ok(mut log) = ctx.state.at_command_log.lock() {
+            if let Ok(mut log) = state.at_command_log.lock() {
                 log.insert(command.to_uppercase());
             }
 
@@ -585,13 +1268,12 @@ impl Obd2Proxy {
             return Ok(());
         }
 
-        // Handle "1" repeat command - expand to this client's last command
+        // Handle "1" repeat command
         let (effective_command, effective_raw): (String, Obd2Buffer) = if command == "1" {
             if let Some(last) = &client_state.last_obd_command {
                 debug!("Expanding repeat command to: {last}");
                 (last.clone(), last.as_bytes().into())
             } else {
-                // No previous command - return error
                 let le = client_state.line_ending();
                 let error_response = format!("{le}?{le}>");
                 writer.write_all(error_response.as_bytes())?;
@@ -601,30 +1283,47 @@ impl Obd2Proxy {
             (command.to_string(), raw_command.into())
         };
 
-        // Get timeout from config
-        let timeout = Duration::from_millis(ctx.state.config.lock().unwrap().obd2_timeout_ms);
-
-        // Record unique OBD2 PIDs (store uppercase for dedup)
-        if let Ok(mut log) = ctx.state.pid_log.lock() {
+        // Record unique OBD2 PIDs
+        if let Ok(mut log) = state.pid_log.lock() {
             log.insert(effective_command.to_uppercase());
         }
 
-        // Forward OBD2 command to dongle task
-        // RPM extraction happens in the dongle task - it sends to rpm_led automatically
-        match send_command(&ctx.state.dongle_tx, &effective_raw, timeout) {
-            Ok(response) => {
-                // Store this command for per-client repeat functionality
-                client_state.last_obd_command = Some(effective_command.clone());
+        // Normalize command for cache key (strips trailing " 1" response count)
+        let cache_key = normalize_obd_command(effective_raw.as_ref());
 
-                // Format and send dongle response (echo already sent character-by-character)
+        // Check if this is a supported PIDs query - return from State cache
+        if let Some(idx) = supported_pids_index(&cache_key) {
+            let supported_pids_guard = state.supported_pids.lock().unwrap();
+            if let Some(ref cached_response) = supported_pids_guard[idx] {
+                client_state.last_obd_command = Some(effective_command);
+                let formatted = client_state.format_response(cached_response);
+                drop(supported_pids_guard);
+                writer
+                    .write_all(&formatted)
+                    .context("Failed to write supported PIDs response")?;
+                return Ok(());
+            }
+            drop(supported_pids_guard);
+            // Not cached (dongle not connected yet?) - return error
+            let le = client_state.line_ending();
+            let error_response = format!("{le}UNABLE TO CONNECT{le}>");
+            writer.write_all(error_response.as_bytes())?;
+            return Ok(());
+        }
+
+        // Get value from cache
+        let timeout = Duration::from_millis(state.config.lock().unwrap().obd2_timeout_ms);
+        match Self::get_cached_value(&cache_key, client_cache, cache_manager_tx, timeout) {
+            Ok(response) => {
+                client_state.last_obd_command = Some(effective_command);
+
                 let formatted = client_state.format_response(&response);
                 writer
                     .write_all(&formatted)
                     .context("Failed to write response")?;
             }
             Err(e) => {
-                error!("Dongle error: {e}");
-                // Send proper ELM327 error response (echo already sent)
+                error!("Cache error: {e}");
                 let le = client_state.line_ending();
                 let error_msg = e.to_elm327_error();
                 let error_response = format!("{le}{error_msg}{le}>");
@@ -633,5 +1332,62 @@ impl Obd2Proxy {
         }
 
         Ok(())
+    }
+
+    fn get_cached_value(
+        pid: &Obd2Buffer,
+        client_cache: &Arc<Mutex<ClientCache>>,
+        cache_manager_tx: &CacheManagerSender,
+        timeout: Duration,
+    ) -> Result<Obd2Buffer, DongleError> {
+        let mut cache_guard = client_cache.lock().unwrap();
+
+        // Swap entry with Empty, check what was there
+        match cache_guard.entries.insert(pid.clone(), CacheEntry::Empty) {
+            Some(CacheEntry::Fresh(v)) => {
+                let _ = cache_manager_tx.send(CacheManagerMessage::Consumed {
+                    pid: pid.clone(),
+                    wait_duration: None,
+                });
+                Ok(v)
+            }
+            Some(CacheEntry::Empty) | None => {
+                // Cache miss - signal that we need this PID (may promote to fast)
+                let _ = cache_manager_tx.send(CacheManagerMessage::Waiting(pid.clone()));
+
+                // Register waiter
+                let (tx, rx) = oneshot::channel();
+                cache_guard.entries.insert(pid.clone(), CacheEntry::Waiting(tx));
+                let wait_start = Instant::now();
+                drop(cache_guard);
+
+                // Wait for notification
+                if rx.recv_timeout(timeout).is_err() {
+                    // Timeout - clean up waiter
+                    let mut cache_guard = client_cache.lock().unwrap();
+                    if let Some(CacheEntry::Waiting(_)) = cache_guard.entries.get(pid) {
+                        cache_guard.entries.insert(pid.clone(), CacheEntry::Empty);
+                    }
+                    return Err(DongleError::Timeout);
+                }
+
+                let wait_duration = wait_start.elapsed();
+
+                // Re-lock and take the value
+                let mut cache_guard = client_cache.lock().unwrap();
+                let Some(CacheEntry::Fresh(v)) = cache_guard.entries.insert(pid.clone(), CacheEntry::Empty) else {
+                    // Not Fresh after notification - logic error or race
+                    return Err(DongleError::NotConnected);
+                };
+                let _ = cache_manager_tx.send(CacheManagerMessage::Consumed {
+                    pid: pid.clone(),
+                    wait_duration: Some(wait_duration),
+                });
+                Ok(v)
+            }
+            Some(CacheEntry::Waiting(_)) => {
+                panic!("Cache entry already in Waiting state - logic error");
+            }
+        }
     }
 }

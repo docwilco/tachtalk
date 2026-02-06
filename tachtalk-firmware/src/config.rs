@@ -120,6 +120,30 @@ pub struct Obd2Config {
     pub dongle_port: u16,
     /// Port to listen on for OBD2 clients
     pub listen_port: u16,
+    /// Interval between slow PID polls (ms)
+    #[serde(default = "default_slow_poll_interval_ms")]
+    pub slow_poll_interval_ms: u64,
+    /// Time without waiters before demoting fast PID to slow (ms)
+    #[serde(default = "default_fast_demotion_ms")]
+    pub fast_demotion_ms: u64,
+    /// Time without consumption before removing PID from polling (ms)
+    #[serde(default = "default_pid_inactive_removal_ms")]
+    pub pid_inactive_removal_ms: u64,
+    /// Whether to test multi-PID query support at boot
+    #[serde(default)]
+    pub test_multi_pid: bool,
+}
+
+const fn default_slow_poll_interval_ms() -> u64 {
+    450
+}
+
+const fn default_fast_demotion_ms() -> u64 {
+    2000
+}
+
+const fn default_pid_inactive_removal_ms() -> u64 {
+    4000
 }
 
 impl Default for Obd2Config {
@@ -128,6 +152,10 @@ impl Default for Obd2Config {
             dongle_ip: "192.168.0.10".to_string(),
             dongle_port: 35000,
             listen_port: 35000,
+            slow_poll_interval_ms: default_slow_poll_interval_ms(),
+            fast_demotion_ms: default_fast_demotion_ms(),
+            pid_inactive_removal_ms: default_pid_inactive_removal_ms(),
+            test_multi_pid: false,
         }
     }
 }

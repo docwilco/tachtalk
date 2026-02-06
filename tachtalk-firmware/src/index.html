@@ -608,24 +608,14 @@
             <div class="debug-content">
                 <div class="debug-row"><span>Free Heap:</span><span id="freeHeap">---</span></div>
                 <div class="debug-row"><span>Min Free Heap:</span><span id="minFreeHeap">---</span></div>
+                <h3>Polling Metrics</h3>
+                <div class="debug-row"><span>Fast PIDs:</span><span id="metricsFastPids">---</span></div>
+                <div class="debug-row"><span>Slow PIDs:</span><span id="metricsSlowPids">---</span></div>
+                <div class="debug-row"><span>Requests/sec:</span><span id="metricsReqsPerSec">---</span></div>
                 <h3>AT Commands Received</h3>
                 <div id="atCommands" class="at-commands">Loading...</div>
                 <h3>OBD2 PIDs Requested</h3>
                 <div id="pids" class="pids">Loading...</div>
-            </div>
-        </details>
-        
-        <details class="debug-section">
-            <summary>🏎️ Benchmark</summary>
-            <div class="debug-content">
-                <p style="color: #888; font-size: 0.9em;">Test how fast the device can query RPM from the OBD2 dongle. Runs for 10 seconds.</p>
-                <button id="btnBenchmark" onclick="runBenchmark()">Start Benchmark</button>
-                <div id="benchmarkResults" style="margin-top: 15px; display: none;">
-                    <div class="debug-row"><span>Duration:</span><span id="benchDuration">---</span></div>
-                    <div class="debug-row"><span>Successful Queries:</span><span id="benchSuccessful">---</span></div>
-                    <div class="debug-row"><span>Failed Queries:</span><span id="benchFailed">---</span></div>
-                    <div class="debug-row" style="font-weight: bold;"><span>Queries/Second:</span><span id="benchQps">---</span></div>
-                </div>
             </div>
         </details>
         
@@ -723,6 +713,26 @@
                 <input type="number" id="obd2TimeoutMs" placeholder="4500" min="100" max="4500">
                 <small style="color: #888;">Max 4500ms</small>
             </div>
+            <div class="form-group">
+                <label>Slow Poll Interval (ms):</label>
+                <input type="number" id="obd2SlowPollMs" placeholder="1000" min="100" max="10000">
+                <small style="color: #888;">Interval for low-priority PIDs</small>
+            </div>
+            <div class="form-group">
+                <label>Fast Demotion (ms):</label>
+                <input type="number" id="obd2FastDemotionMs" placeholder="2000" min="500" max="30000">
+                <small style="color: #888;">Demote to slow after no waiters</small>
+            </div>
+            <div class="form-group">
+                <label>PID Removal (ms):</label>
+                <input type="number" id="obd2PidRemovalMs" placeholder="4000" min="1000" max="60000">
+                <small style="color: #888;">Remove inactive PIDs after</small>
+            </div>
+            <div class="form-group">
+                <label>Test Multi-PID:</label>
+                <input type="checkbox" id="obd2TestMultiPid">
+                <small style="color: #888;">Test multi-PID query support at boot (experimental)</small>
+            </div>
         </div>
         
         <div class="wifi-config">
@@ -780,7 +790,15 @@
         let config = {
             wifi: { ssid: '', password: '' },
             ip: { use_dhcp: true, ip: '192.168.0.20', prefix_len: 24 },
-            obd2: { dongle_ip: '192.168.0.10', dongle_port: 35000, listen_port: 35000 },
+            obd2: {
+                dongle_ip: '192.168.0.10',
+                dongle_port: 35000,
+                listen_port: 35000,
+                slow_poll_interval_ms: 450,
+                fast_demotion_ms: 2000,
+                pid_inactive_removal_ms: 4000,
+                test_multi_pid: false
+            },
             ap_ssid: '',
             ap_password: null,
             ap_ip: '10.15.25.1',
@@ -941,7 +959,11 @@
             config.obd2 = {
                 dongle_ip: document.getElementById('obd2DongleIp').value || '192.168.0.10',
                 dongle_port: parseInt(document.getElementById('obd2DonglePort').value) || 35000,
-                listen_port: parseInt(document.getElementById('obd2ListenPort').value) || 35000
+                listen_port: parseInt(document.getElementById('obd2ListenPort').value) || 35000,
+                slow_poll_interval_ms: parseInt(document.getElementById('obd2SlowPollMs').value) || 450,
+                fast_demotion_ms: parseInt(document.getElementById('obd2FastDemotionMs').value) || 2000,
+                pid_inactive_removal_ms: parseInt(document.getElementById('obd2PidRemovalMs').value) || 4000,
+                test_multi_pid: document.getElementById('obd2TestMultiPid').checked
             };
             config.obd2_timeout_ms = parseInt(document.getElementById('obd2TimeoutMs').value) || 4500;
             config.ap_ssid = document.getElementById('apSsid').value;
@@ -1154,6 +1176,10 @@
                     document.getElementById('obd2DongleIp').value = obd2Config.dongle_ip || '192.168.0.10';
                     document.getElementById('obd2DonglePort').value = obd2Config.dongle_port || 35000;
                     document.getElementById('obd2ListenPort').value = obd2Config.listen_port || 35000;
+                    document.getElementById('obd2SlowPollMs').value = obd2Config.slow_poll_interval_ms || 450;
+                    document.getElementById('obd2FastDemotionMs').value = obd2Config.fast_demotion_ms || 2000;
+                    document.getElementById('obd2PidRemovalMs').value = obd2Config.pid_inactive_removal_ms || 4000;
+                    document.getElementById('obd2TestMultiPid').checked = obd2Config.test_multi_pid || false;
                     
                     // Log level
                     document.getElementById('logLevel').value = config.log_level || 'info';
@@ -1406,6 +1432,13 @@
                 document.getElementById('labelSse').className = 'connector-label';
                 // EventSource will automatically reconnect
             };
+            // Listen for metrics events (separate from RPM messages)
+            rpmEventSource.addEventListener('metrics', function(event) {
+                const data = JSON.parse(event.data);
+                document.getElementById('metricsFastPids').textContent = data.fast_pids;
+                document.getElementById('metricsSlowPids').textContent = data.slow_pids;
+                document.getElementById('metricsReqsPerSec').textContent = data.reqs_per_sec;
+            });
         }
 
         function formatBytes(bytes) {
@@ -1506,33 +1539,6 @@
                 document.getElementById('pids').textContent = '(error)';
                 document.getElementById('freeHeap').textContent = '---';
                 document.getElementById('minFreeHeap').textContent = '---';
-            }
-        }
-
-        async function runBenchmark() {
-            setButtonLoading('btnBenchmark', true, 'Running (10s)...');
-            document.getElementById('benchmarkResults').style.display = 'none';
-            
-            try {
-                const response = await fetch('/api/benchmark', {
-                    method: 'POST'
-                });
-                
-                if (response.ok) {
-                    const result = await response.json();
-                    document.getElementById('benchDuration').textContent = (result.duration_ms / 1000).toFixed(2) + 's';
-                    document.getElementById('benchSuccessful').textContent = result.successful_queries;
-                    document.getElementById('benchFailed').textContent = result.failed_queries;
-                    document.getElementById('benchQps').textContent = result.queries_per_second.toFixed(2);
-                    document.getElementById('benchmarkResults').style.display = 'block';
-                    showStatus('Benchmark complete!', false);
-                } else {
-                    showStatus('Benchmark failed', true);
-                }
-            } catch (error) {
-                showStatus('Error: ' + error.message, true);
-            } finally {
-                setButtonLoading('btnBenchmark', false);
             }
         }
 

@@ -20,7 +20,7 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
 mod config;
-mod cpu_stats;
+mod cpu_metrics;
 mod dns;
 mod obd2;
 mod rpm_leds;
@@ -31,11 +31,49 @@ mod web_server;
 
 use crate::watchdog::WatchdogHandle;
 use config::Config;
-use obd2::{dongle_task, DongleSender, Obd2Proxy};
+use obd2::{dongle_task, cache_manager_task, Obd2Proxy, CacheManagerSender, DongleSender};
 use rpm_leds::{rpm_led_task, LedController, RpmTaskSender};
 use sse_server::{sse_server_task, SseSender};
 
 use std::sync::atomic::{AtomicBool, AtomicU32};
+
+/// Metrics for PID polling
+pub struct PollingMetrics {
+    /// Number of PIDs in the fast polling queue
+    pub fast_pid_count: AtomicU32,
+    /// Number of PIDs in the slow polling queue
+    pub slow_pid_count: AtomicU32,
+    /// Total promotions from slow to fast
+    pub promotions: AtomicU32,
+    /// Total demotions from fast to slow
+    pub demotions: AtomicU32,
+    /// Total PIDs removed from polling
+    pub removals: AtomicU32,
+    /// Total dongle requests sent (wraps at `u32::MAX`)
+    pub dongle_requests_total: AtomicU32,
+    /// Dongle requests in the last second
+    pub dongle_requests_per_sec: AtomicU32,
+    /// List of PIDs in the fast queue (for display)
+    pub fast_pids: Mutex<Vec<String>>,
+    /// List of PIDs in the slow queue (for display)
+    pub slow_pids: Mutex<Vec<String>>,
+}
+
+impl Default for PollingMetrics {
+    fn default() -> Self {
+        Self {
+            fast_pid_count: AtomicU32::new(0),
+            slow_pid_count: AtomicU32::new(0),
+            promotions: AtomicU32::new(0),
+            demotions: AtomicU32::new(0),
+            removals: AtomicU32::new(0),
+            dongle_requests_total: AtomicU32::new(0),
+            dongle_requests_per_sec: AtomicU32::new(0),
+            fast_pids: Mutex::new(Vec::new()),
+            slow_pids: Mutex::new(Vec::new()),
+        }
+    }
+}
 
 /// Central state shared across tasks
 ///
@@ -47,7 +85,6 @@ pub struct State {
     /// AP SSID (cached at startup from config)
     pub ap_ssid: String,
     pub sse_tx: SseSender,
-    pub dongle_tx: DongleSender,
     pub rpm_tx: RpmTaskSender,
     pub shared_rpm: Mutex<Option<u32>>,
     pub at_command_log: Mutex<HashSet<String>>,
@@ -60,6 +97,13 @@ pub struct State {
     pub obd2_client_count: AtomicU32,
     /// TCP connection info for each client: (`local_addr`, `remote_addr`)
     pub client_tcp_info: Mutex<Vec<(SocketAddr, SocketAddr)>>,
+    /// PID polling metrics
+    pub polling_metrics: PollingMetrics,
+    /// Cached responses for supported PIDs queries (0100, 0120, ..., 01E0)
+    /// Indexed by (PID byte / 0x20), e.g., 0x00→0, 0x20→1, 0x40→2, etc.
+    pub supported_pids: Mutex<[Option<obd2::Obd2Buffer>; 8]>,
+    /// Whether the ECU supports multi-PID queries (e.g., `010C0D` for RPM + vehicle speed)
+    pub supports_multi_pid: AtomicBool,
 }
 
 /// Create STA network interface with static IP or DHCP based on config
@@ -236,11 +280,15 @@ fn init_wifi(
 }
 
 /// Spawn all background tasks (DNS, SSE, OBD2, web server, etc.)
+#[allow(clippy::too_many_arguments)]
 fn spawn_background_tasks(
     state: &Arc<State>,
     led_controller: LedController,
     sse_rx: std::sync::mpsc::Receiver<sse_server::SseMessage>,
-    dongle_rx: std::sync::mpsc::Receiver<obd2::DongleRequest>,
+    dongle_control_rx: obd2::DongleReceiver,
+    dongle_control_tx: DongleSender,
+    cache_manager_rx: std::sync::mpsc::Receiver<obd2::CacheManagerMessage>,
+    cache_manager_tx: CacheManagerSender,
     rpm_rx: std::sync::mpsc::Receiver<rpm_leds::RpmTaskMessage>,
     ap_hostname: String,
     ap_ip: Ipv4Addr,
@@ -249,15 +297,27 @@ fn spawn_background_tasks(
     dns::start_dns_server(ap_ip);
 
     // Start SSE server for RPM streaming (on port 81)
-    thread_util::spawn_named(c"sse_srv", move || {
-        sse_server_task(&sse_rx);
-    });
+    {
+        let state = state.clone();
+        thread_util::spawn_named(c"sse_srv", move || {
+            sse_server_task(&sse_rx, &state);
+        });
+    }
 
     // Start OBD2 dongle task
     {
         let state = state.clone();
+        let cache_manager_tx = cache_manager_tx.clone();
         thread_util::spawn_named(c"dongle", move || {
-            dongle_task(&state, &dongle_rx);
+            dongle_task(&state, &cache_manager_tx, &dongle_control_rx);
+        });
+    }
+
+    // Start cache manager task
+    {
+        let state = state.clone();
+        thread_util::spawn_named(c"cache_mgr", move || {
+            cache_manager_task(&state, &cache_manager_rx, &dongle_control_tx);
         });
     }
 
@@ -283,7 +343,7 @@ fn spawn_background_tasks(
     {
         let state = state.clone();
         thread_util::spawn_named(c"obd2_proxy", move || {
-            let proxy = Obd2Proxy::new(state);
+            let proxy = Obd2Proxy::new(state, cache_manager_tx);
             if let Err(e) = proxy.run() {
                 error!("OBD2 proxy error: {e:?}");
             }
@@ -323,7 +383,8 @@ fn main() -> Result<()> {
 
     // Create all channels upfront
     let (sse_tx, sse_rx) = std::sync::mpsc::channel();
-    let (dongle_tx, dongle_rx) = std::sync::mpsc::channel();
+    let (dongle_control_tx, dongle_control_rx) = std::sync::mpsc::channel();  // Control messages to dongle from cache manager
+    let (cache_manager_tx, cache_manager_rx) = std::sync::mpsc::channel();  // Messages to cache manager from dongle and clients
     let (rpm_tx, rpm_rx) = std::sync::mpsc::channel();
 
     // Create central State struct
@@ -332,7 +393,6 @@ fn main() -> Result<()> {
         wifi: Mutex::new(wifi),
         ap_ssid,
         sse_tx,
-        dongle_tx,
         rpm_tx,
         shared_rpm: Mutex::new(None),
         at_command_log: Mutex::new(HashSet::new()),
@@ -341,24 +401,61 @@ fn main() -> Result<()> {
         dongle_tcp_info: Mutex::new(None),
         obd2_client_count: AtomicU32::new(0),
         client_tcp_info: Mutex::new(Vec::new()),
+        polling_metrics: PollingMetrics::default(),
+        supported_pids: Mutex::new([None, None, None, None, None, None, None, None]),
+        supports_multi_pid: AtomicBool::new(false),
     });
 
-    spawn_background_tasks(&state, led_controller, sse_rx, dongle_rx, rpm_rx, ap_hostname, ap_ip);
+    spawn_background_tasks(
+        &state,
+        led_controller,
+        sse_rx,
+        dongle_control_rx,
+        dongle_control_tx,
+        cache_manager_rx,
+        cache_manager_tx,
+        rpm_rx,
+        ap_hostname,
+        ap_ip,
+    );
 
     // Start mDNS for local discovery (tachtalk.local)
     let _mdns = setup_mdns();
 
     info!("All systems running!");
 
-    // Main loop - CPU usage monitoring
+    // Main loop - CPU usage and polling metrics monitoring
     let mut cpu_snapshots = std::collections::HashMap::new();
     let mut cpu_total = 0u64;
 
     loop {
+        use std::sync::atomic::Ordering;
         for _ in 0..5 {
             FreeRtos::delay_ms(1000);
         }
-        cpu_stats::print_cpu_usage_deltas(&mut cpu_snapshots, &mut cpu_total);
+        cpu_metrics::print_cpu_usage_deltas(&mut cpu_snapshots, &mut cpu_total);
+        
+        // Print polling metrics
+        let metrics = &state.polling_metrics;
+        info!(
+            "Polling: {} fast, {} slow PIDs | {}/sec | +{} -{} x{}",
+            metrics.fast_pid_count.load(Ordering::Relaxed),
+            metrics.slow_pid_count.load(Ordering::Relaxed),
+            metrics.dongle_requests_per_sec.load(Ordering::Relaxed),
+            metrics.promotions.load(Ordering::Relaxed),
+            metrics.demotions.load(Ordering::Relaxed),
+            metrics.removals.load(Ordering::Relaxed),
+        );
+        if let Ok(fast) = metrics.fast_pids.lock() {
+            if !fast.is_empty() {
+                info!("  Fast: {}", fast.join(", "));
+            }
+        }
+        if let Ok(slow) = metrics.slow_pids.lock() {
+            if !slow.is_empty() {
+                info!("  Slow: {}", slow.join(", "));
+            }
+        }
     }
 }
 

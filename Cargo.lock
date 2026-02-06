@@ -1503,6 +1503,7 @@ dependencies = [
 name = "tachtalk-mock-elm327-server"
 version = "0.1.0"
 dependencies = [
+ "clap",
  "tachtalk-elm327-lib",
 ]
 

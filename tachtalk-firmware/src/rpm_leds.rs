@@ -7,22 +7,25 @@
 
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::Result;
 use esp_idf_hal::gpio::OutputPin;
 use esp_idf_hal::peripheral::Peripheral;
-use esp_idf_hal::rmt::RmtChannel;
+use esp_idf_hal::rmt::config::TransmitConfig;
+use esp_idf_hal::rmt::{RmtChannel, TxRmtDriver};
 use log::{debug, info, warn};
 use smart_leds::{brightness, gamma, SmartLedsWrite, RGB8};
 use tachtalk_shift_lights_lib::compute_led_state;
 use ws2812_esp32_rmt_driver::Ws2812Esp32Rmt;
 
 use crate::config::Config;
-use crate::obd2::{send_command_async, IDLE_POLL_INTERVAL_MS, CLIENT_ACTIVITY_BACKOFF};
 use crate::sse_server::SseMessage;
 use crate::watchdog::WatchdogHandle;
 use crate::State;
+
+/// Default timeout when no blinking is active
+const DEFAULT_TIMEOUT_MS: u64 = 100;
 
 /// Get current wallclock time in milliseconds
 fn get_wallclock_ms() -> u64 {
@@ -36,6 +39,11 @@ fn get_wallclock_ms() -> u64 {
 fn time_until_next_deadline(interval_ms: u64) -> u64 {
     let now_ms = get_wallclock_ms();
     interval_ms - (now_ms % interval_ms)
+}
+
+/// Compute whether we're in the on or off blink phase (true = on, false = off)
+fn blink_phase_on(timestamp_ms: u64, interval_ms: u64) -> bool {
+    (timestamp_ms / interval_ms) % 2 == 0
 }
 
 /// Messages sent to the LED task
@@ -64,7 +72,13 @@ impl LedController {
         initial_brightness: u8,
     ) -> Result<Self> {
         debug!("Creating LED controller with brightness {initial_brightness}");
-        let driver = Ws2812Esp32Rmt::new(channel, pin)?;
+        // Use multiple memory blocks to prevent flicker when WiFi is active.
+        // The RMT peripheral can be interrupted by WiFi, causing timing issues.
+        // With more memory blocks, the RMT has more buffer to handle interrupts.
+        // See: https://github.com/cat-in-136/ws2812-esp32-rmt-driver#the-led-is-sp32-flickers-sp32--sp32-s3--sp32-c6--sp32-h2
+        let config = TransmitConfig::new().clock_divider(1).mem_block_num(2);
+        let tx_driver = TxRmtDriver::new(channel, pin, &config)?;
+        let driver = Ws2812Esp32Rmt::new_with_rmt_driver(tx_driver)?;
 
         Ok(Self {
             driver,
@@ -129,14 +143,15 @@ fn compute_blink_interval(cfg: &Config) -> Option<u64> {
     }
 }
 
-/// Run the combined RPM poller and LED update task.
+/// Run the LED update task.
 ///
 /// This task:
-/// - Receives RPM values from dongle task via channel
-/// - Polls the dongle for RPM when no client activity
+/// - Receives RPM values from cache manager via channel
 /// - Updates LEDs based on current RPM
 /// - Sends RPM to SSE clients
-/// - Updates shared RPM for HTTP polling fallback
+///
+/// Note: RPM polling is now handled by the cache manager task,
+/// which always keeps RPM in the fast polling queue.
 // Receiver is intentionally moved into this task for exclusive ownership
 #[allow(clippy::needless_pass_by_value)]
 pub fn rpm_led_task(
@@ -158,8 +173,7 @@ pub fn rpm_led_task(
 
     let mut current_rpm: Option<u32> = None;
     let mut last_rendered_rpm: Option<u32> = None;
-    let mut last_client_rpm: Option<Instant> = None;
-    let mut last_poll: Option<Instant> = None;
+    let mut last_blink_on: Option<bool> = None;
 
     let mut blink_interval_ms = compute_blink_interval(&state.config.lock().unwrap());
 
@@ -170,34 +184,35 @@ pub fn rpm_led_task(
         let mut should_render = false;
         let mut should_render_on_timeout = false;
 
-        // Compute timeout: minimum of blink deadline and poll interval
-        let blink_timeout_ms = blink_interval_ms.map(time_until_next_deadline);
-        let timeout_ms = match blink_timeout_ms {
+        // Compute timeout based on blink interval (or default if no blinking)
+        let timeout_ms = match blink_interval_ms.map(time_until_next_deadline) {
             Some(blink_ms) => {
-                if blink_ms < IDLE_POLL_INTERVAL_MS {
-                    should_render_on_timeout = true;
-                    blink_ms
-                } else {
-                    IDLE_POLL_INTERVAL_MS
-                }
+                should_render_on_timeout = true;
+                blink_ms
             }
-            None => IDLE_POLL_INTERVAL_MS,
+            None => DEFAULT_TIMEOUT_MS,
         };
         let timeout = Duration::from_millis(timeout_ms);
 
         // Wait for message or timeout
         match rpm_rx.recv_timeout(timeout) {
             Ok(RpmTaskMessage::Rpm(rpm)) => {
-                last_client_rpm = Some(Instant::now());
                 if current_rpm != Some(rpm) {
                     current_rpm = Some(rpm);
                     should_render = true; // RPM changed
                 }
-                *state.shared_rpm.lock().unwrap() = Some(rpm);
+                // Check for blink phase change (on/off transition)
+                if let Some(interval) = blink_interval_ms {
+                    let current_on = blink_phase_on(get_wallclock_ms(), interval);
+                    if last_blink_on != Some(current_on) {
+                        should_render = true;
+                    }
+                }
                 debug!("Received RPM: {rpm}");
             }
             Ok(RpmTaskMessage::ConfigChanged) => {
                 blink_interval_ms = compute_blink_interval(&state.config.lock().unwrap());
+                last_blink_on = None; // Reset phase tracking on config change
                 should_render = true; // Config changed, re-render
             }
             Ok(RpmTaskMessage::Brightness(brightness)) => {
@@ -208,18 +223,6 @@ pub fn rpm_led_task(
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 if should_render_on_timeout {
                     should_render = true;
-                }
-
-                // Check if we should poll the dongle for RPM
-                let client_idle =
-                    last_client_rpm.map_or(true, |t| t.elapsed() >= CLIENT_ACTIVITY_BACKOFF);
-                let poll_due = last_poll.map_or(true, |t| {
-                    t.elapsed() >= Duration::from_millis(IDLE_POLL_INTERVAL_MS)
-                });
-                if client_idle && poll_due {
-                    last_poll = Some(Instant::now());
-                    // Fire-and-forget: dongle task will extract RPM and send back via channel
-                    send_command_async(&state.dongle_tx, b"010C");
                 }
             }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
@@ -238,6 +241,12 @@ pub fn rpm_led_task(
                 }
 
                 let timestamp_ms = get_wallclock_ms();
+
+                // Update last blink phase after render
+                if let Some(interval) = blink_interval_ms {
+                    last_blink_on = Some(blink_phase_on(timestamp_ms, interval));
+                }
+
                 if let Ok(cfg) = state.config.lock() {
                     let _ = led_controller.update(rpm, &cfg, timestamp_ms);
                 }
