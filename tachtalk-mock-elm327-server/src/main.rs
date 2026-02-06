@@ -1,18 +1,44 @@
 //! Mock ELM327 OBD2 adapter for testing TachTalk proxy
-//!
-//! Usage: cargo run -p tachtalk-mock-elm327-server [--quiet|-q]
-//! Then connect TachTalk proxy to 127.0.0.1:35000
 
-use std::env;
 use std::fmt::Write as _;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+use clap::Parser;
 use tachtalk_elm327_lib::ClientState;
 
+/// Mock ELM327 OBD2 adapter for testing TachTalk proxy.
+///
+/// Connect TachTalk proxy to 127.0.0.1:35000
+#[derive(Parser)]
+#[command(version, about)]
+struct Args {
+    /// Suppress request/response logging
+    #[arg(short, long)]
+    quiet: bool,
+
+    /// Maximum requests per second (throttle responses to this rate)
+    #[arg(short = 'm', long, value_name = "RPS")]
+    max_rps: Option<f64>,
+}
+
 fn main() {
-    let quiet = env::args().any(|arg| arg == "-q" || arg == "--quiet");
+    let args = Args::parse();
+
+    let min_interval = args.max_rps.map(|rps| {
+        assert!(rps > 0.0, "--max-rps must be positive");
+        Duration::from_secs_f64(1.0 / rps)
+    });
     let start_time = Instant::now();
+
+    if let Some(interval) = min_interval {
+        println!(
+            "Rate limiting enabled: max {:.1} req/s (min interval: {:.1}ms)",
+            1.0 / interval.as_secs_f64(),
+            interval.as_secs_f64() * 1000.0
+        );
+    }
 
     println!("Mock ELM327 starting on 0.0.0.0:35000...");
     let listener = TcpListener::bind("0.0.0.0:35000").expect("Failed to bind");
@@ -22,17 +48,24 @@ fn main() {
         match stream {
             Ok(stream) => {
                 println!("Client connected: {:?}", stream.peer_addr());
-                std::thread::spawn(move || handle_client(stream, quiet, start_time));
+                let quiet = args.quiet;
+                std::thread::spawn(move || handle_client(stream, quiet, start_time, min_interval));
             }
             Err(e) => eprintln!("Connection error: {e}"),
         }
     }
 }
 
-fn handle_client(mut stream: TcpStream, quiet: bool, start_time: Instant) {
+fn handle_client(
+    mut stream: TcpStream,
+    quiet: bool,
+    start_time: Instant,
+    min_interval: Option<Duration>,
+) {
     let mut buffer = Vec::new();
     let mut byte = [0u8; 1];
     let mut state = ClientState::new();
+    let mut last_response_time: Option<Instant> = None;
 
     loop {
         match stream.read(&mut byte) {
@@ -56,7 +89,18 @@ fn handle_client(mut stream: TcpStream, quiet: bool, start_time: Instant) {
                         if !quiet {
                             println!("RX: {command}");
                         }
+
+                        // Rate limiting: wait if needed before responding
+                        if let (Some(interval), Some(last_time)) = (min_interval, last_response_time)
+                        {
+                            if let Some(remaining) = interval.checked_sub(last_time.elapsed()) {
+                                std::thread::sleep(remaining);
+                            }
+                        }
+
                         let response = process_command(&command, &start_time, &mut state);
+                        last_response_time = Some(Instant::now());
+
                         if !quiet {
                             println!("TX: {}", response.escape_debug());
                         }
