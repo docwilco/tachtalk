@@ -322,9 +322,10 @@ fn spawn_background_tasks(
     }
 
     // Start the combined RPM poller and LED update task
+    // Pin to Core 1 to avoid interference from WiFi (which runs on Core 0)
     {
         let state = state.clone();
-        thread_util::spawn_named(c"rpm_led", move || {
+        thread_util::spawn_named_on_core(c"rpm_led", esp_idf_hal::cpu::Core::Core1, move || {
             rpm_led_task(&state, led_controller, rpm_rx);
         });
     }

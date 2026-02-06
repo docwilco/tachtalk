@@ -75,8 +75,9 @@ impl LedController {
         // Use multiple memory blocks to prevent flicker when WiFi is active.
         // The RMT peripheral can be interrupted by WiFi, causing timing issues.
         // With more memory blocks, the RMT has more buffer to handle interrupts.
+        // 12 LEDs × 24 items/LED = 288 items; 4 blocks × 64 items = 256 items (close enough).
         // See: https://github.com/cat-in-136/ws2812-esp32-rmt-driver#the-led-is-sp32-flickers-sp32--sp32-s3--sp32-c6--sp32-h2
-        let config = TransmitConfig::new().clock_divider(1).mem_block_num(2);
+        let config = TransmitConfig::new().clock_divider(1).mem_block_num(4);
         let tx_driver = TxRmtDriver::new(channel, pin, &config)?;
         let driver = Ws2812Esp32Rmt::new_with_rmt_driver(tx_driver)?;
 
