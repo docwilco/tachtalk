@@ -434,7 +434,18 @@ fn main() -> Result<()> {
         for _ in 0..5 {
             FreeRtos::delay_ms(1000);
         }
-        cpu_metrics::print_cpu_usage_deltas(&mut cpu_snapshots, &mut cpu_total);
+        
+        // Check config for debug dump settings
+        let (dump_cpu, dump_sockets) = {
+            let cfg = state.config.lock().unwrap();
+            (cfg.dump_cpu_metrics, cfg.dump_socket_info)
+        };
+        if dump_cpu {
+            cpu_metrics::print_cpu_usage_deltas(&mut cpu_snapshots, &mut cpu_total);
+        }
+        if dump_sockets {
+            web_server::log_sockets();
+        }
         
         // Print polling metrics
         let metrics = &state.polling_metrics;

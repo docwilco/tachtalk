@@ -748,6 +748,16 @@
                 </select>
             </div>
             <div class="form-group">
+                <label>Dump CPU Metrics:</label>
+                <input type="checkbox" id="dumpCpuMetrics">
+                <small style="color: #888;">Print CPU usage to serial every 5s</small>
+            </div>
+            <div class="form-group">
+                <label>Dump Socket Info:</label>
+                <input type="checkbox" id="dumpSocketInfo">
+                <small style="color: #888;">Print open sockets to serial every 5s</small>
+            </div>
+            <div class="form-group">
                 <label>Total LEDs:</label>
                 <input type="number" id="totalLeds" value="8">
             </div>
@@ -971,6 +981,8 @@
             config.ap_ip = document.getElementById('apIp').value || '10.15.25.1';
             config.ap_prefix_len = parseInt(document.getElementById('apPrefixLen').value) || 24;
             config.log_level = document.getElementById('logLevel').value;
+            config.dump_cpu_metrics = document.getElementById('dumpCpuMetrics').checked;
+            config.dump_socket_info = document.getElementById('dumpSocketInfo').checked;
             
             setButtonLoading('btnSaveConfig', true, 'Saving...');
             try {
@@ -1183,6 +1195,10 @@
                     
                     // Log level
                     document.getElementById('logLevel').value = config.log_level || 'info';
+                    
+                    // Debug dump options
+                    document.getElementById('dumpCpuMetrics').checked = config.dump_cpu_metrics || false;
+                    document.getElementById('dumpSocketInfo').checked = config.dump_socket_info || false;
                     
                     // AP config
                     document.getElementById('apSsid').value = config.ap_ssid || '';

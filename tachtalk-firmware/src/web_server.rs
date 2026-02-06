@@ -91,6 +91,137 @@ struct TcpStatus {
     clients: Vec<TcpConnectionInfo>,
 }
 
+/// Socket type enumeration
+#[derive(serde::Serialize)]
+enum SocketType {
+    Tcp,
+    Udp,
+    Unknown(i32),
+}
+
+/// Information about a single socket
+#[derive(serde::Serialize)]
+struct SocketInfo {
+    fd: i32,
+    socket_type: SocketType,
+    local: Option<String>,
+    remote: Option<String>,
+}
+
+/// Enumerate all open LWIP sockets
+///
+/// LWIP sockets use FDs starting at `LWIP_SOCKET_OFFSET` (48 on ESP32).
+/// We probe each potential FD with `getsockopt` to see if it's a valid socket.
+#[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
+fn enumerate_sockets() -> Vec<SocketInfo> {
+    use esp_idf_svc::sys::{lwip_getsockopt, SOL_SOCKET, SO_TYPE, SOCK_STREAM, SOCK_DGRAM, 
+                           LWIP_SOCKET_OFFSET, CONFIG_LWIP_MAX_SOCKETS};
+
+    let socket_offset = LWIP_SOCKET_OFFSET as i32;
+    let max_sockets = CONFIG_LWIP_MAX_SOCKETS as i32;
+    let mut sockets = Vec::new();
+
+    for fd in socket_offset..(socket_offset + max_sockets) {
+        // Try to get socket type - if this fails, FD is not a valid socket
+        let mut sock_type: i32 = 0;
+        let mut optlen: u32 = std::mem::size_of::<i32>() as u32;
+
+        let result = unsafe {
+            lwip_getsockopt(
+                fd,
+                SOL_SOCKET as i32,
+                SO_TYPE as i32,
+                std::ptr::addr_of_mut!(sock_type).cast(),
+                &mut optlen,
+            )
+        };
+
+        if result != 0 {
+            continue; // Not a valid socket
+        }
+
+        let socket_type = match sock_type {
+            x if x == SOCK_STREAM as i32 => SocketType::Tcp,
+            x if x == SOCK_DGRAM as i32 => SocketType::Udp,
+            x => SocketType::Unknown(x),
+        };
+
+        // Get local address
+        let local = get_socket_addr(fd, false);
+        // Get remote address (for connected sockets)
+        let remote = get_socket_addr(fd, true);
+
+        sockets.push(SocketInfo {
+            fd,
+            socket_type,
+            local,
+            remote,
+        });
+    }
+
+    sockets
+}
+
+/// Get local or remote address of a socket
+#[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
+fn get_socket_addr(fd: i32, peer: bool) -> Option<String> {
+    use esp_idf_svc::sys::{lwip_getpeername, lwip_getsockname, sockaddr_in, sockaddr, AF_INET};
+    use std::mem::MaybeUninit;
+
+    let mut addr: MaybeUninit<sockaddr_in> = MaybeUninit::uninit();
+    let mut addrlen: u32 = std::mem::size_of::<sockaddr_in>() as u32;
+
+    let result = unsafe {
+        if peer {
+            lwip_getpeername(fd, addr.as_mut_ptr().cast::<sockaddr>(), &mut addrlen)
+        } else {
+            lwip_getsockname(fd, addr.as_mut_ptr().cast::<sockaddr>(), &mut addrlen)
+        }
+    };
+
+    if result != 0 {
+        return None;
+    }
+
+    let addr = unsafe { addr.assume_init() };
+
+    // Check if it's an IPv4 address
+    #[allow(clippy::unnecessary_cast)]
+    if i32::from(addr.sin_family) != AF_INET as i32 {
+        return None;
+    }
+
+    // Convert to string - sin_addr.s_addr is in network byte order
+    let ip = std::net::Ipv4Addr::from(u32::from_be(addr.sin_addr.s_addr));
+    let port = u16::from_be(addr.sin_port);
+
+    Some(format!("{ip}:{port}"))
+}
+
+/// Log all open sockets to console (for debugging FD exhaustion)
+pub fn log_sockets() {
+    let sockets = enumerate_sockets();
+    if sockets.is_empty() {
+        warn!("No open sockets found (unexpected)");
+        return;
+    }
+    
+    warn!("Open sockets ({}/{}):", sockets.len(), esp_idf_svc::sys::CONFIG_LWIP_MAX_SOCKETS);
+    for s in &sockets {
+        let type_str = match &s.socket_type {
+            SocketType::Tcp => "TCP",
+            SocketType::Udp => "UDP",
+            SocketType::Unknown(t) => {
+                warn!("  fd={}: type={} (unknown)", s.fd, t);
+                continue;
+            }
+        };
+        let local = s.local.as_deref().unwrap_or("?");
+        let remote = s.remote.as_deref().unwrap_or("-");
+        warn!("  fd={}: {} {} -> {}", s.fd, type_str, local, remote);
+    }
+}
+
 /// Debug info response
 #[derive(serde::Serialize)]
 struct DebugInfo {
@@ -123,10 +254,10 @@ pub fn start_server(state: &Arc<State>, ap_hostname: Option<String>, ap_ip: Ipv4
     
     // Enable wildcard URI matching for captive portal fallback handler
     // Enable LRU purge to handle abrupt disconnections from captive portal browsers
-    // LWIP max is 16 sockets; leave room for DNS, OBD2, mDNS
+    // LWIP max is 16 sockets; leave room for DNS, SSE, mDNS, OBD2 proxy, dongle, httpd control
     let server_config = Configuration {
         uri_match_wildcard: true,
-        max_open_sockets: 10,
+        max_open_sockets: 6,
         session_timeout: core::time::Duration::from_secs(2),
         lru_purge_enable: true,
         ..Default::default()
@@ -421,6 +552,18 @@ pub fn start_server(state: &Arc<State>, ap_hostname: Option<String>, ap_ip: Ipv4
         
         let status = TcpStatus { dongle, clients };
         let json = serde_json::to_string(&status).unwrap_or_else(|_| "{}".to_string());
+        
+        let mut response = req.into_ok_response()?;
+        response.write_all(json.as_bytes())?;
+        Ok(())
+    })?;
+
+    // GET all open sockets endpoint (for debugging FD exhaustion)
+    server.fn_handler("/api/sockets", Method::Get, move |req| -> Result<(), esp_idf_svc::io::EspIOError> {
+        debug!("HTTP: GET /api/sockets");
+        
+        let sockets = enumerate_sockets();
+        let json = serde_json::to_string(&sockets).unwrap_or_else(|_| "[]".to_string());
         
         let mut response = req.into_ok_response()?;
         response.write_all(json.as_bytes())?;

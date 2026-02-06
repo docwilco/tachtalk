@@ -189,6 +189,12 @@ pub struct Config {
     /// LED brightness (0-255)
     #[serde(default = "default_brightness")]
     pub brightness: u8,
+    /// Dump CPU metrics to serial console every 5 seconds
+    #[serde(default)]
+    pub dump_cpu_metrics: bool,
+    /// Dump socket info to serial console every 5 seconds
+    #[serde(default)]
+    pub dump_socket_info: bool,
 }
 
 const fn default_led_gpio() -> u8 {
@@ -294,6 +300,8 @@ impl Default for Config {
             led_gpio: default_led_gpio(),
             obd2_timeout_ms: default_obd2_timeout_ms(),
             brightness: default_brightness(),
+            dump_cpu_metrics: false,
+            dump_socket_info: false,
         }
     }
 }
