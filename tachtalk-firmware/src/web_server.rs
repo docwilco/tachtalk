@@ -4,6 +4,7 @@ use embedded_svc::io::Write;
 use esp_idf_svc::http::server::{Configuration, EspHttpServer};
 use log::{debug, error, info, warn};
 use std::collections::HashMap;
+use std::net::Ipv4Addr;
 use std::sync::Arc;
 
 use esp_idf_svc::sys::{esp_get_free_heap_size, esp_get_minimum_free_heap_size};
@@ -11,16 +12,23 @@ use esp_idf_svc::sys::{esp_get_free_heap_size, esp_get_minimum_free_heap_size};
 use crate::obd2::RpmTaskMessage;
 use crate::sse_server::SSE_PORT;
 use crate::State;
-use crate::WifiMode;
 
 /// IP configuration for WiFi request
 #[derive(serde::Deserialize)]
 struct IpConfigRequest {
     use_dhcp: bool,
-    ip: Option<String>,
-    gateway: Option<String>,
-    subnet: Option<String>,
-    dns: Option<String>,
+    #[serde(default = "default_static_ip")]
+    ip: String,
+    #[serde(default = "default_prefix_len")]
+    prefix_len: u8,
+}
+
+fn default_static_ip() -> String {
+    "192.168.0.20".to_string()
+}
+
+const fn default_prefix_len() -> u8 {
+    24
 }
 
 /// WiFi configuration request from web UI
@@ -51,9 +59,6 @@ struct Network {
 struct NetworkStatus {
     ssid: Option<String>,
     ip: Option<String>,
-    gateway: Option<String>,
-    subnet: Option<String>,
-    dns: Option<String>,
     mac: String,
     rssi: Option<i8>,
 }
@@ -112,23 +117,8 @@ struct BenchmarkResult {
 const HTML_INDEX_START: &str = include_str!(concat!(env!("OUT_DIR"), "/index_start.html"));
 const HTML_INDEX_END: &str = include_str!(concat!(env!("OUT_DIR"), "/index_end.html"));
 
-// Captive portal redirect page
-const HTML_CAPTIVE_PORTAL: &str = r#"
-<!DOCTYPE html>
-<html>
-<head>
-    <meta charset="UTF-8">
-    <title>TachTalk Setup</title>
-    <meta http-equiv="refresh" content="0;url=http://192.168.71.1/">
-</head>
-<body>
-    <p>Redirecting to <a href="http://192.168.71.1/">TachTalk Setup</a>...</p>
-</body>
-</html>
-"#;
-
 #[allow(clippy::too_many_lines)] // Route registration function - length is proportional to endpoints
-pub fn start_server(state: &Arc<State>, ap_hostname: Option<String>) -> Result<()> {
+pub fn start_server(state: &Arc<State>, ap_hostname: Option<String>, ap_ip: Ipv4Addr) -> Result<()> {
     info!("Web server starting...");
     
     // Enable wildcard URI matching for captive portal fallback handler
@@ -149,22 +139,6 @@ pub fn start_server(state: &Arc<State>, ap_hostname: Option<String>) -> Result<(
         response.write_all(HTML_INDEX_START.as_bytes())?;
         response.write_all(SSE_PORT.to_string().as_bytes())?;
         response.write_all(HTML_INDEX_END.as_bytes())?;
-        Ok(())
-    })?;
-
-    // GET mode endpoint
-    let state_clone = state.clone();
-    server.fn_handler("/api/mode", Method::Get, move |req| -> Result<(), esp_idf_svc::io::EspIOError> {
-        info!("HTTP: GET /api/mode");
-        let mode = state_clone.wifi_mode.lock().unwrap();
-        let mode_str = match *mode {
-            WifiMode::AccessPoint => "ap",
-            WifiMode::Client => "client",
-        };
-        let json = format!(r#"{{"mode":"{mode_str}"}}"#);
-        
-        let mut response = req.into_ok_response()?;
-        response.write_all(json.as_bytes())?;
         Ok(())
     })?;
 
@@ -283,10 +257,12 @@ pub fn start_server(state: &Arc<State>, ap_hostname: Option<String>) -> Result<(
             // Update IP config if provided
             if let Some(ip_cfg) = wifi_req.ip {
                 cfg.ip.use_dhcp = ip_cfg.use_dhcp;
-                cfg.ip.ip = ip_cfg.ip.filter(|s| !s.is_empty());
-                cfg.ip.gateway = ip_cfg.gateway.filter(|s| !s.is_empty());
-                cfg.ip.subnet = ip_cfg.subnet.filter(|s| !s.is_empty());
-                cfg.ip.dns = ip_cfg.dns.filter(|s| !s.is_empty());
+                cfg.ip.ip = if ip_cfg.ip.is_empty() {
+                    "192.168.0.20".to_string()
+                } else {
+                    ip_cfg.ip
+                };
+                cfg.ip.prefix_len = ip_cfg.prefix_len;
             }
             
             if let Err(e) = cfg.save() {
@@ -386,10 +362,9 @@ pub fn start_server(state: &Arc<State>, ap_hostname: Option<String>) -> Result<(
         
         let status = NetworkStatus {
             ssid,
-            ip: ip_info.as_ref().map(|i| format!("{}", i.ip)),
-            gateway: ip_info.as_ref().map(|i| format!("{}", i.subnet.gateway)),
-            subnet: ip_info.as_ref().map(|i| format!("{}", i.subnet.mask)),
-            dns: ip_info.as_ref().and_then(|i| i.dns.map(|d| format!("{d}"))),
+            ip: ip_info.as_ref().map(|i| {
+                format!("{}/{}", i.ip, i.subnet.mask.0)
+            }),
             mac,
             rssi,
         };
@@ -588,11 +563,27 @@ pub fn start_server(state: &Arc<State>, ap_hostname: Option<String>) -> Result<(
     // Captive portal fallback handler - redirect requests with wrong Host header
     // Must be registered last as it's a wildcard that matches everything
     if let Some(hostname) = ap_hostname {
+        let ap_ip_str = ap_ip.to_string();
         let valid_hosts: Vec<String> = vec![
             hostname.clone(),
             format!("{hostname}.local"),
-            "192.168.71.1".to_string(),
+            ap_ip_str.clone(),
         ];
+        let redirect_url = format!("http://{ap_ip_str}/");
+        let captive_portal_html = format!(
+            r#"<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>TachTalk Setup</title>
+    <meta http-equiv="refresh" content="0;url={redirect_url}">
+</head>
+<body>
+    <p>Redirecting to <a href="{redirect_url}">TachTalk Setup</a>...</p>
+</body>
+</html>
+"#
+        );
         
         info!("Captive portal enabled for hostname: {hostname}");
         
@@ -613,11 +604,11 @@ pub fn start_server(state: &Arc<State>, ap_hostname: Option<String>) -> Result<(
                 // Wrong host - redirect to captive portal
                 info!("HTTP: GET {} -> 302 captive (host: {})", req.uri(), host);
                 let mut response = req.into_response(302, Some("Found"), &[
-                    ("Location", "http://192.168.71.1/"),
+                    ("Location", &redirect_url),
                     ("Cache-Control", "no-cache"),
                     ("Connection", "close"),
                 ])?;
-                response.write_all(HTML_CAPTIVE_PORTAL.as_bytes())?;
+                response.write_all(captive_portal_html.as_bytes())?;
             }
             Ok(())
         })?;

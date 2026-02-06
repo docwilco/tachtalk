@@ -4,9 +4,9 @@
 
 ```
 ┌─────────────┐         ┌──────────────┐         ┌─────────────┐
-│ RaceChroно  │ <-----> │  ESP32-S3    │ <-----> │  Wi-Fi OBD2 │
-│     App     │  WiFi   │  TachTalk    │  WiFi   │   Dongle    │
-└─────────────┘         └──────────────┘         └─────────────┘
+│  RaceChrono │ <-----> │  ESP32-S3    │ <-----> │  Wi-Fi OBD2 │
+│     App     │   AP    │  TachTalk    │   STA   │   Dongle    │
+└─────────────┘  WiFi   └──────────────┘  WiFi   └─────────────┘
                                │
                                │
                                ▼
@@ -16,21 +16,28 @@
                         └──────────────┘
 ```
 
+RaceChrono (or any OBD2 client) connects to TachTalk's access point (10.15.25.1:35000).
+TachTalk connects to the OBD2 dongle's WiFi network and proxies requests.
+
 ## Operating Modes
 
-### Access Point Mode (Setup)
-On first boot or when no WiFi is configured, TachTalk creates a WiFi hotspot:
-- SSID: `TachTalk-XXXX` (XXXX derived from MAC address, customizable)
-- IP: `192.168.71.1`
-- Captive portal redirects to configuration page
-- Configure dongle WiFi credentials via Web UI
+### WiFi Configuration
 
-### Client Mode (Normal Operation)
-After WiFi is configured, TachTalk connects to the dongle's network:
+TachTalk always runs in Mixed mode (AP + STA simultaneously):
+
+**Access Point (always active)**:
+- SSID: `TachTalk-XXXX` (XXXX derived from MAC address, customizable)
+- IP: `10.15.25.1` (configurable)
+- Captive portal redirects to configuration page
+- mDNS advertises as `tachtalk.local` (unfortunately, Android does not support mDNS in the browser)
+- Always available for direct phone/laptop connection
+
+**Station (connects to dongle network)**:
 - Connects to configured SSID (default: "V-LINK")
 - DHCP or static IP as configured
-- mDNS advertises as `tachtalk.local`
 - Proxies OBD2 traffic and controls LEDs
+
+This dual-mode operation ensures the Web UI is always accessible via the device's own access point, even when connected to the OBD2 dongle's network. 
 
 ## Component Details
 
@@ -43,7 +50,7 @@ After WiFi is configured, TachTalk connects to the dongle's network:
 | `web_server.rs` | ~530 | HTTP server, REST API, configuration endpoints |
 | `config.rs` | ~330 | Configuration structures, NVS persistence |
 | `sse_server.rs` | ~180 | Server-Sent Events for real-time Web UI updates |
-| `dns.rs` | ~180 | Captive portal DNS server for AP mode |
+| `dns.rs` | ~180 | Captive portal DNS server for AP |
 | `cpu_stats.rs` | ~120 | CPU usage monitoring |
 | `leds.rs` | ~75 | WS2812B LED control via RMT peripheral |
 | `watchdog.rs` | ~65 | Task watchdog management |
@@ -53,15 +60,16 @@ After WiFi is configured, TachTalk connects to the dongle's network:
 
 | Crate | Description |
 |-------|-------------|
-| `tachtalk-elm327-lib` | ELM327 command parsing and response generation |
+| `tachtalk-elm327-lib` | ELM327 AT command handling, per-client state, response formatting |
 | `tachtalk-shift-lights-lib` | Threshold configuration types and LED logic |
 
 ### Main Components
 
 1. **WiFi Connection Manager** (`src/main.rs`)
-   - Manages AP and STA modes
-   - Handles reconnection logic
-   - Static IP or DHCP configuration
+   - Always runs in Mixed mode (AP + STA)
+   - AP always active for direct device access
+   - Manages STA connection to dongle network
+   - Static IP or DHCP configuration for STA
 
 2. **OBD2 Proxy** (`src/obd2.rs`)
    - Listens on configurable port (default: 35000) for client connections
@@ -89,7 +97,7 @@ After WiFi is configured, TachTalk connects to the dongle's network:
    - Powers real-time Web UI updates
 
 6. **DNS Server** (`src/dns.rs`)
-   - Active only in AP mode
+   - Always active (AP is always running)
    - Captive portal: responds to all queries with device IP
    - Enables automatic redirect to configuration page
 
@@ -101,12 +109,12 @@ After WiFi is configured, TachTalk connects to the dongle's network:
 ## Data Flow
 
 ### Request Proxying
-1. RaceChroнo sends OBD2 request → ESP32 (port 35000)
+1. RaceChrono sends OBD2 request → ESP32 (port 35000)
 2. ESP32 forwards request → OBD2 dongle
 3. Dongle responds with OBD2 data → ESP32
 4. ESP32 extracts RPM from response
 5. ESP32 updates LED strip based on RPM
-6. ESP32 forwards response → RaceChroнo
+6. ESP32 forwards response → RaceChrono
 
 ### Idle Polling
 1. When no requests received for a timeout period:
@@ -133,7 +141,7 @@ The highest matching threshold (by RPM) is active. Thresholds are evaluated in o
 - **Dongle IP**: 192.168.0.10
 - **Dongle Port**: 35000
 - **Listen Port**: 35000
-- **AP IP**: 192.168.71.1
+- **AP IP**: 10.15.25.1 (configurable)
 - **AP SSID**: TachTalk-XXXX (auto-generated from MAC)
 
 ### Static IP Defaults (when not using DHCP)
@@ -191,14 +199,15 @@ cargo run --release
 - Check WiFi connectivity (Connection Status shows SSID/IP)
 - Ensure dongle is powered on
 
-### RaceChroнo can't connect
+### RaceChrono can't connect
 - Check ESP32 IP address in Web UI or serial output
 - Verify port 35000 is configured (OBD2 Configuration)
 - Ensure devices are on the same network
 
 ### Can't access Web UI
-- In AP mode: connect to TachTalk-XXXX, go to 192.168.71.1
-- In client mode: use device IP or tachtalk.local
+- Via AP: connect to TachTalk-XXXX, go to 10.15.25.1
+- Via dongle network: use device IP or tachtalk.local
+- Note: Some OBD2 dongles don't allow devices to communicate; use the AP instead
 
 ## Future Enhancements
 

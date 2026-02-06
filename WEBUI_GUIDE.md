@@ -2,15 +2,23 @@
 
 ## Accessing the Web UI
 
-### First Boot (Access Point Mode)
+### Via TachTalk Access Point (Always Available)
+The device's own access point is always active, even when connected to the dongle network:
 1. Connect to the `TachTalk-XXXX` WiFi network (XXXX is derived from the device MAC)
 2. A captive portal should redirect you automatically
-3. If not, open a browser to: `http://192.168.71.1`
+3. If not, open a browser to: `http://10.15.25.1`
 
-### After WiFi Configuration (Client Mode)
-1. Connect your device to the same WiFi network as the ESP32-S3
+This is the recommended method because:
+- Some OBD2 dongles don't allow devices to communicate with each other
+- Fewer devices on the dongle WiFi leaves more processing power for OBD2 queries
+
+### Via Dongle Network
+When connected to the same network as the OBD2 dongle:
+1. Connect your phone/laptop to the dongle's WiFi network
 2. Access via mDNS: `http://tachtalk.local`
 3. Or use the device's IP address (shown in serial output or the Web UI status)
+
+**Note**: This may not work with all OBD2 dongles.
 
 ## Configuration Interface
 
@@ -21,7 +29,7 @@ The web UI displays:
 - Brightness slider with live preview
 - Connection status diagram
 - WiFi configuration
-- Access Point configuration
+- Access Point settings
 - OBD2 configuration
 - System settings
 - RPM threshold configuration
@@ -32,7 +40,7 @@ The web UI displays:
 The visual diagram shows:
 - **OBD2 Dongle**: Connection status to the Wi-Fi OBD2 dongle
 - **TachTalk Device**: Central hub showing WiFi and TCP connections
-- **OBD2 Clients**: Number of connected clients (e.g., RaceChroнo)
+- **OBD2 Clients**: Number of connected clients (e.g., RaceChrono)
 - **Browser**: Your current Web UI connection
 
 Click on nodes to see detailed network information (IP addresses, ports, signal strength).
@@ -73,7 +81,7 @@ Configure connection to the OBD2 dongle:
 
 - **Dongle IP**: IP address of the OBD2 dongle (default: 192.168.0.10)
 - **Dongle Port**: TCP port of the dongle (default: 35000)
-- **Proxy Listen Port**: Port for RaceChroнo to connect (default: 35000)
+- **Proxy Listen Port**: Port for RaceChrono to connect (default: 35000)
 - **Timeout (ms)**: OBD2 response timeout (default: 4500ms, max: 4500ms)
 
 ### System Settings
@@ -188,9 +196,9 @@ Threshold 6: Shift - 6500 RPM, LED 0-7, White, Blink 100ms
 ## Troubleshooting
 
 ### Can't Access Web UI
-- **AP Mode**: Connect to TachTalk-XXXX, go to 192.168.71.1
-- **Client Mode**: Check device IP in serial output, or try tachtalk.local
-- Ensure you're on the correct network
+- **Via AP (recommended)**: Connect to TachTalk-XXXX, go to 10.15.25.1
+- **Via dongle network**: Check device IP in serial output, or try tachtalk.local
+- Note: Some OBD2 dongles don't allow devices to communicate; use the AP instead
 - Clear browser cache or try incognito mode
 
 ### Changes Not Saving
@@ -218,9 +226,9 @@ For programmatic access:
 | `/` | GET | Web UI HTML |
 | `/api/config` | GET | Current configuration (JSON) |
 | `/api/config` | POST | Update configuration |
-| `/api/mode` | GET | Current WiFi mode (ap/client) |
+| `/api/status` | GET | Connection status (WiFi, dongle, clients) |
 | `/api/wifi/scan` | GET | Scan for WiFi networks |
 | `/api/wifi` | POST | Connect to WiFi network |
 | `/api/reboot` | POST | Reboot the device |
-| `/api/benchmark` | GET | Run OBD2 benchmark |
+| `/api/benchmark` | POST | Run OBD2 benchmark |
 | `/events` | GET | SSE stream for real-time updates |

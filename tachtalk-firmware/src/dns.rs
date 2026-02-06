@@ -5,16 +5,18 @@
 use crate::watchdog::WatchdogHandle;
 use log::{debug, error, info, warn};
 use std::net::{Ipv4Addr, UdpSocket};
+use std::sync::OnceLock;
 use std::time::Duration;
 
 const DNS_PORT: u16 = 53;
-const AP_IP: Ipv4Addr = Ipv4Addr::new(192, 168, 71, 1);
+static AP_IP: OnceLock<Ipv4Addr> = OnceLock::new();
 
 /// Start the captive portal DNS server in a background thread.
 ///
 /// The server responds to all A record queries with the AP IP address,
 /// causing all DNS lookups to resolve to the captive portal.
-pub fn start_dns_server() {
+pub fn start_dns_server(ap_ip: Ipv4Addr) {
+    AP_IP.get_or_init(|| ap_ip);
     crate::thread_util::spawn_named(c"dns_srv", || {
         if let Err(e) = run_dns_server() {
             error!("DNS server error: {e}");
@@ -147,7 +149,8 @@ fn build_dns_response(query: &[u8]) -> Option<Vec<u8>> {
     response.extend_from_slice(&1u16.to_be_bytes()); // CLASS = IN (1)
     response.extend_from_slice(&60u32.to_be_bytes()); // TTL = 60 seconds
     response.extend_from_slice(&4u16.to_be_bytes()); // RDLENGTH = 4 (IPv4)
-    response.extend_from_slice(&AP_IP.octets()); // RDATA = AP IP
+    let ap_ip = AP_IP.get().copied().unwrap_or(Ipv4Addr::new(10, 15, 25, 1));
+    response.extend_from_slice(&ap_ip.octets()); // RDATA = AP IP
 
     Some(response)
 }

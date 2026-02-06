@@ -65,7 +65,7 @@ ESP32-S3 GND    ──> LED Strip GND
 
 2. **Open the configuration page**
    - A captive portal should redirect you automatically
-   - If not, go to: `http://192.168.71.1`
+   - If not, go to: `http://10.15.25.1`
 
 3. **Configure WiFi to connect to your OBD2 dongle**
    - Enter the dongle's SSID (default: "V-LINK" for Vgate iCar 2)
@@ -74,8 +74,8 @@ ESP32-S3 GND    ──> LED Strip GND
    - The device will reboot and connect to the dongle network
 
 4. **Reconnect to access the Web UI**
-   - Connect your computer/phone to the same network as the OBD2 dongle
-   - Access TachTalk at `http://tachtalk.local` or its IP address
+   - Connect your computer/phone to the TachTalk-XXXX WiFi access point
+   - Access TachTalk at `http://10.15.25.1`
 
 ## Step 5: Configure Shift Lights (2 minutes)
 
@@ -89,28 +89,29 @@ In the Web UI:
 
 ## Step 6: Connect to Vehicle
 
-### Without RaceChroнo (Standalone Mode)
+### Without RaceChrono (Standalone Mode)
 1. Plug OBD2 dongle into vehicle OBD2 port
 2. Turn on ignition
 3. Power on ESP32-S3
 4. Device connects to dongle WiFi automatically
 5. LEDs will start showing RPM!
 
-### With RaceChroнo (Proxy Mode)
-1. Configure RaceChroнo OBD2 connection:
+### With RaceChrono (Proxy Mode)
+1. Connect your phone to the TachTalk-XXXX WiFi access point
+2. Configure RaceChrono OBD2 connection:
    - Type: WiFi/Network
-   - IP: TachTalk's IP (check Web UI) or tachtalk.local
+   - IP: 10.15.25.1 (configurable)
    - Port: 35000
-2. Connect in RaceChroнo
-3. LEDs show RPM based on your thresholds while RaceChroнo logs data
+3. Connect in RaceChrono
+4. LEDs show RPM based on your thresholds while RaceChroно logs data
 
 ## Verification Checklist
 
 - [ ] ESP32-S3 boots successfully (check serial output)
-- [ ] TachTalk-XXXX WiFi hotspot appears on first boot
-- [ ] Web UI accessible at 192.168.71.1 in AP mode
+- [ ] TachTalk-XXXX WiFi hotspot appears
+- [ ] Web UI accessible at 10.15.25.1 via AP
 - [ ] Device connects to dongle WiFi after configuration
-- [ ] Web UI accessible via tachtalk.local in client mode
+- [ ] Web UI accessible via tachtalk.local on dongle network (may not work on all dongles)
 - [ ] LED strip powers on
 - [ ] LEDs respond to RPM changes
 - [ ] Configuration changes save successfully
@@ -141,9 +142,9 @@ In the Web UI:
 - Check serial output for LED controller errors
 
 ### Can't Access Web UI
-- **AP mode**: Connect to TachTalk-XXXX, go to 192.168.71.1
-- **Client mode**: Use device IP from serial output, or tachtalk.local
-- Ensure you're on the same network
+- **Via AP (recommended)**: Connect to TachTalk-XXXX, go to 10.15.25.1
+- **Via dongle network**: Use device IP from serial output, or tachtalk.local
+- Note: Some OBD2 dongles don't allow devices to communicate; use the AP instead
 - Try pinging the device
 
 ### LEDs Flicker or Wrong Colors

@@ -37,20 +37,14 @@ use sse_server::{sse_server_task, SseSender};
 
 use std::sync::atomic::{AtomicBool, AtomicU32};
 
-const AP_SSID_PREFIX: &str = "TachTalk-";
-
 /// Central state shared across tasks
 ///
-/// Note: `ap_ssid` is stored here (not just in Config) because the default value
-/// requires the WiFi MAC address, which isn't available until after WiFi driver init.
-/// We resolve it once at startup: use `config.ap_ssid` if set, otherwise generate
-/// from MAC. This also means WiFi config changes require a reboot to take effect,
-/// which is consistent with how `wifi_connection_manager` caches credentials.
+/// Note: WiFi config changes require a reboot to take effect, which is consistent
+/// with how `wifi_connection_manager` caches credentials.
 pub struct State {
     pub config: Mutex<Config>,
     pub wifi: Mutex<EspWifi<'static>>,
-    pub wifi_mode: Mutex<WifiMode>,
-    /// Resolved AP SSID (from config or MAC-derived default)
+    /// AP SSID (cached at startup from config)
     pub ap_ssid: String,
     pub sse_tx: SseSender,
     pub dongle_tx: DongleSender,
@@ -68,36 +62,6 @@ pub struct State {
     pub client_tcp_info: Mutex<Vec<(SocketAddr, SocketAddr)>>,
 }
 
-/// Convert a subnet mask string (e.g., "255.255.255.0") to CIDR prefix length (e.g., 24)
-fn subnet_mask_to_cidr(mask_str: &str) -> Result<u8> {
-    let mask: Ipv4Addr = mask_str.parse().map_err(|e| {
-        anyhow::anyhow!("Invalid subnet mask '{mask_str}': {e}")
-    })?;
-    let bits = u32::from(mask);
-    // Validate it's a valid mask (all 1s followed by all 0s)
-    let leading_ones = bits.leading_ones();
-    let expected = if leading_ones == 32 {
-        u32::MAX
-    } else {
-        u32::MAX << (32 - leading_ones)
-    };
-    if bits != expected {
-        return Err(anyhow::anyhow!(
-            "Invalid subnet mask '{mask_str}': not a valid mask (expected contiguous 1s)"
-        ));
-    }
-    Ok(u8::try_from(leading_ones).unwrap())
-}
-
-/// `WiFi` mode the device is running in
-#[derive(Clone, Copy, PartialEq, Debug)]
-pub enum WifiMode {
-    /// Running as an access point (no STA configured or STA disconnected)
-    AccessPoint,
-    /// Connected to a configured network as a client (AP disabled)
-    Client,
-}
-
 /// Create STA network interface with static IP or DHCP based on config
 fn create_sta_netif(config: &Config) -> Result<EspNetif> {
     if config.ip.use_dhcp {
@@ -105,32 +69,22 @@ fn create_sta_netif(config: &Config) -> Result<EspNetif> {
         Ok(EspNetif::new(NetifStack::Sta)?)
     } else {
         // Parse static IP configuration
-        let ip_str = config.ip.effective_ip().unwrap();
-        let gateway_str = config.ip.effective_gateway().unwrap();
-        let subnet_str = config.ip.effective_subnet().unwrap();
-
-        let ip: Ipv4Addr = ip_str.parse().map_err(|e| {
-            anyhow::anyhow!("Invalid static IP '{ip_str}': {e}")
+        let ip: Ipv4Addr = config.ip.ip.parse().map_err(|_| {
+            anyhow::anyhow!("Invalid static IP: {}", config.ip.ip)
         })?;
-        let gateway: Ipv4Addr = gateway_str.parse().map_err(|e| {
-            anyhow::anyhow!("Invalid gateway '{gateway_str}': {e}")
-        })?;
-        let mask = subnet_mask_to_cidr(subnet_str)?;
+        let mask = config.ip.prefix_len;
 
-        // Parse optional DNS
-        let dns = config.ip.dns.as_ref().and_then(|s| s.parse().ok());
-
-        info!("STA netif: Static IP {ip} gateway {gateway}/{mask} dns {dns:?}");
+        info!("STA netif: Static IP {ip}/{mask} (no gateway)");
 
         let mut sta_config = NetifConfiguration::wifi_default_client();
         sta_config.ip_configuration = Some(IpConfiguration::Client(
             IpClientConfiguration::Fixed(IpClientSettings {
                 ip,
                 subnet: Subnet {
-                    gateway,
+                    gateway: Ipv4Addr::UNSPECIFIED,
                     mask: Mask(mask),
                 },
-                dns,
+                dns: None,
                 secondary_dns: None,
             }),
         ));
@@ -139,17 +93,17 @@ fn create_sta_netif(config: &Config) -> Result<EspNetif> {
 }
 
 /// Create AP network interface with captive portal DNS configuration
-fn create_ap_netif() -> Result<EspNetif> {
+fn create_ap_netif(ap_ip: Ipv4Addr, ap_prefix_len: u8) -> Result<EspNetif> {
     // Custom router config that uses our IP as DNS
     // (default uses 8.8.8.8 which bypasses our captive portal DNS)
     let ap_router_config = ipv4::RouterConfiguration {
         subnet: ipv4::Subnet {
-            gateway: Ipv4Addr::new(192, 168, 71, 1),
-            mask: ipv4::Mask(24),
+            gateway: ap_ip,
+            mask: ipv4::Mask(ap_prefix_len),
         },
         dhcp_enabled: true,
-        dns: Some(Ipv4Addr::new(192, 168, 71, 1)),           // Point to our DNS server
-        secondary_dns: Some(Ipv4Addr::new(192, 168, 71, 1)), // Also use our DNS
+        dns: Some(ap_ip),           // Point to our DNS server
+        secondary_dns: Some(ap_ip), // Also use our DNS
     };
 
     let mut ap_netif_config = NetifConfiguration::wifi_default_router();
@@ -259,14 +213,11 @@ fn init_wifi(
 
     let wifi_driver = WifiDriver::new(modem, sys_loop, Some(nvs))?;
     let sta_netif = create_sta_netif(config)?;
-    let ap_netif = create_ap_netif()?;
+    let ap_netif = create_ap_netif(config.ap_ip, config.ap_prefix_len)?;
     let wifi = EspWifi::wrap_all(wifi_driver, sta_netif, ap_netif)?;
 
-    // Generate AP SSID: use config override or derive from MAC address
-    let mac = wifi.sta_netif().get_mac()?;
-    let ap_ssid = config.ap_ssid.clone().unwrap_or_else(|| {
-        format!("{}{:02X}{:02X}", AP_SSID_PREFIX, mac[4], mac[5])
-    });
+    // AP SSID from config (default is MAC-derived, computed in Config::default())
+    let ap_ssid = config.ap_ssid.clone();
 
     // Get AP password from config
     let ap_password = config.ap_password.clone();
@@ -292,9 +243,10 @@ fn spawn_background_tasks(
     dongle_rx: std::sync::mpsc::Receiver<obd2::DongleRequest>,
     rpm_rx: std::sync::mpsc::Receiver<obd2::RpmTaskMessage>,
     ap_hostname: String,
+    ap_ip: Ipv4Addr,
 ) {
     // Start DNS server for captive portal
-    dns::start_dns_server();
+    dns::start_dns_server(ap_ip);
 
     // Start SSE server for RPM streaming (on port 8081)
     thread_util::spawn_named(c"sse_srv", move || {
@@ -321,7 +273,7 @@ fn spawn_background_tasks(
     {
         let state = state.clone();
         thread_util::spawn_named(c"web_srv", move || {
-            if let Err(e) = web_server::start_server(&state, Some(ap_hostname)) {
+            if let Err(e) = web_server::start_server(&state, Some(ap_hostname), ap_ip) {
                 error!("Web server error: {e:?}");
             }
         });
@@ -367,6 +319,7 @@ fn main() -> Result<()> {
     let (wifi, ap_ssid) = init_wifi(&config, peripherals.modem, sys_loop, nvs)?;
 
     let ap_hostname = ap_ssid.to_lowercase();
+    let ap_ip = config.ap_ip;
 
     // Create all channels upfront
     let (sse_tx, sse_rx) = std::sync::mpsc::channel();
@@ -377,7 +330,6 @@ fn main() -> Result<()> {
     let state = Arc::new(State {
         config: Mutex::new(config),
         wifi: Mutex::new(wifi),
-        wifi_mode: Mutex::new(WifiMode::AccessPoint),
         ap_ssid,
         sse_tx,
         dongle_tx,
@@ -391,7 +343,7 @@ fn main() -> Result<()> {
         client_tcp_info: Mutex::new(Vec::new()),
     });
 
-    spawn_background_tasks(&state, led_controller, sse_rx, dongle_rx, rpm_rx, ap_hostname);
+    spawn_background_tasks(&state, led_controller, sse_rx, dongle_rx, rpm_rx, ap_hostname, ap_ip);
 
     // Start mDNS for local discovery (tachtalk.local)
     let _mdns = setup_mdns();
@@ -410,223 +362,102 @@ fn main() -> Result<()> {
     }
 }
 
-/// Configuration bundle for WiFi connection manager
-struct WifiManagerContext<'a> {
-    state: &'a Arc<State>,
-    client_config: Configuration,
-    mixed_config: Configuration,
-    watchdog: WatchdogHandle,
-}
-
-impl WifiManagerContext<'_> {
-    /// Extract STA SSID from the client configuration
-    fn sta_ssid(&self) -> &str {
-        match &self.client_config {
-            Configuration::Client(c) => c.ssid.as_str(),
-            _ => unreachable!("client_config is always Configuration::Client"),
-        }
-    }
-
-    /// Handle Mixed mode: attempt to connect to configured STA network, switch to Station mode on success
-    fn handle_mixed_mode(&self) {
-        let sta_ssid = self.sta_ssid();
-        debug!("Attempting to connect to '{sta_ssid}'...");
-        
-        // Initiate connection (non-blocking)
-        {
-            let mut wifi_guard = self.state.wifi.lock().unwrap();
-            if let Err(e) = wifi_guard.connect() {
-                debug!("STA connection initiation failed: {e:?}");
-                drop(wifi_guard);
-                // Wait before next attempt
-                for _ in 0..2 {
-                    FreeRtos::delay_ms(1000);
-                    self.watchdog.feed();
-                }
-                return;
-            }
-        }
-        
-        // Poll for connection with 15s timeout, releasing mutex between polls
-        for _ in 0..15 {
-            self.watchdog.feed();
-            FreeRtos::delay_ms(1000);
-            
-            let wifi_guard = self.state.wifi.lock().unwrap();
-            if wifi_guard.is_connected().unwrap_or(false) {
-                if let Ok(ip_info) = wifi_guard.sta_netif().get_ip_info() {
-                    if !ip_info.ip.is_unspecified() {
-                        info!("WiFi STA connected to '{sta_ssid}' with IP: {}", ip_info.ip);
-                        drop(wifi_guard);
-                        self.switch_to_station_mode();
-                        return;
-                    }
-                }
-            }
-        }
-        
-        debug!("Connection to '{sta_ssid}' timed out after 15s");
-        
-        // Wait before next attempt
-        for _ in 0..2 {
-            FreeRtos::delay_ms(1000);
-            self.watchdog.feed();
-        }
-    }
-    
-    /// Switch from Mixed mode to Station-only mode after successful connection
-    fn switch_to_station_mode(&self) {
-        info!("Switching to Station-only mode");
-        
-        {
-            let mut wifi_guard = self.state.wifi.lock().unwrap();
-            
-            if let Err(e) = wifi_guard.stop() {
-                warn!("Failed to stop WiFi for mode switch: {e:?}");
-                return;
-            }
-            
-            if let Err(e) = wifi_guard.set_configuration(&self.client_config) {
-                warn!("Failed to switch to Station-only mode: {e:?}");
-                self.restore_mixed_mode(&mut wifi_guard);
-                return;
-            }
-            
-            if let Err(e) = wifi_guard.start() {
-                warn!("Failed to start WiFi in Station-only mode: {e:?}");
-                self.restore_mixed_mode(&mut wifi_guard);
-                return;
-            }
-            
-            // Brief delay for WiFi driver to settle after mode switch
-            FreeRtos::delay_ms(100);
-            
-            // Reconnect in Station-only mode (non-blocking)
-            if let Err(e) = wifi_guard.connect() {
-                warn!("Failed to reconnect after mode switch: {e:?}");
-                self.restore_mixed_mode(&mut wifi_guard);
-                return;
-            }
-        }
-        
-        // Poll for reconnection with 15s timeout, releasing mutex between polls
-        for _ in 0..15 {
-            self.watchdog.feed();
-            FreeRtos::delay_ms(1000);
-            
-            let wifi_guard = self.state.wifi.lock().unwrap();
-            if wifi_guard.is_connected().unwrap_or(false) {
-                if let Ok(ip_info) = wifi_guard.sta_netif().get_ip_info() {
-                    if !ip_info.ip.is_unspecified() {
-                        info!("Reconnected in Station-only mode with IP: {}", ip_info.ip);
-                        drop(wifi_guard);
-                        *self.state.wifi_mode.lock().unwrap() = WifiMode::Client;
-                        return;
-                    }
-                }
-            }
-        }
-        
-        // Reconnection failed - fall back to Mixed mode
-        warn!("Failed to reconnect in Station-only mode after 15s, falling back to Mixed mode");
-        let mut wifi_guard = self.state.wifi.lock().unwrap();
-        self.restore_mixed_mode(&mut wifi_guard);
-    }
-    
-    /// Restore Mixed mode configuration after a failed mode switch
-    fn restore_mixed_mode(&self, wifi_guard: &mut EspWifi<'static>) {
-        if let Err(e) = wifi_guard.stop() {
-            warn!("Failed to stop WiFi for fallback: {e:?}");
-        }
-        if let Err(e) = wifi_guard.set_configuration(&self.mixed_config) {
-            warn!("Failed to restore Mixed mode config: {e:?}");
-        }
-        if let Err(e) = wifi_guard.start() {
-            warn!("Failed to restart WiFi in Mixed mode: {e:?}");
-        }
-    }
-
-    /// Handle Client mode: monitor connection, switch back to Mixed if disconnected
-    fn handle_client_mode(&self) {
-        FreeRtos::delay_ms(1000);
-        self.watchdog.feed();
-        
-        let connected = {
-            let wifi_guard = self.state.wifi.lock().unwrap();
-            wifi_guard.is_connected().unwrap_or(false)
-        };
-        
-        if !connected {
-            warn!("WiFi STA disconnected from '{}' - switching back to Mixed mode", self.sta_ssid());
-            
-            let mut wifi_guard = self.state.wifi.lock().unwrap();
-            if let Err(e) = wifi_guard.stop() {
-                warn!("Failed to stop WiFi for mode switch: {e:?}");
-            }
-            if let Err(e) = wifi_guard.set_configuration(&self.mixed_config) {
-                warn!("Failed to switch to Mixed mode: {e:?}");
-            } else {
-                info!("Switched to Mixed mode (AP re-enabled)");
-                *self.state.wifi_mode.lock().unwrap() = WifiMode::AccessPoint;
-            }
-            if let Err(e) = wifi_guard.start() {
-                warn!("Failed to restart WiFi in Mixed mode: {e:?}");
-            }
-        }
-    }
+/// Connection state for WiFi station interface
+enum StaConnectionState {
+    /// Not connected at L2 (WiFi association)
+    Disconnected,
+    /// L2 connected, waiting for IP (DHCP or static IP being applied)
+    AwaitingIp,
+    /// Fully connected with a valid IP address
+    Connected(Ipv4Addr),
 }
 
 /// Background task to manage WiFi STA connection
-/// - In Mixed mode: AP running, attempting to connect to configured STA network
-/// - In STA mode: Connected to STA, AP disabled
+/// Always runs in Mixed mode (AP + STA) - AP is never disabled
 fn wifi_connection_manager(state: &Arc<State>) {
-    // Read credentials from config (cached at task start - changes require reboot)
-    let (sta_ssid, sta_password, ap_password) = {
-        let cfg_guard = state.config.lock().unwrap();
-        (
-            cfg_guard.wifi.ssid.clone(),
-            cfg_guard.wifi.password.clone().unwrap_or_default(),
-            cfg_guard.ap_password.clone().unwrap_or_default(),
-        )
-    };
-    let ap_ssid = &state.ap_ssid;
+    let watchdog = WatchdogHandle::register("wifi_manager");
     
-    let sta_auth_method = if sta_password.is_empty() { AuthMethod::None } else { AuthMethod::WPA2Personal };
-    let ap_auth_method = if ap_password.is_empty() { AuthMethod::None } else { AuthMethod::WPA2Personal };
-
-    let ctx = WifiManagerContext {
-        state,
-        client_config: Configuration::Client(ClientConfiguration {
-            ssid: sta_ssid.as_str().try_into().unwrap_or_default(),
-            password: sta_password.as_str().try_into().unwrap_or_default(),
-            auth_method: sta_auth_method,
-            ..Default::default()
-        }),
-        mixed_config: Configuration::Mixed(
-            ClientConfiguration {
-                ssid: sta_ssid.as_str().try_into().unwrap_or_default(),
-                password: sta_password.as_str().try_into().unwrap_or_default(),
-                auth_method: sta_auth_method,
-                ..Default::default()
-            },
-            AccessPointConfiguration {
-                ssid: ap_ssid.as_str().try_into().unwrap(),
-                password: ap_password.as_str().try_into().unwrap_or_default(),
-                auth_method: ap_auth_method,
-                channel: 0,
-                ..Default::default()
-            },
-        ),
-        watchdog: WatchdogHandle::register("wifi_manager"),
+    // Read STA SSID from config (cached at task start - changes require reboot)
+    let sta_ssid = {
+        let cfg_guard = state.config.lock().unwrap();
+        cfg_guard.wifi.ssid.clone()
     };
+
+    let mut was_connected = false;
 
     loop {
-        ctx.watchdog.feed();
-        let current_mode = *ctx.state.wifi_mode.lock().unwrap();
-
-        match current_mode {
-            WifiMode::AccessPoint => ctx.handle_mixed_mode(),
-            WifiMode::Client => ctx.handle_client_mode(),
+        watchdog.feed();
+        
+        let connection_state = {
+            let wifi_guard = state.wifi.lock().unwrap();
+            let l2_connected = match wifi_guard.is_connected() {
+                Ok(connected) => connected,
+                Err(e) => {
+                    error!("Failed to check WiFi connection status: {e}");
+                    false
+                }
+            };
+            if l2_connected {
+                match wifi_guard.sta_netif().get_ip_info() {
+                    Ok(info) if !info.ip.is_unspecified() => {
+                        StaConnectionState::Connected(info.ip)
+                    }
+                    Ok(_) => StaConnectionState::AwaitingIp,
+                    Err(e) => {
+                        error!("Failed to get STA IP info: {e}");
+                        StaConnectionState::AwaitingIp
+                    }
+                }
+            } else {
+                StaConnectionState::Disconnected
+            }
+        };
+        
+        match connection_state {
+            StaConnectionState::Connected(ip) => {
+                // Fully connected with IP - just monitor
+                if !was_connected {
+                    info!("WiFi STA connected to '{sta_ssid}' with IP: {ip}");
+                    was_connected = true;
+                }
+                FreeRtos::delay_ms(1000);
+            }
+            StaConnectionState::AwaitingIp => {
+                // L2 connected but waiting for IP - don't call connect(), just wait
+                FreeRtos::delay_ms(1000);
+            }
+            StaConnectionState::Disconnected => {
+                // Not connected at L2 - try to connect
+                if was_connected {
+                    warn!("WiFi STA disconnected from '{sta_ssid}'");
+                    was_connected = false;
+                }
+                
+                debug!("Attempting to connect to '{sta_ssid}'...");
+                
+                // Initiate connection (non-blocking)
+                {
+                    let mut wifi_guard = state.wifi.lock().unwrap();
+                    if let Err(e) = wifi_guard.connect() {
+                        debug!("STA connection initiation failed: {e:?}");
+                    }
+                }
+                
+                // Wait for L2 connection or timeout (15s)
+                for _ in 0..15 {
+                    watchdog.feed();
+                    FreeRtos::delay_ms(1000);
+                    
+                    let wifi_guard = state.wifi.lock().unwrap();
+                    match wifi_guard.is_connected() {
+                        Ok(true) => break,
+                        Ok(false) => {}
+                        Err(e) => {
+                            error!("Failed to check WiFi connection status: {e}");
+                        }
+                    }
+                }
+            }
         }
     }
 }

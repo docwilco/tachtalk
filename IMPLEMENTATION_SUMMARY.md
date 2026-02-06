@@ -165,7 +165,7 @@ ws2812-esp32-rmt-driver = "0.13.1"  # WS2812B driver
 
 ```
 ┌──────────────┐
-│ RaceChroнo   │
+│ RaceChrono   │
 │     App      │
 └──────┬───────┘
        │ OBD2 Request (port 35000)

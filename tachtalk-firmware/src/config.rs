@@ -1,8 +1,28 @@
 use anyhow::{anyhow, Result};
 use esp_idf_svc::nvs::{EspNvs, EspNvsPartition, NvsDefault};
+use esp_idf_svc::sys::{esp_mac_type_t_ESP_MAC_WIFI_STA, esp_read_mac};
 use log::{debug, info, warn, LevelFilter};
 use serde::{Deserialize, Serialize};
+use std::net::Ipv4Addr;
 use std::sync::Mutex;
+
+const AP_SSID_PREFIX: &str = "TachTalk-";
+
+/// Read WiFi STA MAC address from eFuse (available before WiFi driver init)
+fn get_wifi_sta_mac() -> [u8; 6] {
+    let mut mac = [0u8; 6];
+    // SAFETY: esp_read_mac just reads from eFuse, no driver needed
+    unsafe {
+        esp_read_mac(mac.as_mut_ptr(), esp_mac_type_t_ESP_MAC_WIFI_STA);
+    }
+    mac
+}
+
+/// Generate default AP SSID from WiFi MAC address
+fn default_ap_ssid() -> String {
+    let mac = get_wifi_sta_mac();
+    format!("{AP_SSID_PREFIX}{:02X}{:02X}", mac[4], mac[5])
+}
 
 // Re-export shift-lights types for use in the firmware
 pub use tachtalk_shift_lights_lib::{RGB8, ThresholdConfig};
@@ -65,61 +85,28 @@ impl Default for WifiConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IpConfig {
     pub use_dhcp: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub ip: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub gateway: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub subnet: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub dns: Option<String>,
+    /// Static IP address (used when `use_dhcp` is false)
+    #[serde(default = "default_static_ip")]
+    pub ip: String,
+    /// Subnet prefix length (e.g., 24 for /24). Defaults to 24.
+    #[serde(default = "default_prefix_len")]
+    pub prefix_len: u8,
+}
+
+fn default_static_ip() -> String {
+    "192.168.0.20".to_string()
+}
+
+const fn default_prefix_len() -> u8 {
+    24
 }
 
 impl Default for IpConfig {
     fn default() -> Self {
         Self {
             use_dhcp: true,
-            ip: None,
-            gateway: None,
-            subnet: None,
-            dns: None,
-        }
-    }
-}
-
-impl IpConfig {
-    /// Default static IP when not using DHCP on the dongle network
-    pub const DEFAULT_STATIC_IP: &'static str = "192.168.0.20";
-    pub const DEFAULT_GATEWAY: &'static str = "192.168.0.1";
-    pub const DEFAULT_SUBNET: &'static str = "255.255.255.0";
-
-    /// Get IP address, using default static IP if static mode but no IP configured
-    #[must_use]
-    pub fn effective_ip(&self) -> Option<&str> {
-        if self.use_dhcp {
-            None
-        } else {
-            Some(self.ip.as_deref().unwrap_or(Self::DEFAULT_STATIC_IP))
-        }
-    }
-
-    /// Get gateway, using default if static mode but not configured
-    #[must_use]
-    pub fn effective_gateway(&self) -> Option<&str> {
-        if self.use_dhcp {
-            None
-        } else {
-            Some(self.gateway.as_deref().unwrap_or(Self::DEFAULT_GATEWAY))
-        }
-    }
-
-    /// Get subnet mask, using default if static mode but not configured
-    #[must_use]
-    pub fn effective_subnet(&self) -> Option<&str> {
-        if self.use_dhcp {
-            None
-        } else {
-            Some(self.subnet.as_deref().unwrap_or(Self::DEFAULT_SUBNET))
+            ip: default_static_ip(),
+            prefix_len: default_prefix_len(),
         }
     }
 }
@@ -152,11 +139,17 @@ pub struct Config {
     pub ip: IpConfig,
     #[serde(default)]
     pub obd2: Obd2Config,
-    /// AP SSID override. If None, uses "TachTalk-XXXX" where XXXX is derived from MAC.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub ap_ssid: Option<String>,
+    /// AP SSID (defaults to "TachTalk-XXXX" where XXXX is derived from MAC)
+    #[serde(default = "default_ap_ssid")]
+    pub ap_ssid: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ap_password: Option<String>,
+    /// AP IP address for the access point interface
+    #[serde(default = "default_ap_ip")]
+    pub ap_ip: Ipv4Addr,
+    /// AP subnet prefix length (e.g., 24 for /24)
+    #[serde(default = "default_ap_prefix_len")]
+    pub ap_prefix_len: u8,
     #[serde(default)]
     pub log_level: LogLevel,
     pub thresholds: Vec<ThresholdConfig>,
@@ -178,6 +171,14 @@ const fn default_brightness() -> u8 {
     255
 }
 
+fn default_ap_ip() -> Ipv4Addr {
+    Ipv4Addr::new(10, 15, 25, 1)
+}
+
+const fn default_ap_prefix_len() -> u8 {
+    24
+}
+
 /// Maximum OBD2 timeout to avoid triggering watchdog in dongle task
 pub const MAX_OBD2_TIMEOUT_MS: u64 = 4500;
 
@@ -191,8 +192,10 @@ impl Default for Config {
             wifi: WifiConfig::default(),
             ip: IpConfig::default(),
             obd2: Obd2Config::default(),
-            ap_ssid: None,
+            ap_ssid: default_ap_ssid(),
             ap_password: None,
+            ap_ip: default_ap_ip(),
+            ap_prefix_len: default_ap_prefix_len(),
             log_level: LogLevel::default(),
             thresholds: vec![
                 ThresholdConfig {
@@ -260,9 +263,9 @@ impl Default for Config {
                 },
             ],
             total_leds: 1,
-            led_gpio: 48,
-            obd2_timeout_ms: MAX_OBD2_TIMEOUT_MS,
-            brightness: 255,
+            led_gpio: default_led_gpio(),
+            obd2_timeout_ms: default_obd2_timeout_ms(),
+            brightness: default_brightness(),
         }
     }
 }
@@ -277,6 +280,14 @@ impl Config {
         if self.wifi.ssid.is_empty() {
             warn!("WiFi SSID is empty, resetting to default");
             self.wifi = WifiConfig::default();
+        }
+        if self.ap_ssid.is_empty() {
+            warn!("AP SSID is empty, resetting to default");
+            self.ap_ssid = default_ap_ssid();
+        }
+        if self.ip.ip.is_empty() {
+            warn!("Static IP is empty, resetting to default");
+            self.ip.ip = default_static_ip();
         }
     }
 

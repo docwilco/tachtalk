@@ -10,13 +10,13 @@ Get up and running in 15 minutes with step-by-step instructions!
 
 ## Features
 
-- **OBD2 Proxy**: Proxies requests between RaceChroнo app and Wi-Fi OBD2 dongle
+- **OBD2 Proxy**: Proxies requests between RaceChrono app and Wi-Fi OBD2 dongle
 - **RPM Extraction**: Extracts RPM data from OBD2 requests/responses
 - **Shift Lights**: Controls WS2812B LED strip based on configurable RPM thresholds
 - **Automatic Polling**: Polls for RPM when no active requests
 - **Web UI**: Full configuration interface with real-time status
-- **Access Point Mode**: Creates WiFi hotspot for initial setup
-- **mDNS Discovery**: Access via `http://tachtalk.local` when in client mode
+- **Always-On Access Point**: TachTalk-XXXX hotspot always available for direct access
+- **mDNS Discovery**: Access via `http://tachtalk.local` on the dongle network
 - **NVS Storage**: Configuration persists across reboots
 - **ESP32-S3**: Optimized for ESP32-S3 hardware
 
@@ -63,10 +63,12 @@ espflash flash target/xtensa-esp32s3-espidf/release/tachtalk
 
 1. **Power on** the ESP32-S3 with TachTalk firmware
 2. **Connect to the WiFi hotspot** `TachTalk-XXXX` (where XXXX is derived from the device MAC address)
-3. **Open a browser** to `http://192.168.71.1` (captive portal should redirect automatically)
+3. **Open a browser** to `http://10.15.25.1` (captive portal should redirect automatically)
 4. **Configure WiFi** credentials for your OBD2 dongle's network (default: "V-LINK")
 5. **Save & Connect** — the device will reboot and connect to the configured network
-6. **Access the Web UI** at the device's new IP address or `http://tachtalk.local`
+6. **Access the Web UI** via the device's AP (10.15.25.1), or on the dongle network via IP or `http://tachtalk.local`
+
+**Note**: The TachTalk-XXXX access point remains active even after WiFi is configured. This ensures you can always access the Web UI directly, which is necessary because some OBD2 dongles don't allow connected devices to communicate with each other.
 
 ## Usage
 
@@ -76,10 +78,11 @@ espflash flash target/xtensa-esp32s3-espidf/release/tachtalk
 3. The device connects to the dongle's WiFi network
 4. LEDs display RPM automatically via polling
 
-### Proxy Mode (with RaceChroнo)
-1. Configure RaceChroнo to connect to the ESP32-S3 IP on port 35000
-2. The device proxies OBD2 requests and extracts RPM for the shift lights
-3. Both RaceChroнo and shift lights work simultaneously
+### Proxy Mode (with RaceChrono)
+1. Connect your phone to the TachTalk-XXXX WiFi access point
+2. Configure RaceChrono to connect to `10.15.25.1` on port 35000
+3. The device proxies OBD2 requests and extracts RPM for the shift lights
+4. Both RaceChrono and shift lights work simultaneously
 
 ## Web UI Configuration
 

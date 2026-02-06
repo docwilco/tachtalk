@@ -110,15 +110,6 @@
             border-radius: 5px;
             border-left: 4px solid #0088ff;
         }
-        .ap-mode-banner {
-            background-color: #ff8800;
-            color: #000;
-            padding: 15px;
-            margin: 20px 0;
-            border-radius: 5px;
-            text-align: center;
-            font-weight: bold;
-        }
         #status {
             padding: 10px;
             margin: 10px 0;
@@ -132,20 +123,6 @@
         .error {
             background-color: #5a1a1a;
             border: 1px solid #ff0000;
-        }
-        .mode-indicator {
-            padding: 5px 10px;
-            border-radius: 3px;
-            font-size: 0.9em;
-            margin-left: 10px;
-        }
-        .mode-ap {
-            background-color: #ff8800;
-            color: #000;
-        }
-        .mode-client {
-            background-color: #00ff00;
-            color: #000;
         }
         /* Connection diagram styles */
         .connection-diagram {
@@ -534,10 +511,6 @@
     <div class="container">
         <h1>📈 TachTalk Configuration</h1>
         
-        <div id="apBanner" class="ap-mode-banner" style="display: none;">
-            ⚠️ Running in Setup Mode - Configure WiFi below to connect to your network
-        </div>
-        
         <div id="status"></div>
         
         <div class="rpm-display">
@@ -611,9 +584,6 @@
                 <h3 style="margin-top: 0;">📊 Network Details</h3>
                 <div class="info-row"><span>SSID:</span><span id="netSsid">---</span></div>
                 <div class="info-row"><span>IP Address:</span><span id="netIp">---</span></div>
-                <div class="info-row"><span>Gateway:</span><span id="netGateway">---</span></div>
-                <div class="info-row"><span>Subnet Mask:</span><span id="netSubnet">---</span></div>
-                <div class="info-row"><span>DNS:</span><span id="netDns">---</span></div>
                 <div class="info-row"><span>MAC Address:</span><span id="netMac">---</span></div>
                 <div class="info-row"><span>Signal:</span><span id="netRssi">---</span></div>
             </div>
@@ -694,20 +664,12 @@
             </div>
             <div id="staticIpFields" class="hidden">
                 <div class="form-group">
-                    <label>IP Address:</label>
-                    <input type="text" id="staticIp" placeholder="192.168.1.100">
-                </div>
-                <div class="form-group">
-                    <label>Gateway:</label>
-                    <input type="text" id="staticGateway" placeholder="192.168.1.1">
-                </div>
-                <div class="form-group">
-                    <label>Subnet Mask:</label>
-                    <input type="text" id="staticSubnet" placeholder="255.255.255.0">
-                </div>
-                <div class="form-group">
-                    <label>DNS:</label>
-                    <input type="text" id="staticDns" placeholder="8.8.8.8">
+                    <label>IP/Prefix:</label>
+                    <span class="password-wrapper">
+                        <input type="text" id="staticIp" placeholder="192.168.0.20" style="width: 140px;">
+                        <span>/</span>
+                        <input type="number" id="staticPrefixLen" placeholder="24" min="1" max="32" style="width: 50px;">
+                    </span>
                 </div>
             </div>
             <button id="btnSaveWifi" onclick="saveWifi()">Save & Connect</button>
@@ -717,10 +679,11 @@
         
         <div class="wifi-config">
             <h2>📡 Access Point Configuration</h2>
+            <small style="color: #888; display: block; margin-bottom: 10px;">Changes require reboot to take effect</small>
             <div class="form-group">
                 <label>AP SSID:</label>
                 <input type="text" id="apSsid" placeholder="TachTalk-XXXX (auto)">
-                <small style="color: #888;">Leave empty for auto (MAC-based)</small>
+                <br><small style="color: #888;">Leave empty for auto (MAC-based)</small>
             </div>
             <div class="form-group">
                 <label>AP Password:</label>
@@ -728,7 +691,16 @@
                     <input type="password" id="apPassword" placeholder="No password (open)">
                     <button type="button" class="toggle-password" onclick="toggleApPasswordVisibility()">Show</button>
                 </span>
-                <small style="color: #888;">Leave empty for open AP</small>
+                <br><small style="color: #888;">Leave empty for open AP</small>
+            </div>
+            <div class="form-group">
+                <label>AP IP/Prefix:</label>
+                <span class="password-wrapper">
+                    <input type="text" id="apIp" placeholder="10.15.25.1" style="width: 140px;">
+                    <span>/</span>
+                    <input type="number" id="apPrefixLen" placeholder="24" min="1" max="32" style="width: 50px;">
+                </span>
+                <br><small style="color: #888;">Default: 10.15.25.1/24</small>
             </div>
         </div>
         
@@ -807,10 +779,12 @@
 
         let config = {
             wifi: { ssid: '', password: '' },
-            ip: { use_dhcp: true, ip: null, gateway: null, subnet: null, dns: null },
+            ip: { use_dhcp: true, ip: '192.168.0.20', prefix_len: 24 },
             obd2: { dongle_ip: '192.168.0.10', dongle_port: 35000, listen_port: 35000 },
-            ap_ssid: null,
+            ap_ssid: '',
             ap_password: null,
+            ap_ip: '10.15.25.1',
+            ap_prefix_len: 24,
             obd2_timeout_ms: 4500,
             log_level: 'info',
             thresholds: [
@@ -970,8 +944,10 @@
                 listen_port: parseInt(document.getElementById('obd2ListenPort').value) || 35000
             };
             config.obd2_timeout_ms = parseInt(document.getElementById('obd2TimeoutMs').value) || 4500;
-            config.ap_ssid = document.getElementById('apSsid').value || null;
+            config.ap_ssid = document.getElementById('apSsid').value;
             config.ap_password = document.getElementById('apPassword').value || null;
+            config.ap_ip = document.getElementById('apIp').value || '10.15.25.1';
+            config.ap_prefix_len = parseInt(document.getElementById('apPrefixLen').value) || 24;
             config.log_level = document.getElementById('logLevel').value;
             
             setButtonLoading('btnSaveConfig', true, 'Saving...');
@@ -1071,10 +1047,8 @@
             
             const ipConfig = {
                 use_dhcp: useDhcp,
-                ip: useDhcp ? null : document.getElementById('staticIp').value || null,
-                gateway: useDhcp ? null : document.getElementById('staticGateway').value || null,
-                subnet: useDhcp ? null : document.getElementById('staticSubnet').value || null,
-                dns: useDhcp ? null : document.getElementById('staticDns').value || null
+                ip: document.getElementById('staticIp').value || '192.168.0.20',
+                prefix_len: parseInt(document.getElementById('staticPrefixLen').value) || 24
             };
             
             config.wifi = { ssid, password: password || null };
@@ -1169,12 +1143,10 @@
                     document.getElementById('wifiPassword').value = config.wifi?.password || '';
                     
                     // IP config
-                    const ipConfig = config.ip || { use_dhcp: true };
+                    const ipConfig = config.ip || { use_dhcp: true, prefix_len: 24 };
                     document.getElementById('ipMode').value = ipConfig.use_dhcp ? 'dhcp' : 'static';
                     document.getElementById('staticIp').value = ipConfig.ip || '';
-                    document.getElementById('staticGateway').value = ipConfig.gateway || '';
-                    document.getElementById('staticSubnet').value = ipConfig.subnet || '';
-                    document.getElementById('staticDns').value = ipConfig.dns || '';
+                    document.getElementById('staticPrefixLen').value = ipConfig.prefix_len || 24;
                     toggleStaticIp();
                     
                     // OBD2 config
@@ -1189,6 +1161,8 @@
                     // AP config
                     document.getElementById('apSsid').value = config.ap_ssid || '';
                     document.getElementById('apPassword').value = config.ap_password || '';
+                    document.getElementById('apIp').value = config.ap_ip || '10.15.25.1';
+                    document.getElementById('apPrefixLen').value = config.ap_prefix_len || 24;
                     
                     // OBD2 timeout
                     document.getElementById('obd2TimeoutMs').value = config.obd2_timeout_ms || 4500;
@@ -1207,23 +1181,6 @@
                 showStatus('Error: ' + error.message, true);
             } finally {
                 setButtonLoading('btnReload', false);
-            }
-        }
-
-        async function loadMode() {
-            try {
-                const response = await fetch('/api/mode');
-                if (response.ok) {
-                    const data = await response.json();
-                    const banner = document.getElementById('apBanner');
-                    if (data.mode === 'ap') {
-                        banner.style.display = 'block';
-                    } else {
-                        banner.style.display = 'none';
-                    }
-                }
-            } catch (error) {
-                console.error('Failed to load mode:', error);
             }
         }
 
@@ -1368,9 +1325,6 @@
                     const data = await response.json();
                     document.getElementById('netSsid').textContent = data.ssid || '---';
                     document.getElementById('netIp').textContent = data.ip || '---';
-                    document.getElementById('netGateway').textContent = data.gateway || '---';
-                    document.getElementById('netSubnet').textContent = data.subnet || '---';
-                    document.getElementById('netDns').textContent = data.dns || '---';
                     document.getElementById('netMac').textContent = data.mac || '---';
                     if (data.rssi !== null && data.rssi !== undefined) {
                         let quality;
@@ -1585,7 +1539,6 @@
         // Initialize
         renderThresholds();
         loadConfig();
-        loadMode();
         loadNetworkStatus();
         loadConnectionStatus();
         setupRpmEventSource();
