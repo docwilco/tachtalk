@@ -92,7 +92,7 @@ This dual-mode operation ensures the Web UI is always accessible via the device'
    - WiFi scanning endpoint
 
 5. **SSE Server** (`src/sse_server.rs`)
-   - Server-Sent Events on configurable port
+   - Server-Sent Events on port 81
    - Streams RPM, connection status, debug info
    - Powers real-time Web UI updates
 
@@ -214,7 +214,6 @@ cargo run --release
 - [ ] Multi-zone LED support
 - [ ] Alternative display modes (progress bar, etc.)
 - [ ] Support for additional OBD2 parameters
-- [ ] Bluetooth support for configuration
 - [ ] Over-the-air (OTA) updates
 - [x] NVS storage for persistent configuration
 - [x] mDNS/Bonjour for easy discovery (tachtalk.local)

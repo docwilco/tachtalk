@@ -248,7 +248,7 @@ fn spawn_background_tasks(
     // Start DNS server for captive portal
     dns::start_dns_server(ap_ip);
 
-    // Start SSE server for RPM streaming (on port 8081)
+    // Start SSE server for RPM streaming (on port 81)
     thread_util::spawn_named(c"sse_srv", move || {
         sse_server_task(&sse_rx);
     });

@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use crate::watchdog::WatchdogHandle;
 
 /// Port for the SSE server (separate from main HTTP server)
-pub const SSE_PORT: u16 = 8081;
+pub const SSE_PORT: u16 = 81;
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 const MAX_SSE_CLIENTS: usize = 3;
 
