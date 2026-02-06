@@ -32,16 +32,19 @@ fn main() {
     });
     let start_time = Instant::now();
 
+    println!("Mock ELM327 starting on 0.0.0.0:35000...");
+    let listener = TcpListener::bind("0.0.0.0:35000").expect("Failed to bind");
+
     if let Some(interval) = min_interval {
         println!(
-            "Rate limiting enabled: max {:.1} req/s (min interval: {:.1}ms)",
+            "Rate limit: {:.1} req/s (min interval: {:.1}ms)",
             1.0 / interval.as_secs_f64(),
             interval.as_secs_f64() * 1000.0
         );
+    } else {
+        println!("Rate limit: unlimited");
     }
 
-    println!("Mock ELM327 starting on 0.0.0.0:35000...");
-    let listener = TcpListener::bind("0.0.0.0:35000").expect("Failed to bind");
     println!("Mock ELM327 ready - waiting for connections...");
 
     for stream in listener.incoming() {
