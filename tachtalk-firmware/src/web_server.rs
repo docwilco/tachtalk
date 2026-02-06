@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use esp_idf_svc::sys::{esp_get_free_heap_size, esp_get_minimum_free_heap_size};
 
-use crate::obd2::RpmTaskMessage;
+use crate::rpm_leds::RpmTaskMessage;
 use crate::sse_server::SSE_PORT;
 use crate::State;
 

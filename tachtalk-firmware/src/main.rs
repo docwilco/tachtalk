@@ -22,8 +22,8 @@ use std::sync::{Arc, Mutex};
 mod config;
 mod cpu_stats;
 mod dns;
-mod leds;
 mod obd2;
+mod rpm_leds;
 mod sse_server;
 mod thread_util;
 mod watchdog;
@@ -31,8 +31,8 @@ mod web_server;
 
 use crate::watchdog::WatchdogHandle;
 use config::Config;
-use leds::LedController;
-use obd2::{dongle_task, rpm_led_task, DongleSender, Obd2Proxy, RpmTaskSender};
+use obd2::{dongle_task, DongleSender, Obd2Proxy};
+use rpm_leds::{rpm_led_task, LedController, RpmTaskSender};
 use sse_server::{sse_server_task, SseSender};
 
 use std::sync::atomic::{AtomicBool, AtomicU32};
@@ -241,7 +241,7 @@ fn spawn_background_tasks(
     led_controller: LedController,
     sse_rx: std::sync::mpsc::Receiver<sse_server::SseMessage>,
     dongle_rx: std::sync::mpsc::Receiver<obd2::DongleRequest>,
-    rpm_rx: std::sync::mpsc::Receiver<obd2::RpmTaskMessage>,
+    rpm_rx: std::sync::mpsc::Receiver<rpm_leds::RpmTaskMessage>,
     ap_hostname: String,
     ap_ip: Ipv4Addr,
 ) {

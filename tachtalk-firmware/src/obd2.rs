@@ -14,33 +14,17 @@ use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
 
-use crate::config::Config;
+use crate::rpm_leds::RpmTaskMessage;
 use std::time::{Duration, Instant};
 use tachtalk_elm327_lib::ClientState;
 
-use crate::leds::LedController;
-use crate::sse_server::SseMessage;
 use crate::watchdog::WatchdogHandle;
 use crate::State;
 
-const IDLE_POLL_INTERVAL_MS: u64 = 100;
+pub const IDLE_POLL_INTERVAL_MS: u64 = 100;
 /// How long after a client RPM update before background poller resumes
-const CLIENT_ACTIVITY_BACKOFF: Duration = Duration::from_millis(250);
+pub const CLIENT_ACTIVITY_BACKOFF: Duration = Duration::from_millis(250);
 const RECONNECT_DELAY: Duration = Duration::from_secs(1);
-
-/// Get current wallclock time in milliseconds
-fn get_wallclock_ms() -> u64 {
-    // u64::MAX milliseconds = 584 million years, safe to truncate
-    #[allow(clippy::cast_possible_truncation)]
-    let ms = esp_idf_svc::systime::EspSystemTime.now().as_millis() as u64;
-    ms
-}
-
-/// Compute time in ms until the next wallclock-aligned deadline
-fn time_until_next_deadline(interval_ms: u64) -> u64 {
-    let now_ms = get_wallclock_ms();
-    interval_ms - (now_ms % interval_ms)
-}
 
 /// State for the dongle connection
 struct DongleState {
@@ -106,20 +90,6 @@ impl DongleState {
         }
     }
 }
-
-/// Messages sent to the LED task
-#[derive(Debug, Clone)]
-pub enum RpmTaskMessage {
-    /// RPM update from client or poll
-    Rpm(u32),
-    /// Config changed, recalculate render interval
-    ConfigChanged,
-    /// Brightness changed (0-255), apply immediately
-    Brightness(u8),
-}
-
-/// Channel sender for messages to the LED task
-pub type RpmTaskSender = Sender<RpmTaskMessage>;
 
 /// Type alias for small OBD2 command/response buffers
 pub type Obd2Buffer = SmallVec<[u8; 12]>;
@@ -405,17 +375,6 @@ fn execute_command(
     Ok(response)
 }
 
-/// Compute blink render interval from config (None = no blinking, event-driven only)
-fn compute_blink_interval(cfg: &Config) -> Option<u64> {
-    if let Some(ms) = tachtalk_shift_lights_lib::compute_render_interval(&cfg.thresholds) {
-        info!("LED render interval: {ms}ms (blinking active)");
-        Some(u64::from(ms))
-    } else {
-        info!("LED render: event-driven only (no blinking)");
-        None
-    }
-}
-
 /// Send a command to the dongle and wait for response
 pub fn send_command(
     dongle_tx: &DongleSender,
@@ -445,123 +404,6 @@ pub fn send_command_async(dongle_tx: &DongleSender, command: &[u8]) {
         response_tx: None,
     };
     let _ = dongle_tx.send(request);
-}
-
-/// Run the combined RPM poller and LED update task.
-///
-/// This task:
-/// - Receives RPM values from dongle task via channel
-/// - Polls the dongle for RPM when no client activity
-/// - Updates LEDs based on current RPM
-/// - Sends RPM to SSE clients
-/// - Updates shared RPM for HTTP polling fallback
-// Receiver is intentionally moved into this task for exclusive ownership
-#[allow(clippy::needless_pass_by_value)]
-pub fn rpm_led_task(
-    state: &Arc<State>,
-    mut led_controller: LedController,
-    rpm_rx: std::sync::mpsc::Receiver<RpmTaskMessage>,
-) {
-    // Boot animation: blink purple 3 times
-    {
-        let total_leds = state.config.lock().unwrap().total_leds;
-        if let Err(e) = led_controller.boot_animation(total_leds) {
-            warn!("Boot animation failed: {e}");
-        }
-    }
-
-    let watchdog = WatchdogHandle::register("rpm_led_task");
-    let led_gpio = state.config.lock().unwrap().led_gpio;
-    info!("RPM/LED task started (GPIO {led_gpio})");
-
-    let mut current_rpm: Option<u32> = None;
-    let mut last_rendered_rpm: Option<u32> = None;
-    let mut last_client_rpm: Option<Instant> = None;
-    let mut last_poll: Option<Instant> = None;
-
-    let mut blink_interval_ms = compute_blink_interval(&state.config.lock().unwrap());
-
-    loop {
-        watchdog.feed();
-
-        // Track whether we need to render this iteration
-        let mut should_render = false;
-        let mut should_render_on_timeout = false;
-
-        // Compute timeout: minimum of blink deadline and poll interval
-        let blink_timeout_ms = blink_interval_ms.map(time_until_next_deadline);
-        let timeout_ms = match blink_timeout_ms {
-            Some(blink_ms) => {
-                if blink_ms < IDLE_POLL_INTERVAL_MS {
-                    should_render_on_timeout = true;
-                    blink_ms
-                } else {
-                    IDLE_POLL_INTERVAL_MS
-                }
-            }
-            None => IDLE_POLL_INTERVAL_MS,
-        };
-        let timeout = Duration::from_millis(timeout_ms);
-
-        // Wait for message or timeout
-        match rpm_rx.recv_timeout(timeout) {
-            Ok(RpmTaskMessage::Rpm(rpm)) => {
-                last_client_rpm = Some(Instant::now());
-                if current_rpm != Some(rpm) {
-                    current_rpm = Some(rpm);
-                    should_render = true; // RPM changed
-                }
-                *state.shared_rpm.lock().unwrap() = Some(rpm);
-                debug!("Received RPM: {rpm}");
-            }
-            Ok(RpmTaskMessage::ConfigChanged) => {
-                blink_interval_ms = compute_blink_interval(&state.config.lock().unwrap());
-                should_render = true; // Config changed, re-render
-            }
-            Ok(RpmTaskMessage::Brightness(brightness)) => {
-                debug!("Received brightness: {brightness}");
-                led_controller.set_brightness(brightness);
-                should_render = true; // Re-render with new brightness
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                if should_render_on_timeout {
-                    should_render = true;
-                }
-
-                // Check if we should poll the dongle for RPM
-                let client_idle =
-                    last_client_rpm.map_or(true, |t| t.elapsed() >= CLIENT_ACTIVITY_BACKOFF);
-                let poll_due = last_poll.map_or(true, |t| {
-                    t.elapsed() >= Duration::from_millis(IDLE_POLL_INTERVAL_MS)
-                });
-                if client_idle && poll_due {
-                    last_poll = Some(Instant::now());
-                    // Fire-and-forget: dongle task will extract RPM and send back via channel
-                    send_command_async(&state.dongle_tx, b"010C");
-                }
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                warn!("RPM channel disconnected, exiting task");
-                break;
-            }
-        }
-
-        // Update LEDs only when needed (RPM changed or blinking)
-        if should_render {
-            if let Some(rpm) = current_rpm {
-                // Only send SSE if RPM actually changed
-                if last_rendered_rpm != Some(rpm) {
-                    let _ = state.sse_tx.send(SseMessage::RpmUpdate(rpm));
-                    last_rendered_rpm = Some(rpm);
-                }
-
-                let timestamp_ms = get_wallclock_ms();
-                if let Ok(cfg) = state.config.lock() {
-                    let _ = led_controller.update(rpm, &cfg, timestamp_ms);
-                }
-            }
-        }
-    }
 }
 
 pub struct Obd2Proxy {
