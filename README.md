@@ -1,6 +1,6 @@
 # TachTalk
 
-Firmware for proxying OBD2 requests between RaceChroно and a Wi-Fi OBD2 dongle (e.g., Vgate iCar 2), extracting RPM data to display on WS2812B LED shift lights.
+Firmware for proxying OBD2 requests between RaceChrono and a Wi-Fi OBD2 dongle (e.g., Vgate iCar 2), extracting RPM data to display on WS2812B LED shift lights.
 
 ## 🚀 Quick Start
 
@@ -72,7 +72,7 @@ espflash flash target/xtensa-esp32s3-espidf/release/tachtalk
 
 ## Usage
 
-### Standalone Mode (without RaceChroно)
+### Standalone Mode (without RaceChrono)
 1. Plug the OBD2 dongle into your vehicle's OBD2 port
 2. Power on the ESP32-S3
 3. The device connects to the dongle's WiFi network

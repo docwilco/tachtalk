@@ -103,7 +103,7 @@ In the Web UI:
    - IP: 10.15.25.1 (configurable)
    - Port: 35000
 3. Connect in RaceChrono
-4. LEDs show RPM based on your thresholds while RaceChroно logs data
+4. LEDs show RPM based on your thresholds while RaceChrono logs data
 
 ## Verification Checklist
 
