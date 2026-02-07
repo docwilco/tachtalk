@@ -94,7 +94,7 @@ impl LedController {
 
     pub fn update(&mut self, rpm: u32, config: &Config, timestamp_ms: u64) -> Result<()> {
         // Compute LED state using the library
-        let led_state = compute_led_state(rpm, &config.thresholds, config.total_leds, timestamp_ms);
+        let led_state = compute_led_state(rpm, config.active_thresholds(), config.total_leds, timestamp_ms);
 
         self.write_leds(&led_state.leds)?;
         Ok(())
@@ -135,7 +135,7 @@ impl LedController {
 
 /// Compute blink render interval from config (None = no blinking, event-driven only)
 fn compute_blink_interval(cfg: &Config) -> Option<u64> {
-    if let Some(ms) = tachtalk_shift_lights_lib::compute_render_interval(&cfg.thresholds) {
+    if let Some(ms) = tachtalk_shift_lights_lib::compute_render_interval(cfg.active_thresholds()) {
         info!("LED render interval: {ms}ms (blinking active)");
         Some(u64::from(ms))
     } else {

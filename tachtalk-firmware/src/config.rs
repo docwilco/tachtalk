@@ -27,6 +27,23 @@ fn default_ap_ssid() -> String {
 // Re-export shift-lights types for use in the firmware
 pub use tachtalk_shift_lights_lib::{RGB8, ThresholdConfig};
 
+/// A named collection of threshold configurations
+///
+/// Profiles allow users to switch between different shift light setups
+/// (e.g., "Street", "Track", "Economy") without reconfiguring each time.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ThresholdProfile {
+    pub name: String,
+    pub thresholds: Vec<ThresholdConfig>,
+    /// RPM value to show when previewing this profile (e.g., when cycling profiles)
+    #[serde(default = "default_preview_rpm")]
+    pub preview_rpm: u32,
+}
+
+const fn default_preview_rpm() -> u32 {
+    3000
+}
+
 /// Configurable log level
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq)]
 #[serde(rename_all = "lowercase")]
@@ -211,7 +228,12 @@ pub struct Config {
     pub ap_prefix_len: u8,
     #[serde(default)]
     pub log_level: LogLevel,
-    pub thresholds: Vec<ThresholdConfig>,
+    /// Threshold profiles (named collections of thresholds)
+    #[serde(default = "default_profiles")]
+    pub profiles: Vec<ThresholdProfile>,
+    /// Index of the currently active profile
+    #[serde(default)]
+    pub active_profile: usize,
     pub total_leds: usize,
     #[serde(default = "default_led_gpio")]
     pub led_gpio: u8,
@@ -250,6 +272,159 @@ const fn default_ap_prefix_len() -> u8 {
     24
 }
 
+fn default_profile() -> ThresholdProfile {
+    ThresholdProfile {
+        name: "Default".to_string(),
+        thresholds: vec![
+            ThresholdConfig {
+                name: "Blue".to_string(),
+                rpm_lower: 1000,
+                rpm_upper: None,
+                start_led: 0,
+                end_led: 2,
+                colors: smallvec::smallvec![RGB8::new(0, 0, 255)],
+                blink: false,
+                blink_ms: 500,
+            },
+            ThresholdConfig {
+                name: "Green".to_string(),
+                rpm_lower: 1500,
+                rpm_upper: None,
+                start_led: 3,
+                end_led: 5,
+                colors: smallvec::smallvec![RGB8::new(0, 255, 0)],
+                blink: false,
+                blink_ms: 500,
+            },
+            ThresholdConfig {
+                name: "Yellow".to_string(),
+                rpm_lower: 2000,
+                rpm_upper: None,
+                start_led: 6,
+                end_led: 8,
+                colors: smallvec::smallvec![RGB8::new(255, 255, 0)],
+                blink: false,
+                blink_ms: 500,
+            },
+            ThresholdConfig {
+                name: "Red".to_string(),
+                rpm_lower: 2500,
+                rpm_upper: None,
+                start_led: 9,
+                end_led: 11,
+                colors: smallvec::smallvec![RGB8::new(255, 0, 0)],
+                blink: false,
+                blink_ms: 500,
+            },
+            ThresholdConfig {
+                name: "Off".to_string(),
+                rpm_lower: 3000,
+                rpm_upper: None,
+                start_led: 0,
+                end_led: 11,
+                colors: smallvec::smallvec![RGB8::new(0, 0, 0)],
+                blink: false,
+                blink_ms: 500,
+            },
+            ThresholdConfig {
+                name: "Shift".to_string(),
+                rpm_lower: 3000,
+                rpm_upper: None,
+                start_led: 0,
+                end_led: 11,
+                colors: smallvec::smallvec![RGB8::new(0, 0, 255)],
+                blink: true,
+                blink_ms: 500,
+            },
+        ],
+        preview_rpm: 2900,
+    }
+}
+
+fn rainbow_profile() -> ThresholdProfile {
+    ThresholdProfile {
+        name: "Rainbow".to_string(),
+        thresholds: vec![
+            ThresholdConfig {
+                name: "Rainbow".to_string(),
+                rpm_lower: 1000,
+                rpm_upper: Some(3000),
+                start_led: 0,
+                end_led: 12,
+                colors: smallvec::smallvec![
+                    RGB8::new(0, 0, 255),
+                    RGB8::new(0, 255, 255),
+                    RGB8::new(0, 255, 0),
+                    RGB8::new(255, 255, 0),
+                    RGB8::new(255, 0, 0),
+                ],
+                blink: false,
+                blink_ms: 500,
+            },
+            ThresholdConfig {
+                name: "Shift".to_string(),
+                rpm_lower: 3000,
+                rpm_upper: None,
+                start_led: 0,
+                end_led: 12,
+                colors: smallvec::smallvec![RGB8::new(0, 0, 255)],
+                blink: true,
+                blink_ms: 100,
+            },
+        ],
+        preview_rpm: 2900,
+    }
+}
+
+fn martijn_profile() -> ThresholdProfile {
+    ThresholdProfile {
+        name: "Martijn".to_string(),
+        thresholds: vec![
+            ThresholdConfig {
+                name: "Left".to_string(),
+                rpm_lower: 1000,
+                rpm_upper: Some(3000),
+                start_led: 0,
+                end_led: 5,
+                colors: smallvec::smallvec![
+                    RGB8::new(0, 0, 255),
+                    RGB8::new(255, 0, 0),
+                ],
+                blink: false,
+                blink_ms: 500,
+            },
+            ThresholdConfig {
+                name: "Right".to_string(),
+                rpm_lower: 1000,
+                rpm_upper: Some(3000),
+                start_led: 11,
+                end_led: 6,
+                colors: smallvec::smallvec![
+                    RGB8::new(0, 0, 255),
+                    RGB8::new(255, 0, 0),
+                ],
+                blink: false,
+                blink_ms: 500,
+            },
+            ThresholdConfig {
+                name: "Shift".to_string(),
+                rpm_lower: 3000,
+                rpm_upper: None,
+                start_led: 0,
+                end_led: 11,
+                colors: smallvec::smallvec![RGB8::new(0, 0, 0)],
+                blink: true,
+                blink_ms: 100,
+            },
+        ],
+        preview_rpm: 2900,
+    }
+}
+
+fn default_profiles() -> Vec<ThresholdProfile> {
+    vec![default_profile(), rainbow_profile(), martijn_profile()]
+}
+
 /// Maximum OBD2 timeout to avoid triggering watchdog in dongle task
 pub const MAX_OBD2_TIMEOUT_MS: u64 = 4500;
 
@@ -268,78 +443,8 @@ impl Default for Config {
             ap_ip: default_ap_ip(),
             ap_prefix_len: default_ap_prefix_len(),
             log_level: LogLevel::default(),
-            thresholds: vec![
-                ThresholdConfig {
-                    name: "Off".to_string(),
-                    rpm_lower: 0,
-                    rpm_upper: None,
-                    start_led: 0,
-                    end_led: 0,
-                    colors: smallvec::smallvec![RGB8::new(0, 0, 0)],
-                    blink: false,
-                    blink_ms: 500,
-                },
-                ThresholdConfig {
-                    name: "Blue".to_string(),
-                    rpm_lower: 1000,
-                    rpm_upper: None,
-                    start_led: 0,
-                    end_led: 0,
-                    colors: smallvec::smallvec![RGB8::new(0, 0, 255)],
-                    blink: false,
-                    blink_ms: 500,
-                },
-                ThresholdConfig {
-                    name: "Green".to_string(),
-                    rpm_lower: 1500,
-                    rpm_upper: None,
-                    start_led: 0,
-                    end_led: 0,
-                    colors: smallvec::smallvec![RGB8::new(0, 255, 0)],
-                    blink: false,
-                    blink_ms: 500,
-                },
-                ThresholdConfig {
-                    name: "Yellow".to_string(),
-                    rpm_lower: 2000,
-                    rpm_upper: None,
-                    start_led: 0,
-                    end_led: 0,
-                    colors: smallvec::smallvec![RGB8::new(255, 255, 0)],
-                    blink: false,
-                    blink_ms: 500,
-                },
-                ThresholdConfig {
-                    name: "Red".to_string(),
-                    rpm_lower: 2500,
-                    rpm_upper: None,
-                    start_led: 0,
-                    end_led: 0,
-                    colors: smallvec::smallvec![RGB8::new(255, 0, 0)],
-                    blink: false,
-                    blink_ms: 500,
-                },
-                ThresholdConfig {
-                    name: "Off".to_string(),
-                    rpm_lower: 3000,
-                    rpm_upper: None,
-                    start_led: 0,
-                    end_led: 0,
-                    colors: smallvec::smallvec![RGB8::new(0, 0, 0)],
-                    blink: false,
-                    blink_ms: 500,
-                },
-                ThresholdConfig {
-                    name: "Shift".to_string(),
-                    rpm_lower: 3000,
-                    rpm_upper: None,
-                    start_led: 0,
-                    end_led: 0,
-                    colors: smallvec::smallvec![RGB8::new(0, 0, 255)],
-                    blink: true,
-                    blink_ms: 500,
-                },
-            ],
+            profiles: default_profiles(),
+            active_profile: 0,
             total_leds: 1,
             led_gpio: default_led_gpio(),
             obd2_timeout_ms: default_obd2_timeout_ms(),
@@ -353,6 +458,14 @@ impl Default for Config {
 }
 
 impl Config {
+    /// Get the thresholds from the active profile
+    #[must_use]
+    pub fn active_thresholds(&self) -> &[ThresholdConfig] {
+        self.profiles
+            .get(self.active_profile)
+            .map_or(&[], |p| p.thresholds.as_slice())
+    }
+
     /// Clamp values to valid ranges and fix invalid values
     pub fn validate(&mut self) {
         if self.obd2_timeout_ms > MAX_OBD2_TIMEOUT_MS {

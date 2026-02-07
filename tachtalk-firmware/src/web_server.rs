@@ -345,8 +345,8 @@ pub fn start_server(state: &Arc<State>, ap_hostname: Option<String>, ap_ip: Ipv4
             // Validate/clamp values to safe ranges
             new_config.validate();
             
-            debug!("Config update: {} thresholds, log_level={:?}", 
-                   new_config.thresholds.len(), new_config.log_level);
+            debug!("Config update: {} profiles, active={}, log_level={:?}", 
+                   new_config.profiles.len(), new_config.active_profile, new_config.log_level);
             
             // Check if any settings changed that require a restart
             let (gpios_to_reset, needs_restart) = {
