@@ -856,6 +856,11 @@
                 <input type="number" id="encoderPinB" value="0" min="0" max="48">
                 <small style="color: #888;">0 = disabled (requires restart)</small>
             </div>
+            <div class="form-group">
+                <label>Button Pin:</label>
+                <input type="number" id="buttonPin" value="0" min="0" max="48">
+                <small style="color: #888;">Profile switch button, 0 = disabled (requires restart)</small>
+            </div>
         </div>
         
         <button id="btnSaveConfig2" onclick="saveConfig()">Save Configuration</button>
@@ -1398,6 +1403,7 @@
                 led_gpio: parseInt(document.getElementById('ledGpio').value),
                 encoder_pin_a: parseInt(document.getElementById('encoderPinA').value) || 0,
                 encoder_pin_b: parseInt(document.getElementById('encoderPinB').value) || 0,
+                button_pin: parseInt(document.getElementById('buttonPin').value) || 0,
                 obd2: {
                     dongle_ip: document.getElementById('obd2DongleIp').value || d('obd2.dongle_ip'),
                     dongle_port: parseInt(document.getElementById('obd2DonglePort').value) || d('obd2.dongle_port'),
@@ -1575,6 +1581,7 @@
                     document.getElementById('ledGpio').value = config.led_gpio ?? d('led_gpio');
                     document.getElementById('encoderPinA').value = config.encoder_pin_a ?? 0;
                     document.getElementById('encoderPinB').value = config.encoder_pin_b ?? 0;
+                    document.getElementById('buttonPin').value = config.button_pin ?? 0;
                     document.getElementById('wifiSsid').value = config.wifi?.ssid || '';
                     document.getElementById('wifiPassword').value = config.wifi?.password || '';
                     

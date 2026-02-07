@@ -24,3 +24,7 @@ This is an embedded project, so we use `smallvec` where appropriate to avoid hea
 [dependencies]
 smallvec = { workspace = true }
 ```
+
+# Configuration
+
+Anything related to configuration should be added to the Web UI and stored in NVS. The `Config` struct in `tachtalk-firmware/src/config.rs` is the single source of truth for all configuration options. 

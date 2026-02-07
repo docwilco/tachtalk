@@ -11,6 +11,10 @@
 - [ ] Data logging capability
 - [ ] Bluetooth configuration option
 
+## Infrastructure
+- [ ] Upgrade to ESP-IDF 5.4
+- [ ] Switch PCNT encoder to event-based using `add_watch_step()` (requires ESP-IDF 5.4)
+
 ## Completed
 - [x] NVS storage for persistent configuration
 - [x] mDNS/Bonjour for easy discovery (tachtalk.local)

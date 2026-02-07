@@ -19,10 +19,11 @@ use smallvec::SmallVec;
 /// Check if a config change would require a device restart
 /// Returns (GPIOs to reset before restart, `needs_restart`)
 #[allow(clippy::similar_names)]
-fn check_restart_needed(current: &Config, new: &Config) -> (SmallVec<[u8; 3]>, bool) {
+fn check_restart_needed(current: &Config, new: &Config) -> (SmallVec<[u8; 4]>, bool) {
     let led_changed = current.led_gpio != new.led_gpio;
     let encoder_a_changed = current.encoder_pin_a != new.encoder_pin_a;
     let encoder_b_changed = current.encoder_pin_b != new.encoder_pin_b;
+    let button_changed = current.button_pin != new.button_pin;
     let wifi_changed = current.wifi.ssid != new.wifi.ssid
         || current.wifi.password != new.wifi.password;
     let ip_changed = current.ip.use_dhcp != new.ip.use_dhcp
@@ -44,8 +45,11 @@ fn check_restart_needed(current: &Config, new: &Config) -> (SmallVec<[u8; 3]>, b
     if encoder_b_changed && current.encoder_pin_b != 0 {
         gpios_to_reset.push(current.encoder_pin_b);
     }
+    if button_changed && current.button_pin != 0 {
+        gpios_to_reset.push(current.button_pin);
+    }
     
-    let needs_restart = led_changed || encoder_a_changed || encoder_b_changed 
+    let needs_restart = led_changed || encoder_a_changed || encoder_b_changed || button_changed
         || wifi_changed || ip_changed || ap_changed;
     
     (gpios_to_reset, needs_restart)

@@ -254,6 +254,9 @@ pub struct Config {
     /// Rotary encoder pin B (DT) - set to 0 to disable encoder
     #[serde(default)]
     pub encoder_pin_b: u8,
+    /// Profile switch button pin - set to 0 to disable button
+    #[serde(default)]
+    pub button_pin: u8,
 }
 
 const fn default_led_gpio() -> u8 {
@@ -453,6 +456,7 @@ impl Default for Config {
             dump_socket_info: false,
             encoder_pin_a: 0, // Disabled by default
             encoder_pin_b: 0,
+            button_pin: 0, // Disabled by default
         }
     }
 }

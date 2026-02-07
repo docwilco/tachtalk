@@ -21,10 +21,10 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
 mod config;
+mod controls;
 mod cpu_metrics;
 mod dns;
 mod obd2;
-mod rotary_encoder;
 mod rpm_leds;
 mod sse_server;
 mod thread_util;
@@ -275,7 +275,7 @@ fn init_encoder<PCNT: esp_idf_hal::pcnt::Pcnt>(
     let pin_a = unsafe { esp_idf_hal::gpio::AnyInputPin::new(i32::from(config.encoder_pin_a)) };
     let pin_b = unsafe { esp_idf_hal::gpio::AnyInputPin::new(i32::from(config.encoder_pin_b)) };
 
-    match rotary_encoder::init_encoder(pcnt, pin_a, pin_b) {
+    match controls::init_encoder(pcnt, pin_a, pin_b) {
         Ok(driver) => {
             info!("Rotary encoder initialized");
             Some(driver)
@@ -402,11 +402,11 @@ fn spawn_background_tasks(
         });
     }
 
-    // Start rotary encoder task (if configured)
+    // Start controls task (rotary encoder and/or button)
     if let Some(driver) = encoder_driver {
         let state = state.clone();
-        thread_util::spawn_named(c"encoder", move || {
-            rotary_encoder::encoder_task(&state, driver);
+        thread_util::spawn_named(c"controls", move || {
+            controls::controls_task(&state, driver);
         });
     }
 }
