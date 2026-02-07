@@ -27,6 +27,9 @@ use crate::State;
 /// Default timeout when no blinking is active
 const DEFAULT_TIMEOUT_MS: u64 = 100;
 
+/// Duration to show `preview_rpm` after brightness change (ms)
+const BRIGHTNESS_PREVIEW_DURATION_MS: u64 = 1000;
+
 /// Get current wallclock time in milliseconds
 fn get_wallclock_ms() -> u64 {
     // u64::MAX milliseconds = 584 million years, safe to truncate
@@ -175,6 +178,8 @@ pub fn rpm_led_task(
     let mut current_rpm: Option<u32> = None;
     let mut last_rendered_rpm: Option<u32> = None;
     let mut last_blink_on: Option<bool> = None;
+    // When set, use `preview_rpm` override until this timestamp (ms)
+    let mut preview_override_until: Option<u64> = None;
 
     let mut blink_interval_ms = compute_blink_interval(&state.config.lock().unwrap());
 
@@ -219,6 +224,8 @@ pub fn rpm_led_task(
             Ok(RpmTaskMessage::Brightness(brightness)) => {
                 debug!("Received brightness: {brightness}");
                 led_controller.set_brightness(brightness);
+                // Use preview_rpm from active profile for 1 second
+                preview_override_until = Some(get_wallclock_ms() + BRIGHTNESS_PREVIEW_DURATION_MS);
                 should_render = true; // Re-render with new brightness
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
@@ -234,14 +241,27 @@ pub fn rpm_led_task(
 
         // Update LEDs only when needed (RPM changed or blinking)
         if should_render {
-            if let Some(rpm) = current_rpm {
-                // Only send SSE if RPM actually changed
-                if last_rendered_rpm != Some(rpm) {
-                    let _ = state.sse_tx.send(SseMessage::RpmUpdate(rpm));
-                    last_rendered_rpm = Some(rpm);
+            let timestamp_ms = get_wallclock_ms();
+            
+            // Determine which RPM to render: preview override or actual
+            let render_rpm = if preview_override_until.is_some_and(|until| timestamp_ms < until) {
+                // Use preview_rpm from active profile during brightness adjustment
+                state.config.lock().ok().and_then(|cfg| {
+                    cfg.profiles.get(cfg.active_profile).map(|p| p.preview_rpm)
+                }).or(current_rpm)
+            } else {
+                preview_override_until = None; // Clear expired override
+                current_rpm
+            };
+            
+            if let Some(rpm) = render_rpm {
+                // Only send SSE if actual RPM changed (not during preview override)
+                if preview_override_until.is_none() && last_rendered_rpm != current_rpm {
+                    if let Some(actual_rpm) = current_rpm {
+                        let _ = state.sse_tx.send(SseMessage::RpmUpdate(actual_rpm));
+                    }
+                    last_rendered_rpm = current_rpm;
                 }
-
-                let timestamp_ms = get_wallclock_ms();
 
                 // Update last blink phase after render
                 if let Some(interval) = blink_interval_ms {
