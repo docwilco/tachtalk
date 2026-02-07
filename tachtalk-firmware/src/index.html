@@ -54,6 +54,25 @@
         .threshold-grid .form-group {
             margin: 5px 0;
         }
+        .threshold-grid .colors-group {
+            grid-column: 1 / -1;
+            display: flex;
+            align-items: center;
+            flex-wrap: wrap;
+            gap: 5px;
+        }
+        .threshold-grid .colors-group label {
+            margin-right: 5px;
+        }
+        .threshold-grid .colors-group input[type="color"] {
+            margin: 0;
+        }
+        .threshold-grid .colors-group button {
+            padding: 3px 8px;
+            margin: 0;
+            min-width: 24px;
+            font-size: 1em;
+        }
         .threshold-grid input[type="number"] {
             width: 70px;
         }
@@ -920,6 +939,18 @@
                         '<input type="number" value="' + rpmUpperValue + '" ' + (hasRpmUpper ? '' : 'disabled') + ' onchange="updateThreshold(' + index + ', \'rpm_upper\', parseInt(this.value))">' +
                         '<input type="checkbox" ' + (hasRpmUpper ? 'checked' : '') + ' onchange="this.previousElementSibling.disabled = !this.checked; updateThreshold(' + index + ', \'rpm_upper\', this.checked ? parseInt(this.previousElementSibling.value) : null)">' +
                     '</div>';
+                let colorsHtml = '<div class="form-group colors-group"><label>Colors:</label>';
+                const colors = threshold.colors;
+                colors.forEach((c, colorIndex) => {
+                    const isFirst = colorIndex === 0;
+                    const isLast = colorIndex === colors.length - 1;
+                    colorsHtml += '<input type="color" value="' + rgbToHex(c) + '" onchange="updateColor(' + index + ', ' + colorIndex + ', hexToRgb(this.value))">';
+                    colorsHtml += '<button style="padding: 3px 6px; margin: 0 2px;" onclick="addColor(' + index + ', ' + colorIndex + ')">+</button>';
+                    if (!isFirst) {
+                        colorsHtml += '<button style="padding: 3px 6px; margin: 0 2px;" onclick="removeColor(' + index + ', ' + colorIndex + ')">−</button>';
+                    }
+                });
+                colorsHtml += '</div>';
                 div.innerHTML = 
                     '<div class="threshold-header">' +
                         '<input type="text" class="threshold-title" value="' + (threshold.name || 'Threshold ' + (index + 1)) + '" onchange="updateThreshold(' + index + ', \'name\', this.value)">' +
@@ -938,10 +969,7 @@
                             '<label>To LED:</label>' +
                             '<input type="number" min="0" value="' + threshold.end_led + '" onchange="updateThreshold(' + index + ', \'end_led\', parseInt(this.value))">' +
                         '</div>' +
-                        '<div class="form-group">' +
-                            '<label>Color:</label>' +
-                            '<input type="color" value="' + rgbToHex(threshold.color) + '" onchange="updateThreshold(' + index + ', \'color\', hexToRgb(this.value))">' +
-                        '</div>' +
+                        colorsHtml +
                         '<div class="form-group">' +
                             '<label>Blink:</label>' +
                             '<input type="checkbox" ' + (threshold.blink ? 'checked' : '') + ' onchange="updateThreshold(' + index + ', \'blink\', this.checked); renderThresholds();">' +
@@ -961,6 +989,26 @@
             config.thresholds[index][field] = value;
         }
 
+        function updateColor(thresholdIndex, colorIndex, value) {
+            config.thresholds[thresholdIndex].colors[colorIndex] = value;
+        }
+
+        function addColor(thresholdIndex, afterColorIndex) {
+            const colors = config.thresholds[thresholdIndex].colors;
+            // Insert a new color (copy of the current one) after the specified index
+            const newColor = { ...colors[afterColorIndex] };
+            colors.splice(afterColorIndex + 1, 0, newColor);
+            renderThresholds();
+        }
+
+        function removeColor(thresholdIndex, colorIndex) {
+            const colors = config.thresholds[thresholdIndex].colors;
+            if (colors.length > 1) {
+                colors.splice(colorIndex, 1);
+                renderThresholds();
+            }
+        }
+
         function addThreshold() {
             config.thresholds.push({
                 name: 'New Threshold',
@@ -968,7 +1016,7 @@
                 rpm_upper: null,
                 start_led: 0,
                 end_led: 7,
-                color: { r: 255, g: 0, b: 0 },
+                colors: [{ r: 255, g: 0, b: 0 }],
                 blink: false,
                 blink_ms: 500
             });

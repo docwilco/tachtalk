@@ -10,5 +10,5 @@ name = "tachtalk-mock-elm327"
 path = "src/main.rs"
 
 [dependencies]
-clap = { version = "4", features = ["derive"] }
+clap.workspace = true
 tachtalk-elm327-lib = { path = "../tachtalk-elm327-lib" }

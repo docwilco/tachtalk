@@ -6,6 +6,7 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-num-integer = "0.1"
-rgb = { version = "0.8", features = ["serde"] }
-serde = { version = "1.0", features = ["derive"] }
+num-integer.workspace = true
+rgb.workspace = true
+serde.workspace = true
+smallvec.workspace = true

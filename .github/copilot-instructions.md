@@ -15,3 +15,12 @@ cargo clippy --all-targets --all-features --workspace --exclude tachtalk-firmwar
 # Firmware crate (from tachtalk-firmware directory)
 cd tachtalk-firmware && cargo clippy --all-targets --all-features -- -W clippy::pedantic
 ```
+
+## SmallVec
+
+This is an embedded project, so we use `smallvec` where appropriate to avoid heap allocations. If you add a new dependency, consider whether it should be added to `smallvec` instead of `Vec`. A Vec on this platform will be 12 bytes (pointer + length + capacity) and will require heap allocation on top of that. The crate is already included in the workspace. You can add it to your crate by adding the following to your `Cargo.toml`:
+
+```toml
+[dependencies]
+smallvec = { workspace = true }
+```

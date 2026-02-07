@@ -6,12 +6,18 @@
 
 pub use rgb::RGB8;
 use serde::{Deserialize, Serialize};
+use smallvec::SmallVec;
+
+/// Maximum colors stored inline in `SmallVec` (avoids heap allocation for typical use)
+const MAX_INLINE_COLORS: usize = 4;
 
 /// Threshold configuration for shift lights
 ///
 /// When only `rpm_lower` is set, all LEDs in the range light up when RPM exceeds it.
 /// When `rpm_upper` is also set, LEDs light up proportionally within the RPM range.
 /// `start_led` can be greater than `end_led` for mirror effect (LEDs light from outside in).
+///
+/// Multiple colors create a gradient across the lit LEDs.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ThresholdConfig {
     pub name: String,
@@ -22,10 +28,16 @@ pub struct ThresholdConfig {
     pub rpm_upper: Option<u32>,
     pub start_led: usize,
     pub end_led: usize,
-    pub color: RGB8,
+    /// Colors for the LEDs - multiple colors create a gradient
+    #[serde(default = "default_colors")]
+    pub colors: SmallVec<[RGB8; MAX_INLINE_COLORS]>,
     pub blink: bool,
     #[serde(default = "default_blink_ms")]
     pub blink_ms: u32,
+}
+
+fn default_colors() -> SmallVec<[RGB8; MAX_INLINE_COLORS]> {
+    smallvec::smallvec![RGB8::new(255, 0, 0)]
 }
 
 const fn default_blink_ms() -> u32 {
@@ -101,12 +113,14 @@ pub fn compute_led_state(
             }
         }
 
-        let color = threshold.color;
         let leds_to_light = compute_leds_to_light(rpm, threshold, total_leds);
+        // Total LEDs in this threshold's range (for static gradient mapping)
+        let total_range = threshold.start_led.abs_diff(threshold.end_led) + 1;
 
-        for &led_idx in &leds_to_light {
+        for (i, &led_idx) in leds_to_light.iter().enumerate() {
             if led_idx < total_leds {
-                leds[led_idx] = color;
+                // Use position in full range for static gradient (not position among lit LEDs)
+                leds[led_idx] = interpolate_color(&threshold.colors, i, total_range);
             }
         }
     }
@@ -117,11 +131,59 @@ pub fn compute_led_state(
     }
 }
 
+/// Interpolate a color from a gradient based on position
+///
+/// Given a list of colors and an LED position within the total count,
+/// returns the interpolated color at that position.
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
+fn interpolate_color(colors: &[RGB8], led_index: usize, total_leds: usize) -> RGB8 {
+    // Handle edge cases
+    if colors.is_empty() {
+        return RGB8::default();
+    }
+    if colors.len() == 1 || total_leds <= 1 {
+        return colors[0];
+    }
+
+    // Position in gradient [0.0, 1.0]
+    let position = led_index as f32 / (total_leds - 1) as f32;
+
+    // Find which segment of the gradient we're in
+    let segment_count = colors.len() - 1;
+    let segment_position = position * segment_count as f32;
+    let segment_index = (segment_position as usize).min(segment_count - 1);
+    let segment_t = segment_position - segment_index as f32;
+
+    // Interpolate between the two colors in this segment
+    let c1 = colors[segment_index];
+    let c2 = colors[segment_index + 1];
+
+    RGB8::new(
+        lerp_u8(c1.r, c2.r, segment_t),
+        lerp_u8(c1.g, c2.g, segment_t),
+        lerp_u8(c1.b, c2.b, segment_t),
+    )
+}
+
+/// Linear interpolation for u8 values
+#[inline]
+fn lerp_u8(a: u8, b: u8, t: f32) -> u8 {
+    let a_f = f32::from(a);
+    let b_f = f32::from(b);
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let result = (a_f + (b_f - a_f) * t).round() as u8;
+    result
+}
+
 /// Compute which LED indices should be lit for a threshold
 ///
 /// Handles both forward ranges (start < end) and reverse ranges (start > end)
 /// for mirror effects. When `rpm_upper` is set, computes proportional lighting.
-fn compute_leds_to_light(rpm: u32, threshold: &ThresholdConfig, total_leds: usize) -> Vec<usize> {
+fn compute_leds_to_light(rpm: u32, threshold: &ThresholdConfig, total_leds: usize) -> SmallVec<[usize; 16]> {
     let start = threshold.start_led.min(total_leds.saturating_sub(1));
     let end = threshold.end_led.min(total_leds.saturating_sub(1));
 
@@ -209,7 +271,7 @@ mod tests {
                 rpm_upper: None,
                 start_led: 0,
                 end_led: 2,
-                color: RGB8::new(0, 255, 0),
+                colors: smallvec::smallvec![RGB8::new(0, 255, 0)],
                 blink: false,
                 blink_ms: 500,
             },
@@ -219,7 +281,7 @@ mod tests {
                 rpm_upper: None,
                 start_led: 0,
                 end_led: 4,
-                color: RGB8::new(255, 255, 0),
+                colors: smallvec::smallvec![RGB8::new(255, 255, 0)],
                 blink: false,
                 blink_ms: 500,
             },
@@ -229,7 +291,7 @@ mod tests {
                 rpm_upper: None,
                 start_led: 0,
                 end_led: 7,
-                color: RGB8::new(255, 0, 0),
+                colors: smallvec::smallvec![RGB8::new(255, 0, 0)],
                 blink: false,
                 blink_ms: 500,
             },
@@ -239,7 +301,7 @@ mod tests {
                 rpm_upper: None,
                 start_led: 0,
                 end_led: 7,
-                color: RGB8::new(255, 0, 0),
+                colors: smallvec::smallvec![RGB8::new(255, 0, 0)],
                 blink: true,
                 blink_ms: 100,
             },
@@ -316,7 +378,7 @@ mod tests {
             rpm_upper: None,
             start_led: 0,
             end_led: 0,
-            color: RGB8::new(255, 0, 0),
+            colors: smallvec::smallvec![RGB8::new(255, 0, 0)],
             blink: true,
             blink_ms: 100,
         }];
@@ -350,7 +412,7 @@ mod tests {
             rpm_upper: None,
             start_led: 5,
             end_led: 100, // Way beyond total LEDs
-            color: RGB8::new(255, 0, 0),
+            colors: smallvec::smallvec![RGB8::new(255, 0, 0)],
             blink: false,
             blink_ms: 500,
         }];
@@ -373,7 +435,7 @@ mod tests {
                 rpm_upper: None,
                 start_led: 0,
                 end_led: 11,
-                color: RGB8::new(0, 0, 0),
+                colors: smallvec::smallvec![RGB8::new(0, 0, 0)],
                 blink: false,
                 blink_ms: 500,
             },
@@ -383,7 +445,7 @@ mod tests {
                 rpm_upper: None,
                 start_led: 0,
                 end_led: 2,
-                color: RGB8::new(0, 0, 255),
+                colors: smallvec::smallvec![RGB8::new(0, 0, 255)],
                 blink: false,
                 blink_ms: 500,
             },
@@ -393,7 +455,7 @@ mod tests {
                 rpm_upper: None,
                 start_led: 3,
                 end_led: 5,
-                color: RGB8::new(0, 255, 0),
+                colors: smallvec::smallvec![RGB8::new(0, 255, 0)],
                 blink: false,
                 blink_ms: 500,
             },
@@ -403,7 +465,7 @@ mod tests {
                 rpm_upper: None,
                 start_led: 6,
                 end_led: 8,
-                color: RGB8::new(255, 255, 0),
+                colors: smallvec::smallvec![RGB8::new(255, 255, 0)],
                 blink: false,
                 blink_ms: 500,
             },
@@ -413,7 +475,7 @@ mod tests {
                 rpm_upper: None,
                 start_led: 9,
                 end_led: 11,
-                color: RGB8::new(255, 0, 0),
+                colors: smallvec::smallvec![RGB8::new(255, 0, 0)],
                 blink: false,
                 blink_ms: 500,
             },
@@ -462,7 +524,7 @@ mod tests {
                 rpm_upper: None,
                 start_led: 0,
                 end_led: 2,
-                color: RGB8::new(0, 0, 0),
+                colors: smallvec::smallvec![RGB8::new(0, 0, 0)],
                 blink: false,
                 blink_ms: 500,
             },
@@ -472,7 +534,7 @@ mod tests {
                 rpm_upper: None,
                 start_led: 0,
                 end_led: 0,
-                color: RGB8::new(0, 0, 255),
+                colors: smallvec::smallvec![RGB8::new(0, 0, 255)],
                 blink: false,
                 blink_ms: 500,
             },
@@ -482,7 +544,7 @@ mod tests {
                 rpm_upper: None,
                 start_led: 1,
                 end_led: 1,
-                color: RGB8::new(0, 0, 255),
+                colors: smallvec::smallvec![RGB8::new(0, 0, 255)],
                 blink: false,
                 blink_ms: 500,
             },
@@ -492,7 +554,7 @@ mod tests {
                 rpm_upper: None,
                 start_led: 2,
                 end_led: 2,
-                color: RGB8::new(0, 0, 255),
+                colors: smallvec::smallvec![RGB8::new(0, 0, 255)],
                 blink: false,
                 blink_ms: 500,
             },
@@ -527,7 +589,7 @@ mod tests {
                 rpm_upper: None,
                 start_led: 0,
                 end_led: 2,
-                color: RGB8::new(0, 0, 255),
+                colors: smallvec::smallvec![RGB8::new(0, 0, 255)],
                 blink: false,
                 blink_ms: 500,
             },
@@ -537,7 +599,7 @@ mod tests {
                 rpm_upper: None,
                 start_led: 3,
                 end_led: 5,
-                color: RGB8::new(0, 255, 0),
+                colors: smallvec::smallvec![RGB8::new(0, 255, 0)],
                 blink: false,
                 blink_ms: 500,
             },
@@ -547,7 +609,7 @@ mod tests {
                 rpm_upper: None,
                 start_led: 0,
                 end_led: 5,
-                color: RGB8::new(255, 0, 0),
+                colors: smallvec::smallvec![RGB8::new(255, 0, 0)],
                 blink: true,
                 blink_ms: 100,
             },
@@ -580,7 +642,7 @@ mod tests {
                 rpm_upper: None,
                 start_led: 0,
                 end_led: 2,
-                color: RGB8::new(0, 0, 255),
+                colors: smallvec::smallvec![RGB8::new(0, 0, 255)],
                 blink: false,
                 blink_ms: 500,
             },
@@ -590,7 +652,7 @@ mod tests {
                 rpm_upper: None,
                 start_led: 3,
                 end_led: 5,
-                color: RGB8::new(0, 255, 0),
+                colors: smallvec::smallvec![RGB8::new(0, 255, 0)],
                 blink: false,
                 blink_ms: 500,
             },
@@ -600,7 +662,7 @@ mod tests {
                 rpm_upper: None,
                 start_led: 0,
                 end_led: 5,
-                color: RGB8::new(0, 0, 0), // All off
+                colors: smallvec::smallvec![RGB8::new(0, 0, 0)], // All off
                 blink: false,
                 blink_ms: 500,
             },
@@ -610,7 +672,7 @@ mod tests {
                 rpm_upper: None,
                 start_led: 0,
                 end_led: 5,
-                color: RGB8::new(255, 0, 0),
+                colors: smallvec::smallvec![RGB8::new(255, 0, 0)],
                 blink: true,
                 blink_ms: 100,
             },
@@ -641,7 +703,7 @@ mod tests {
                 rpm_upper: None,
                 start_led: 0,
                 end_led: 2,
-                color: RGB8::new(0, 0, 255),
+                colors: smallvec::smallvec![RGB8::new(0, 0, 255)],
                 blink: true,
                 blink_ms: 200, // 200ms period
             },
@@ -651,7 +713,7 @@ mod tests {
                 rpm_upper: None,
                 start_led: 3,
                 end_led: 5,
-                color: RGB8::new(255, 0, 0),
+                colors: smallvec::smallvec![RGB8::new(255, 0, 0)],
                 blink: true,
                 blink_ms: 100, // 100ms period
             },
@@ -688,7 +750,7 @@ mod tests {
             rpm_upper: Some(2000),
             start_led: 0,
             end_led: 3,
-            color: RGB8::new(0, 255, 0),
+            colors: smallvec::smallvec![RGB8::new(0, 255, 0)],
             blink: false,
             blink_ms: 500,
         }];
@@ -749,7 +811,7 @@ mod tests {
             rpm_upper: Some(2000),
             start_led: 3,
             end_led: 0,
-            color: RGB8::new(255, 0, 0),
+            colors: smallvec::smallvec![RGB8::new(255, 0, 0)],
             blink: false,
             blink_ms: 500,
         }];
@@ -794,7 +856,7 @@ mod tests {
                 rpm_upper: Some(2000),
                 start_led: 0,
                 end_led: 3,
-                color: RGB8::new(0, 255, 0),
+                colors: smallvec::smallvec![RGB8::new(0, 255, 0)],
                 blink: false,
                 blink_ms: 500,
             },
@@ -804,7 +866,7 @@ mod tests {
                 rpm_upper: Some(2000),
                 start_led: 7,
                 end_led: 4,
-                color: RGB8::new(0, 255, 0),
+                colors: smallvec::smallvec![RGB8::new(0, 255, 0)],
                 blink: false,
                 blink_ms: 500,
             },
@@ -831,5 +893,115 @@ mod tests {
         for i in 0..8 {
             assert_eq!(state.leds[i], RGB8::new(0, 255, 0), "LED {i} should be on");
         }
+    }
+
+    /// Test gradient interpolation with two colors
+    #[test]
+    fn test_gradient_two_colors() {
+        let thresholds = vec![ThresholdConfig {
+            name: "Gradient".to_string(),
+            rpm_lower: 1000,
+            rpm_upper: None,
+            start_led: 0,
+            end_led: 4,
+            colors: smallvec::smallvec![RGB8::new(255, 0, 0), RGB8::new(0, 0, 255)],
+            blink: false,
+            blink_ms: 500,
+        }];
+
+        let state = compute_led_state(1500, &thresholds, 5, 0);
+
+        // First LED should be red
+        assert_eq!(state.leds[0], RGB8::new(255, 0, 0));
+        // Last LED should be blue
+        assert_eq!(state.leds[4], RGB8::new(0, 0, 255));
+        // Middle LED should be purple (50% blend)
+        assert_eq!(state.leds[2], RGB8::new(128, 0, 128));
+        // LED 1 should be 75% red, 25% blue
+        assert_eq!(state.leds[1], RGB8::new(191, 0, 64));
+        // LED 3 should be 25% red, 75% blue
+        assert_eq!(state.leds[3], RGB8::new(64, 0, 191));
+    }
+
+    /// Test that gradient is static - colors don't shift as RPM increases
+    /// With 5 LEDs, RPM range 1000-2000, and RPM at 1500:
+    /// - 3 LEDs should be lit (proportional)
+    /// - LED 2 (middle of full range) should have midway color, not end color
+    #[test]
+    fn test_gradient_static_with_proportional() {
+        let thresholds = vec![ThresholdConfig {
+            name: "Static Gradient".to_string(),
+            rpm_lower: 1000,
+            rpm_upper: Some(2000),
+            start_led: 0,
+            end_led: 4,
+            colors: smallvec::smallvec![RGB8::new(255, 0, 0), RGB8::new(0, 0, 255)],
+            blink: false,
+            blink_ms: 500,
+        }];
+
+        let state = compute_led_state(1500, &thresholds, 5, 0);
+
+        // At 1500 RPM (halfway), 3 LEDs should be lit: 0, 1, 2
+        // LED 0: first color (red)
+        assert_eq!(state.leds[0], RGB8::new(255, 0, 0));
+        // LED 1: 25% through gradient (75% red, 25% blue)
+        assert_eq!(state.leds[1], RGB8::new(191, 0, 64));
+        // LED 2: 50% through gradient (midway color - purple)
+        // This is the key assertion: LED 2 should be purple, NOT blue
+        assert_eq!(state.leds[2], RGB8::new(128, 0, 128));
+        // LEDs 3 and 4 should be off (black)
+        assert_eq!(state.leds[3], RGB8::new(0, 0, 0));
+        assert_eq!(state.leds[4], RGB8::new(0, 0, 0));
+    }
+
+    /// Test gradient with three colors (red -> green -> blue)
+    #[test]
+    fn test_gradient_three_colors() {
+        let thresholds = vec![ThresholdConfig {
+            name: "Rainbow".to_string(),
+            rpm_lower: 1000,
+            rpm_upper: None,
+            start_led: 0,
+            end_led: 4,
+            colors: smallvec::smallvec![RGB8::new(255, 0, 0), RGB8::new(0, 255, 0), RGB8::new(0, 0, 255)],
+            blink: false,
+            blink_ms: 500,
+        }];
+
+        let state = compute_led_state(1500, &thresholds, 5, 0);
+
+        // First LED should be red
+        assert_eq!(state.leds[0], RGB8::new(255, 0, 0));
+        // Middle LED (index 2) should be green
+        assert_eq!(state.leds[2], RGB8::new(0, 255, 0));
+        // Last LED should be blue
+        assert_eq!(state.leds[4], RGB8::new(0, 0, 255));
+        // LED 1 should be between red and green
+        assert_eq!(state.leds[1], RGB8::new(128, 128, 0));
+        // LED 3 should be between green and blue
+        assert_eq!(state.leds[3], RGB8::new(0, 128, 128));
+    }
+
+    /// Test single color acts as solid (no gradient)
+    #[test]
+    fn test_gradient_single_color() {
+        let thresholds = vec![ThresholdConfig {
+            name: "Solid".to_string(),
+            rpm_lower: 1000,
+            rpm_upper: None,
+            start_led: 0,
+            end_led: 2,
+            colors: smallvec::smallvec![RGB8::new(255, 128, 0)],
+            blink: false,
+            blink_ms: 500,
+        }];
+
+        let state = compute_led_state(1500, &thresholds, 3, 0);
+
+        // All LEDs should be the same color
+        assert_eq!(state.leds[0], RGB8::new(255, 128, 0));
+        assert_eq!(state.leds[1], RGB8::new(255, 128, 0));
+        assert_eq!(state.leds[2], RGB8::new(255, 128, 0));
     }
 }
