@@ -19,13 +19,14 @@ use std::time::{Duration, Instant};
 
 use tachtalk_elm327_lib::ClientState;
 
+use crate::config::SlowPollMode;
 use crate::rpm_leds::RpmTaskMessage;
 use crate::watchdog::WatchdogHandle;
 use crate::State;
 
 const RECONNECT_DELAY: Duration = Duration::from_secs(1);
 /// Maintenance interval for checking promotion/demotion/removal
-const MAINTENANCE_INTERVAL: Duration = Duration::from_millis(500);
+const MAINTENANCE_INTERVAL: Duration = Duration::from_millis(2000);
 /// RPM PID command (always polled)
 const RPM_PID: &[u8] = b"010C";
 
@@ -411,6 +412,9 @@ pub fn dongle_task(
     // For requests/sec calculation
     let mut requests_this_second: u32 = 0;
     let mut last_rate_update = Instant::now();
+    
+    // For ratio-based slow polling
+    let mut fast_requests_since_slow: u32 = 0;
 
     let watchdog = WatchdogHandle::register("obd2_dongle");
 
@@ -420,13 +424,15 @@ pub fn dongle_task(
         watchdog.feed();
 
         // Get config values
-        let (timeout, dongle_ip, dongle_port, slow_poll_interval) = {
+        let (timeout, dongle_ip, dongle_port, slow_poll_mode, slow_poll_interval, slow_poll_ratio) = {
             let cfg = state.config.lock().unwrap();
             (
                 Duration::from_millis(cfg.obd2_timeout_ms),
                 cfg.obd2.dongle_ip.clone(),
                 cfg.obd2.dongle_port,
+                cfg.obd2.slow_poll_mode,
                 Duration::from_millis(cfg.obd2.slow_poll_interval_ms),
+                cfg.obd2.slow_poll_ratio,
             )
         };
 
@@ -478,6 +484,7 @@ pub fn dongle_task(
                 });
 
                 requests_this_second += 1;
+                fast_requests_since_slow += 1;
                 state
                     .polling_metrics
                     .dongle_requests_total
@@ -485,8 +492,13 @@ pub fn dongle_task(
                 polled = true;
             }
 
-            // Poll slow PID if interval elapsed
-            if polling.last_slow_poll.elapsed() >= slow_poll_interval {
+            // Poll slow PID based on mode (interval or ratio)
+            let should_poll_slow = match slow_poll_mode {
+                SlowPollMode::Interval => polling.last_slow_poll.elapsed() >= slow_poll_interval,
+                SlowPollMode::Ratio => fast_requests_since_slow >= slow_poll_ratio,
+            };
+            
+            if should_poll_slow {
                 if let Some(pid) = polling.next_slow_pid() {
                     // Re-check connection after potential fast poll failure
                     if let Some(ref mut dongle_state) = connection {
@@ -506,6 +518,7 @@ pub fn dongle_task(
                     }
                 }
                 polling.last_slow_poll = Instant::now();
+                fast_requests_since_slow = 0;
             }
 
             // RPM is always in fast queue, so we should always poll something
@@ -651,6 +664,12 @@ pub fn cache_manager_task(
                 }
             }
             Ok(CacheManagerMessage::Waiting(pid)) => {
+                // Get config for promotion behavior
+                let slow_poll_mode = {
+                    let cfg = state.config.lock().unwrap();
+                    cfg.obd2.slow_poll_mode
+                };
+                
                 // Update or create PID info
                 let is_new = !pid_info.contains_key(&pid);
                 let info = pid_info.entry(pid.clone()).or_insert_with(|| PidInfo {
@@ -661,8 +680,9 @@ pub fn cache_manager_task(
                 });
                 info.last_waiter_time = Some(Instant::now());
 
-                // Promote to fast if it was slow
-                if info.priority == PidPriority::Slow {
+                // Promote to fast if it was slow (in interval mode, promote immediately)
+                // In ratio mode, we don't auto-promote here - we check wait time on Consumed
+                if info.priority == PidPriority::Slow && slow_poll_mode == SlowPollMode::Interval {
                     info.priority = PidPriority::Fast;
                     state
                         .polling_metrics
@@ -677,9 +697,32 @@ pub fn cache_manager_task(
                 }
             }
             Ok(CacheManagerMessage::Consumed { pid, wait_duration }) => {
+                // Get config for promotion behavior  
+                let (slow_poll_mode, promotion_threshold) = {
+                    let cfg = state.config.lock().unwrap();
+                    (cfg.obd2.slow_poll_mode, Duration::from_millis(cfg.obd2.promotion_wait_threshold_ms))
+                };
+                
                 if let Some(info) = pid_info.get_mut(&pid) {
                     info.last_consumed_time = Some(Instant::now());
                     info.request_count += 1;
+                    
+                    // In ratio mode, promote slow PIDs if wait time exceeds threshold
+                    if slow_poll_mode == SlowPollMode::Ratio 
+                        && info.priority == PidPriority::Slow 
+                        && wait_duration.is_some_and(|d| d >= promotion_threshold) 
+                    {
+                        info.priority = PidPriority::Fast;
+                        state
+                            .polling_metrics
+                            .promotions
+                            .fetch_add(1, Ordering::Relaxed);
+                        info!("PID {:?}: promoted to fast (wait {}ms >= {}ms threshold)", 
+                            String::from_utf8_lossy(&pid),
+                            wait_duration.unwrap().as_millis(),
+                            promotion_threshold.as_millis());
+                        let _ = dongle_tx.send(DongleMessage::SetPidPriority(pid.clone(), true));
+                    }
                 }
                 if let Some(duration) = wait_duration {
                     cache_misses += 1;

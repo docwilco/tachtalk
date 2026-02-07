@@ -111,6 +111,17 @@ impl Default for IpConfig {
     }
 }
 
+/// Slow poll mode: interval-based or ratio-based
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SlowPollMode {
+    /// Poll slow PIDs at fixed interval (ms)
+    Interval,
+    /// Poll 1 slow PID per N fast requests
+    #[default]
+    Ratio,
+}
+
 /// OBD2 network configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Obd2Config {
@@ -120,9 +131,18 @@ pub struct Obd2Config {
     pub dongle_port: u16,
     /// Port to listen on for OBD2 clients
     pub listen_port: u16,
-    /// Interval between slow PID polls (ms)
+    /// Slow poll mode: interval or ratio
+    #[serde(default)]
+    pub slow_poll_mode: SlowPollMode,
+    /// Interval between slow PID polls (ms) - used in interval mode
     #[serde(default = "default_slow_poll_interval_ms")]
     pub slow_poll_interval_ms: u64,
+    /// Ratio of fast requests per slow request - used in ratio mode
+    #[serde(default = "default_slow_poll_ratio")]
+    pub slow_poll_ratio: u32,
+    /// Wait time threshold (ms) for promoting slow PID to fast - used in ratio mode
+    #[serde(default = "default_promotion_wait_threshold_ms")]
+    pub promotion_wait_threshold_ms: u64,
     /// Time without waiters before demoting fast PID to slow (ms)
     #[serde(default = "default_fast_demotion_ms")]
     pub fast_demotion_ms: u64,
@@ -136,6 +156,14 @@ pub struct Obd2Config {
 
 const fn default_slow_poll_interval_ms() -> u64 {
     450
+}
+
+const fn default_slow_poll_ratio() -> u32 {
+    6
+}
+
+const fn default_promotion_wait_threshold_ms() -> u64 {
+    40
 }
 
 const fn default_fast_demotion_ms() -> u64 {
@@ -152,7 +180,10 @@ impl Default for Obd2Config {
             dongle_ip: "192.168.0.10".to_string(),
             dongle_port: 35000,
             listen_port: 35000,
+            slow_poll_mode: SlowPollMode::default(),
             slow_poll_interval_ms: default_slow_poll_interval_ms(),
+            slow_poll_ratio: default_slow_poll_ratio(),
+            promotion_wait_threshold_ms: default_promotion_wait_threshold_ms(),
             fast_demotion_ms: default_fast_demotion_ms(),
             pid_inactive_removal_ms: default_pid_inactive_removal_ms(),
             test_multi_pid: false,

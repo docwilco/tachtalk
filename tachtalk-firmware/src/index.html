@@ -714,9 +714,26 @@
                 <small style="color: #888;">Max 4500ms</small>
             </div>
             <div class="form-group">
+                <label>Slow Poll Mode:</label>
+                <select id="obd2SlowPollMode" onchange="toggleSlowPollMode()">
+                    <option value="interval">Interval (ms)</option>
+                    <option value="ratio">Ratio (1 slow per N fast)</option>
+                </select>
+            </div>
+            <div class="form-group" id="slowPollIntervalGroup">
                 <label>Slow Poll Interval (ms):</label>
-                <input type="number" id="obd2SlowPollMs" placeholder="1000" min="100" max="10000">
+                <input type="number" id="obd2SlowPollMs" placeholder="450" min="50" max="10000">
                 <small style="color: #888;">Interval for low-priority PIDs</small>
+            </div>
+            <div class="form-group hidden" id="slowPollRatioGroup">
+                <label>Slow Poll Ratio:</label>
+                <input type="number" id="obd2SlowPollRatio" placeholder="6" min="1" max="100">
+                <small style="color: #888;">1 slow request per N fast requests</small>
+            </div>
+            <div class="form-group hidden" id="promotionThresholdGroup">
+                <label>Promotion Wait Threshold (ms):</label>
+                <input type="number" id="obd2PromotionThreshold" placeholder="20" min="0" max="1000">
+                <small style="color: #888;">Promote slow PID to fast if wait exceeds this</small>
             </div>
             <div class="form-group">
                 <label>Fast Demotion (ms):</label>
@@ -804,7 +821,10 @@
                 dongle_ip: '192.168.0.10',
                 dongle_port: 35000,
                 listen_port: 35000,
+                slow_poll_mode: 'ratio',
                 slow_poll_interval_ms: 450,
+                slow_poll_ratio: 6,
+                promotion_wait_threshold_ms: 40,
                 fast_demotion_ms: 2000,
                 pid_inactive_removal_ms: 4000,
                 test_multi_pid: false
@@ -832,6 +852,13 @@
             const mode = document.getElementById('ipMode').value;
             const fields = document.getElementById('staticIpFields');
             fields.className = mode === 'static' ? '' : 'hidden';
+        }
+
+        function toggleSlowPollMode() {
+            const mode = document.getElementById('obd2SlowPollMode').value;
+            document.getElementById('slowPollIntervalGroup').className = mode === 'interval' ? 'form-group' : 'form-group hidden';
+            document.getElementById('slowPollRatioGroup').className = mode === 'ratio' ? 'form-group' : 'form-group hidden';
+            document.getElementById('promotionThresholdGroup').className = mode === 'ratio' ? 'form-group' : 'form-group hidden';
         }
 
         function togglePasswordVisibility() {
@@ -970,7 +997,10 @@
                 dongle_ip: document.getElementById('obd2DongleIp').value || '192.168.0.10',
                 dongle_port: parseInt(document.getElementById('obd2DonglePort').value) || 35000,
                 listen_port: parseInt(document.getElementById('obd2ListenPort').value) || 35000,
+                slow_poll_mode: document.getElementById('obd2SlowPollMode').value || 'ratio',
                 slow_poll_interval_ms: parseInt(document.getElementById('obd2SlowPollMs').value) || 450,
+                slow_poll_ratio: parseInt(document.getElementById('obd2SlowPollRatio').value) || 6,
+                promotion_wait_threshold_ms: parseInt(document.getElementById('obd2PromotionThreshold').value) || 20,
                 fast_demotion_ms: parseInt(document.getElementById('obd2FastDemotionMs').value) || 2000,
                 pid_inactive_removal_ms: parseInt(document.getElementById('obd2PidRemovalMs').value) || 4000,
                 test_multi_pid: document.getElementById('obd2TestMultiPid').checked
@@ -1188,10 +1218,14 @@
                     document.getElementById('obd2DongleIp').value = obd2Config.dongle_ip || '192.168.0.10';
                     document.getElementById('obd2DonglePort').value = obd2Config.dongle_port || 35000;
                     document.getElementById('obd2ListenPort').value = obd2Config.listen_port || 35000;
+                    document.getElementById('obd2SlowPollMode').value = obd2Config.slow_poll_mode || 'ratio';
                     document.getElementById('obd2SlowPollMs').value = obd2Config.slow_poll_interval_ms || 450;
+                    document.getElementById('obd2SlowPollRatio').value = obd2Config.slow_poll_ratio || 6;
+                    document.getElementById('obd2PromotionThreshold').value = obd2Config.promotion_wait_threshold_ms || 20;
                     document.getElementById('obd2FastDemotionMs').value = obd2Config.fast_demotion_ms || 2000;
                     document.getElementById('obd2PidRemovalMs').value = obd2Config.pid_inactive_removal_ms || 4000;
                     document.getElementById('obd2TestMultiPid').checked = obd2Config.test_multi_pid || false;
+                    toggleSlowPollMode();
                     
                     // Log level
                     document.getElementById('logLevel').value = config.log_level || 'info';
