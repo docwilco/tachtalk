@@ -219,16 +219,7 @@ To build this project, you need:
 
 ### Future Enhancement Opportunities
 
-- [ ] Multi-zone LED patterns
-- [ ] Additional OBD2 parameters (coolant temp, speed, etc.)
-- [ ] Data logging capability
-- [ ] Over-the-air (OTA) updates
-- [ ] Bluetooth configuration option
-- [x] NVS storage for persistent configuration
-- [x] mDNS/Bonjour for easy device discovery
-- [x] Access Point mode for initial setup
-- [x] Captive portal for seamless configuration
-- [x] Server-Sent Events for real-time Web UI
+See [TODO.md](TODO.md) for the current list of planned features.
 
 ## Summary
 

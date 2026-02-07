@@ -211,9 +211,4 @@ cargo run --release
 
 ## Future Enhancements
 
-- [ ] Multi-zone LED support
-- [ ] Alternative display modes (progress bar, etc.)
-- [ ] Support for additional OBD2 parameters
-- [ ] Over-the-air (OTA) updates
-- [x] NVS storage for persistent configuration
-- [x] mDNS/Bonjour for easy discovery (tachtalk.local)
+See [TODO.md](TODO.md) for the current list of planned features.

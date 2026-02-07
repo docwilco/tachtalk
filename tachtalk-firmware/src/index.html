@@ -814,39 +814,27 @@
             }
         }
 
-        let config = {
-            wifi: { ssid: '', password: '' },
-            ip: { use_dhcp: true, ip: '192.168.0.20', prefix_len: 24 },
-            obd2: {
-                dongle_ip: '192.168.0.10',
-                dongle_port: 35000,
-                listen_port: 35000,
-                slow_poll_mode: 'ratio',
-                slow_poll_interval_ms: 450,
-                slow_poll_ratio: 6,
-                promotion_wait_threshold_ms: 40,
-                fast_demotion_ms: 2000,
-                pid_inactive_removal_ms: 4000,
-                test_multi_pid: false
-            },
-            ap_ssid: '',
-            ap_password: null,
-            ap_ip: '10.15.25.1',
-            ap_prefix_len: 24,
-            obd2_timeout_ms: 4500,
-            log_level: 'info',
-            thresholds: [
-                { name: 'Off', rpm: 0, start_led: 0, end_led: 0, color: { r: 0, g: 0, b: 0 }, blink: false, blink_ms: 500 },
-                { name: 'Blue', rpm: 1000, start_led: 0, end_led: 0, color: { r: 0, g: 0, b: 255 }, blink: false, blink_ms: 500 },
-                { name: 'Green', rpm: 1500, start_led: 0, end_led: 0, color: { r: 0, g: 255, b: 0 }, blink: false, blink_ms: 500 },
-                { name: 'Yellow', rpm: 2000, start_led: 0, end_led: 0, color: { r: 255, g: 255, b: 0 }, blink: false, blink_ms: 500 },
-                { name: 'Red', rpm: 2500, start_led: 0, end_led: 0, color: { r: 255, g: 0, b: 0 }, blink: false, blink_ms: 500 },
-                { name: 'Off', rpm: 3000, start_led: 0, end_led: 0, color: { r: 0, g: 0, b: 0 }, blink: false, blink_ms: 500 },
-                { name: 'Shift', rpm: 3000, start_led: 0, end_led: 0, color: { r: 0, g: 0, b: 255 }, blink: true, blink_ms: 500 }
-            ],
-            total_leds: 1,
-            led_gpio: 48
-        };
+        // Current config (loaded from server)
+        let config = { thresholds: [] };
+        // Default config (loaded from server, used as fallback)
+        let defaults = null;
+
+        // Helper to get default value by path (e.g., 'obd2.dongle_ip')
+        function d(path) {
+            if (!defaults) return undefined;
+            return path.split('.').reduce((obj, key) => obj?.[key], defaults);
+        }
+
+        async function loadDefaults() {
+            try {
+                const response = await fetch('/api/config/default');
+                if (response.ok) {
+                    defaults = await response.json();
+                }
+            } catch (error) {
+                console.error('Failed to load defaults:', error);
+            }
+        }
 
         function toggleStaticIp() {
             const mode = document.getElementById('ipMode').value;
@@ -994,22 +982,22 @@
             config.total_leds = parseInt(document.getElementById('totalLeds').value);
             config.led_gpio = parseInt(document.getElementById('ledGpio').value);
             config.obd2 = {
-                dongle_ip: document.getElementById('obd2DongleIp').value || '192.168.0.10',
-                dongle_port: parseInt(document.getElementById('obd2DonglePort').value) || 35000,
-                listen_port: parseInt(document.getElementById('obd2ListenPort').value) || 35000,
-                slow_poll_mode: document.getElementById('obd2SlowPollMode').value || 'ratio',
-                slow_poll_interval_ms: parseInt(document.getElementById('obd2SlowPollMs').value) || 450,
-                slow_poll_ratio: parseInt(document.getElementById('obd2SlowPollRatio').value) || 6,
-                promotion_wait_threshold_ms: parseInt(document.getElementById('obd2PromotionThreshold').value) || 20,
-                fast_demotion_ms: parseInt(document.getElementById('obd2FastDemotionMs').value) || 2000,
-                pid_inactive_removal_ms: parseInt(document.getElementById('obd2PidRemovalMs').value) || 4000,
+                dongle_ip: document.getElementById('obd2DongleIp').value || d('obd2.dongle_ip'),
+                dongle_port: parseInt(document.getElementById('obd2DonglePort').value) || d('obd2.dongle_port'),
+                listen_port: parseInt(document.getElementById('obd2ListenPort').value) || d('obd2.listen_port'),
+                slow_poll_mode: document.getElementById('obd2SlowPollMode').value || d('obd2.slow_poll_mode'),
+                slow_poll_interval_ms: parseInt(document.getElementById('obd2SlowPollMs').value) || d('obd2.slow_poll_interval_ms'),
+                slow_poll_ratio: parseInt(document.getElementById('obd2SlowPollRatio').value) || d('obd2.slow_poll_ratio'),
+                promotion_wait_threshold_ms: parseInt(document.getElementById('obd2PromotionThreshold').value) || d('obd2.promotion_wait_threshold_ms'),
+                fast_demotion_ms: parseInt(document.getElementById('obd2FastDemotionMs').value) || d('obd2.fast_demotion_ms'),
+                pid_inactive_removal_ms: parseInt(document.getElementById('obd2PidRemovalMs').value) || d('obd2.pid_inactive_removal_ms'),
                 test_multi_pid: document.getElementById('obd2TestMultiPid').checked
             };
-            config.obd2_timeout_ms = parseInt(document.getElementById('obd2TimeoutMs').value) || 4500;
+            config.obd2_timeout_ms = parseInt(document.getElementById('obd2TimeoutMs').value) || d('obd2_timeout_ms');
             config.ap_ssid = document.getElementById('apSsid').value;
             config.ap_password = document.getElementById('apPassword').value || null;
-            config.ap_ip = document.getElementById('apIp').value || '10.15.25.1';
-            config.ap_prefix_len = parseInt(document.getElementById('apPrefixLen').value) || 24;
+            config.ap_ip = document.getElementById('apIp').value || d('ap_ip');
+            config.ap_prefix_len = parseInt(document.getElementById('apPrefixLen').value) || d('ap_prefix_len');
             config.log_level = document.getElementById('logLevel').value;
             config.dump_cpu_metrics = document.getElementById('dumpCpuMetrics').checked;
             config.dump_socket_info = document.getElementById('dumpSocketInfo').checked;
@@ -1202,46 +1190,46 @@
                 if (response.ok) {
                     config = await response.json();
                     document.getElementById('totalLeds').value = config.total_leds;
-                    document.getElementById('ledGpio').value = config.led_gpio || 48;
+                    document.getElementById('ledGpio').value = config.led_gpio ?? d('led_gpio');
                     document.getElementById('wifiSsid').value = config.wifi?.ssid || '';
                     document.getElementById('wifiPassword').value = config.wifi?.password || '';
                     
                     // IP config
-                    const ipConfig = config.ip || { use_dhcp: true, prefix_len: 24 };
+                    const ipConfig = config.ip || defaults?.ip || {};
                     document.getElementById('ipMode').value = ipConfig.use_dhcp ? 'dhcp' : 'static';
                     document.getElementById('staticIp').value = ipConfig.ip || '';
-                    document.getElementById('staticPrefixLen').value = ipConfig.prefix_len || 24;
+                    document.getElementById('staticPrefixLen').value = ipConfig.prefix_len ?? d('ip.prefix_len');
                     toggleStaticIp();
                     
                     // OBD2 config
-                    const obd2Config = config.obd2 || { dongle_ip: '192.168.0.10', dongle_port: 35000, listen_port: 35000 };
-                    document.getElementById('obd2DongleIp').value = obd2Config.dongle_ip || '192.168.0.10';
-                    document.getElementById('obd2DonglePort').value = obd2Config.dongle_port || 35000;
-                    document.getElementById('obd2ListenPort').value = obd2Config.listen_port || 35000;
-                    document.getElementById('obd2SlowPollMode').value = obd2Config.slow_poll_mode || 'ratio';
-                    document.getElementById('obd2SlowPollMs').value = obd2Config.slow_poll_interval_ms || 450;
-                    document.getElementById('obd2SlowPollRatio').value = obd2Config.slow_poll_ratio || 6;
-                    document.getElementById('obd2PromotionThreshold').value = obd2Config.promotion_wait_threshold_ms || 20;
-                    document.getElementById('obd2FastDemotionMs').value = obd2Config.fast_demotion_ms || 2000;
-                    document.getElementById('obd2PidRemovalMs').value = obd2Config.pid_inactive_removal_ms || 4000;
-                    document.getElementById('obd2TestMultiPid').checked = obd2Config.test_multi_pid || false;
+                    const obd2Config = config.obd2 || defaults?.obd2 || {};
+                    document.getElementById('obd2DongleIp').value = obd2Config.dongle_ip ?? d('obd2.dongle_ip');
+                    document.getElementById('obd2DonglePort').value = obd2Config.dongle_port ?? d('obd2.dongle_port');
+                    document.getElementById('obd2ListenPort').value = obd2Config.listen_port ?? d('obd2.listen_port');
+                    document.getElementById('obd2SlowPollMode').value = obd2Config.slow_poll_mode ?? d('obd2.slow_poll_mode');
+                    document.getElementById('obd2SlowPollMs').value = obd2Config.slow_poll_interval_ms ?? d('obd2.slow_poll_interval_ms');
+                    document.getElementById('obd2SlowPollRatio').value = obd2Config.slow_poll_ratio ?? d('obd2.slow_poll_ratio');
+                    document.getElementById('obd2PromotionThreshold').value = obd2Config.promotion_wait_threshold_ms ?? d('obd2.promotion_wait_threshold_ms');
+                    document.getElementById('obd2FastDemotionMs').value = obd2Config.fast_demotion_ms ?? d('obd2.fast_demotion_ms');
+                    document.getElementById('obd2PidRemovalMs').value = obd2Config.pid_inactive_removal_ms ?? d('obd2.pid_inactive_removal_ms');
+                    document.getElementById('obd2TestMultiPid').checked = obd2Config.test_multi_pid ?? d('obd2.test_multi_pid');
                     toggleSlowPollMode();
                     
                     // Log level
-                    document.getElementById('logLevel').value = config.log_level || 'info';
+                    document.getElementById('logLevel').value = config.log_level ?? d('log_level');
                     
                     // Debug dump options
-                    document.getElementById('dumpCpuMetrics').checked = config.dump_cpu_metrics || false;
-                    document.getElementById('dumpSocketInfo').checked = config.dump_socket_info || false;
+                    document.getElementById('dumpCpuMetrics').checked = config.dump_cpu_metrics ?? d('dump_cpu_metrics');
+                    document.getElementById('dumpSocketInfo').checked = config.dump_socket_info ?? d('dump_socket_info');
                     
                     // AP config
                     document.getElementById('apSsid').value = config.ap_ssid || '';
                     document.getElementById('apPassword').value = config.ap_password || '';
-                    document.getElementById('apIp').value = config.ap_ip || '10.15.25.1';
-                    document.getElementById('apPrefixLen').value = config.ap_prefix_len || 24;
+                    document.getElementById('apIp').value = config.ap_ip ?? d('ap_ip');
+                    document.getElementById('apPrefixLen').value = config.ap_prefix_len ?? d('ap_prefix_len');
                     
                     // OBD2 timeout
-                    document.getElementById('obd2TimeoutMs').value = config.obd2_timeout_ms || 4500;
+                    document.getElementById('obd2TimeoutMs').value = config.obd2_timeout_ms ?? d('obd2_timeout_ms');
                     
                     // Brightness
                     const brightness = config.brightness !== undefined ? config.brightness : 255;
@@ -1593,12 +1581,15 @@
         }
 
         // Initialize
-        renderThresholds();
-        loadConfig();
-        loadNetworkStatus();
-        loadConnectionStatus();
-        setupRpmEventSource();
-        loadDebugInfo();
+        (async function init() {
+            await loadDefaults();  // Load defaults first
+            renderThresholds();
+            loadConfig();
+            loadNetworkStatus();
+            loadConnectionStatus();
+            setupRpmEventSource();
+            loadDebugInfo();
+        })();
         
         // Load raw config when that section is opened
         document.querySelectorAll('.debug-section').forEach(details => {

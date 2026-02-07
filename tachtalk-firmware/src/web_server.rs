@@ -285,6 +285,17 @@ pub fn start_server(state: &Arc<State>, ap_hostname: Option<String>, ap_ip: Ipv4
         Ok(())
     })?;
 
+    // GET default config endpoint
+    server.fn_handler("/api/config/default", Method::Get, |req| -> Result<(), esp_idf_svc::io::EspIOError> {
+        info!("HTTP: GET /api/config/default");
+        let default_config = crate::config::Config::default();
+        let json = serde_json::to_string(&default_config).unwrap();
+        
+        let mut response = req.into_ok_response()?;
+        response.write_all(json.as_bytes())?;
+        Ok(())
+    })?;
+
     // POST config endpoint
     let state_clone = state.clone();
     server.fn_handler("/api/config", Method::Post, move |mut req| -> Result<(), esp_idf_svc::io::EspIOError> {
