@@ -13,31 +13,42 @@ use esp_idf_svc::sys::{esp_get_free_heap_size, esp_get_minimum_free_heap_size};
 use crate::rpm_leds::RpmTaskMessage;
 use crate::sse_server::SSE_PORT;
 use crate::State;
+use crate::config::Config;
+use smallvec::SmallVec;
 
-/// IP configuration for WiFi request
-#[derive(serde::Deserialize)]
-struct IpConfigRequest {
-    use_dhcp: bool,
-    #[serde(default = "default_static_ip")]
-    ip: String,
-    #[serde(default = "default_prefix_len")]
-    prefix_len: u8,
-}
-
-fn default_static_ip() -> String {
-    "192.168.0.20".to_string()
-}
-
-const fn default_prefix_len() -> u8 {
-    24
-}
-
-/// WiFi configuration request from web UI
-#[derive(serde::Deserialize)]
-struct WifiRequest {
-    ssid: String,
-    password: Option<String>,
-    ip: Option<IpConfigRequest>,
+/// Check if a config change would require a device restart
+/// Returns (GPIOs to reset before restart, `needs_restart`)
+#[allow(clippy::similar_names)]
+fn check_restart_needed(current: &Config, new: &Config) -> (SmallVec<[u8; 3]>, bool) {
+    let led_changed = current.led_gpio != new.led_gpio;
+    let encoder_a_changed = current.encoder_pin_a != new.encoder_pin_a;
+    let encoder_b_changed = current.encoder_pin_b != new.encoder_pin_b;
+    let wifi_changed = current.wifi.ssid != new.wifi.ssid
+        || current.wifi.password != new.wifi.password;
+    let ip_changed = current.ip.use_dhcp != new.ip.use_dhcp
+        || current.ip.ip != new.ip.ip
+        || current.ip.prefix_len != new.ip.prefix_len;
+    let ap_changed = current.ap_ssid != new.ap_ssid
+        || current.ap_password != new.ap_password
+        || current.ap_ip != new.ap_ip
+        || current.ap_prefix_len != new.ap_prefix_len;
+    
+    // Collect old GPIO pins that need reset (to disconnect from RMT/PCNT peripherals)
+    let mut gpios_to_reset = SmallVec::new();
+    if led_changed {
+        gpios_to_reset.push(current.led_gpio);
+    }
+    if encoder_a_changed && current.encoder_pin_a != 0 {
+        gpios_to_reset.push(current.encoder_pin_a);
+    }
+    if encoder_b_changed && current.encoder_pin_b != 0 {
+        gpios_to_reset.push(current.encoder_pin_b);
+    }
+    
+    let needs_restart = led_changed || encoder_a_changed || encoder_b_changed 
+        || wifi_changed || ip_changed || ap_changed;
+    
+    (gpios_to_reset, needs_restart)
 }
 
 /// Brightness change request from web UI
@@ -296,6 +307,33 @@ pub fn start_server(state: &Arc<State>, ap_hostname: Option<String>, ap_ip: Ipv4
         Ok(())
     })?;
 
+    // POST config check endpoint - returns whether the config change would require a restart
+    let state_clone = state.clone();
+    server.fn_handler("/api/config/check", Method::Post, move |mut req| -> Result<(), esp_idf_svc::io::EspIOError> {
+        debug!("HTTP: POST /api/config/check");
+        let mut buf = vec![0u8; 8192];
+        let bytes_read = req.read(&mut buf)?;
+        
+        if let Ok(mut new_config) = serde_json::from_slice::<crate::config::Config>(&buf[..bytes_read]) {
+            new_config.validate();
+            let (_, needs_restart) = {
+                let cfg = state_clone.config.lock().unwrap();
+                check_restart_needed(&cfg, &new_config)
+            };
+            let mut response = req.into_ok_response()?;
+            if needs_restart {
+                response.write_all(b"{\"restart\":true}")?;
+            } else {
+                response.write_all(b"{\"restart\":false}")?;
+            }
+        } else {
+            warn!("Invalid config JSON received");
+            req.into_status_response(400)?;
+        }
+        
+        Ok(())
+    })?;
+
     // POST config endpoint
     let state_clone = state.clone();
     server.fn_handler("/api/config", Method::Post, move |mut req| -> Result<(), esp_idf_svc::io::EspIOError> {
@@ -310,13 +348,10 @@ pub fn start_server(state: &Arc<State>, ap_hostname: Option<String>, ap_ip: Ipv4
             debug!("Config update: {} thresholds, log_level={:?}", 
                    new_config.thresholds.len(), new_config.log_level);
             
-            let old_gpio = {
+            // Check if any settings changed that require a restart
+            let (gpios_to_reset, needs_restart) = {
                 let cfg = state_clone.config.lock().unwrap();
-                if cfg.led_gpio == new_config.led_gpio {
-                    None
-                } else {
-                    Some(cfg.led_gpio)
-                }
+                check_restart_needed(&cfg, &new_config)
             };
             
             {
@@ -330,10 +365,12 @@ pub fn start_server(state: &Arc<State>, ap_hostname: Option<String>, ap_ip: Ipv4
             // Notify RPM task of config change (to recalculate render interval)
             let _ = state_clone.rpm_tx.send(RpmTaskMessage::ConfigChanged);
             
-            if let Some(old_gpio) = old_gpio {
-                info!("LED GPIO changed from {old_gpio} to new value, resetting old pin and restarting in 2 seconds...");
-                // Reset the OLD GPIO to clear RMT routing before restart
-                unsafe { esp_idf_svc::sys::gpio_reset_pin(i32::from(old_gpio)); }
+            if needs_restart {
+                info!("Config changed (requires restart), restarting in 2 seconds...");
+                // Reset old GPIOs to disconnect from RMT/PCNT peripherals before restart
+                for gpio in gpios_to_reset {
+                    unsafe { esp_idf_svc::sys::gpio_reset_pin(i32::from(gpio)); }
+                }
                 let mut response = req.into_ok_response()?;
                 response.write_all(b"{\"restart\":true}")?;
                 crate::thread_util::spawn_named(c"restart", || {
@@ -376,54 +413,6 @@ pub fn start_server(state: &Arc<State>, ap_hostname: Option<String>, ap_ip: Ipv4
             req.into_ok_response()?;
         } else {
             warn!("Invalid brightness JSON received");
-            req.into_status_response(400)?;
-        }
-        
-        Ok(())
-    })?;
-
-    // POST wifi endpoint - save wifi and restart
-    let state_clone = state.clone();
-    server.fn_handler("/api/wifi", Method::Post, move |mut req| -> Result<(), esp_idf_svc::io::EspIOError> {
-        info!("HTTP: POST /api/wifi");
-        let mut buf = vec![0u8; 1024];
-        let bytes_read = req.read(&mut buf)?;
-        
-        if let Ok(wifi_req) = serde_json::from_slice::<WifiRequest>(&buf[..bytes_read]) {
-            info!("WiFi config update: ssid={:?}, dhcp={:?}", 
-                  wifi_req.ssid, wifi_req.ip.as_ref().map(|i| i.use_dhcp));
-            let mut cfg = state_clone.config.lock().unwrap();
-            cfg.wifi.ssid = wifi_req.ssid;
-            cfg.wifi.password = wifi_req.password.filter(|p| !p.is_empty());
-            
-            // Update IP config if provided
-            if let Some(ip_cfg) = wifi_req.ip {
-                cfg.ip.use_dhcp = ip_cfg.use_dhcp;
-                cfg.ip.ip = if ip_cfg.ip.is_empty() {
-                    "192.168.0.20".to_string()
-                } else {
-                    ip_cfg.ip
-                };
-                cfg.ip.prefix_len = ip_cfg.prefix_len;
-            }
-            
-            if let Err(e) = cfg.save() {
-                error!("Failed to save config: {e:?}");
-                req.into_status_response(500)?;
-                return Ok(());
-            }
-            
-            req.into_ok_response()?;
-            
-            // Schedule restart after response is sent
-            info!("WiFi configured, restarting in 2 seconds...");
-            crate::thread_util::spawn_named(c"restart", || {
-                std::thread::sleep(std::time::Duration::from_secs(2));
-                unsafe {
-                    esp_idf_svc::sys::esp_restart();
-                }
-            });
-        } else {
             req.into_status_response(400)?;
         }
         

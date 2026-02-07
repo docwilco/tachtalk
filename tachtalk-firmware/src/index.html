@@ -662,7 +662,6 @@
                     </span>
                 </div>
             </div>
-            <button id="btnSaveWifi" onclick="saveWifi()">Save & Connect</button>
             <button id="btnScanWifi" onclick="scanWifi()">Scan Networks</button>
             <div id="wifiNetworks" style="margin-top: 10px;"></div>
         </div>
@@ -784,7 +783,14 @@
                 <small style="color: #888;">(requires restart)</small>
             </div>
             <div class="form-group">
-                <button id="btnReboot" onclick="rebootDevice()" style="background-color: #ff5500;">🔄 Reboot Device</button>
+                <label>Encoder Pin A:</label>
+                <input type="number" id="encoderPinA" value="0" min="0" max="48">
+                <small style="color: #888;">0 = disabled (requires restart)</small>
+            </div>
+            <div class="form-group">
+                <label>Encoder Pin B:</label>
+                <input type="number" id="encoderPinB" value="0" min="0" max="48">
+                <small style="color: #888;">0 = disabled (requires restart)</small>
             </div>
         </div>
         
@@ -978,29 +984,68 @@
             }, 3000);
         }
 
-        async function saveConfig() {
-            config.total_leds = parseInt(document.getElementById('totalLeds').value);
-            config.led_gpio = parseInt(document.getElementById('ledGpio').value);
-            config.obd2 = {
-                dongle_ip: document.getElementById('obd2DongleIp').value || d('obd2.dongle_ip'),
-                dongle_port: parseInt(document.getElementById('obd2DonglePort').value) || d('obd2.dongle_port'),
-                listen_port: parseInt(document.getElementById('obd2ListenPort').value) || d('obd2.listen_port'),
-                slow_poll_mode: document.getElementById('obd2SlowPollMode').value || d('obd2.slow_poll_mode'),
-                slow_poll_interval_ms: parseInt(document.getElementById('obd2SlowPollMs').value) || d('obd2.slow_poll_interval_ms'),
-                slow_poll_ratio: parseInt(document.getElementById('obd2SlowPollRatio').value) || d('obd2.slow_poll_ratio'),
-                promotion_wait_threshold_ms: parseInt(document.getElementById('obd2PromotionThreshold').value) || d('obd2.promotion_wait_threshold_ms'),
-                fast_demotion_ms: parseInt(document.getElementById('obd2FastDemotionMs').value) || d('obd2.fast_demotion_ms'),
-                pid_inactive_removal_ms: parseInt(document.getElementById('obd2PidRemovalMs').value) || d('obd2.pid_inactive_removal_ms'),
-                test_multi_pid: document.getElementById('obd2TestMultiPid').checked
+        // Build config object from form values
+        function buildConfigFromForm() {
+            return {
+                ...config,
+                total_leds: parseInt(document.getElementById('totalLeds').value),
+                led_gpio: parseInt(document.getElementById('ledGpio').value),
+                encoder_pin_a: parseInt(document.getElementById('encoderPinA').value) || 0,
+                encoder_pin_b: parseInt(document.getElementById('encoderPinB').value) || 0,
+                obd2: {
+                    dongle_ip: document.getElementById('obd2DongleIp').value || d('obd2.dongle_ip'),
+                    dongle_port: parseInt(document.getElementById('obd2DonglePort').value) || d('obd2.dongle_port'),
+                    listen_port: parseInt(document.getElementById('obd2ListenPort').value) || d('obd2.listen_port'),
+                    slow_poll_mode: document.getElementById('obd2SlowPollMode').value || d('obd2.slow_poll_mode'),
+                    slow_poll_interval_ms: parseInt(document.getElementById('obd2SlowPollMs').value) || d('obd2.slow_poll_interval_ms'),
+                    slow_poll_ratio: parseInt(document.getElementById('obd2SlowPollRatio').value) || d('obd2.slow_poll_ratio'),
+                    promotion_wait_threshold_ms: parseInt(document.getElementById('obd2PromotionThreshold').value) || d('obd2.promotion_wait_threshold_ms'),
+                    fast_demotion_ms: parseInt(document.getElementById('obd2FastDemotionMs').value) || d('obd2.fast_demotion_ms'),
+                    pid_inactive_removal_ms: parseInt(document.getElementById('obd2PidRemovalMs').value) || d('obd2.pid_inactive_removal_ms'),
+                    test_multi_pid: document.getElementById('obd2TestMultiPid').checked
+                },
+                obd2_timeout_ms: parseInt(document.getElementById('obd2TimeoutMs').value) || d('obd2_timeout_ms'),
+                wifi: {
+                    ssid: document.getElementById('wifiSsid').value,
+                    password: document.getElementById('wifiPassword').value || null
+                },
+                ip: {
+                    use_dhcp: document.getElementById('ipMode').value === 'dhcp',
+                    ip: document.getElementById('staticIp').value || '192.168.0.20',
+                    prefix_len: parseInt(document.getElementById('staticPrefixLen').value) || 24
+                },
+                ap_ssid: document.getElementById('apSsid').value,
+                ap_password: document.getElementById('apPassword').value || null,
+                ap_ip: document.getElementById('apIp').value || d('ap_ip'),
+                ap_prefix_len: parseInt(document.getElementById('apPrefixLen').value) || d('ap_prefix_len'),
+                log_level: document.getElementById('logLevel').value,
+                dump_cpu_metrics: document.getElementById('dumpCpuMetrics').checked,
+                dump_socket_info: document.getElementById('dumpSocketInfo').checked
             };
-            config.obd2_timeout_ms = parseInt(document.getElementById('obd2TimeoutMs').value) || d('obd2_timeout_ms');
-            config.ap_ssid = document.getElementById('apSsid').value;
-            config.ap_password = document.getElementById('apPassword').value || null;
-            config.ap_ip = document.getElementById('apIp').value || d('ap_ip');
-            config.ap_prefix_len = parseInt(document.getElementById('apPrefixLen').value) || d('ap_prefix_len');
-            config.log_level = document.getElementById('logLevel').value;
-            config.dump_cpu_metrics = document.getElementById('dumpCpuMetrics').checked;
-            config.dump_socket_info = document.getElementById('dumpSocketInfo').checked;
+        }
+
+        async function saveConfig() {
+            const newConfig = buildConfigFromForm();
+            
+            // Check with server if restart will be required
+            try {
+                const checkResponse = await fetch('/api/config/check', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(newConfig)
+                });
+                if (checkResponse.ok) {
+                    const result = await checkResponse.json();
+                    if (result.restart && !confirm('This will reboot the device. Continue?')) {
+                        return;
+                    }
+                }
+            } catch (error) {
+                // If check fails, proceed anyway (server will handle it)
+                console.warn('Config check failed:', error);
+            }
+            
+            config = newConfig;
             
             setButtonLoading('btnSaveConfig', true, 'Saving...');
             try {
@@ -1087,50 +1132,6 @@
             }
         }
 
-        async function saveWifi() {
-            const ssid = document.getElementById('wifiSsid').value;
-            const password = document.getElementById('wifiPassword').value;
-            const useDhcp = document.getElementById('ipMode').value === 'dhcp';
-            
-            if (!ssid) {
-                showStatus('Please enter a WiFi SSID', true);
-                return;
-            }
-            
-            const ipConfig = {
-                use_dhcp: useDhcp,
-                ip: document.getElementById('staticIp').value || '192.168.0.20',
-                prefix_len: parseInt(document.getElementById('staticPrefixLen').value) || 24
-            };
-            
-            config.wifi = { ssid, password: password || null };
-            config.ip = ipConfig;
-            
-            setButtonLoading('btnSaveWifi', true, 'Connecting...');
-            try {
-                const response = await fetch('/api/wifi', {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json',
-                    },
-                    body: JSON.stringify({ ssid, password: password || null, ip: ipConfig })
-                });
-                
-                if (response.ok) {
-                    showStatus('WiFi saved! Device will restart and connect to ' + ssid, false);
-                    setTimeout(() => {
-                        showStatus('Restarting device...', false);
-                    }, 2000);
-                } else {
-                    showStatus('Failed to save WiFi configuration', true);
-                }
-            } catch (error) {
-                showStatus('Error: ' + error.message, true);
-            } finally {
-                setButtonLoading('btnSaveWifi', false);
-            }
-        }
-
         async function scanWifi() {
             setButtonLoading('btnScanWifi', true, 'Scanning...');
             try {
@@ -1158,31 +1159,6 @@
             }
         }
 
-        async function rebootDevice() {
-            if (!confirm('Are you sure you want to reboot the device?')) {
-                return;
-            }
-            
-            setButtonLoading('btnReboot', true, 'Rebooting...');
-            try {
-                const response = await fetch('/api/reboot', {
-                    method: 'POST'
-                });
-                
-                if (response.ok) {
-                    showStatus('Device is rebooting...', false);
-                    // Disable the button since device is restarting
-                    document.getElementById('btnReboot').disabled = true;
-                } else {
-                    showStatus('Failed to reboot device', true);
-                    setButtonLoading('btnReboot', false);
-                }
-            } catch (error) {
-                // Expected to fail as device disconnects
-                showStatus('Device is rebooting...', false);
-            }
-        }
-
         async function loadConfig() {
             setButtonLoading('btnReload', true, 'Loading...');
             try {
@@ -1191,6 +1167,8 @@
                     config = await response.json();
                     document.getElementById('totalLeds').value = config.total_leds;
                     document.getElementById('ledGpio').value = config.led_gpio ?? d('led_gpio');
+                    document.getElementById('encoderPinA').value = config.encoder_pin_a ?? 0;
+                    document.getElementById('encoderPinB').value = config.encoder_pin_b ?? 0;
                     document.getElementById('wifiSsid').value = config.wifi?.ssid || '';
                     document.getElementById('wifiPassword').value = config.wifi?.password || '';
                     

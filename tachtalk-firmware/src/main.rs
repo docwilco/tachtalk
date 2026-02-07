@@ -14,6 +14,7 @@ use esp_idf_svc::ipv4::{
     self, ClientConfiguration as IpClientConfiguration, ClientSettings as IpClientSettings,
     Configuration as IpConfiguration, Ipv4Addr, Mask, Subnet,
 };
+use esp_idf_svc::sys::{gpio_pullup_en, gpio_set_pull_mode, gpio_pull_mode_t_GPIO_PULLUP_ONLY};
 use log::{debug, info, warn, error};
 use std::collections::HashSet;
 use std::net::SocketAddr;
@@ -23,6 +24,7 @@ mod config;
 mod cpu_metrics;
 mod dns;
 mod obd2;
+mod rotary_encoder;
 mod rpm_leds;
 mod sse_server;
 mod thread_util;
@@ -246,6 +248,45 @@ fn init_led_controller<C: esp_idf_hal::rmt::RmtChannel>(
     LedController::new(led_pin, rmt_channel, brightness)
 }
 
+/// Initialize rotary encoder if configured (both pins must be non-zero)
+fn init_encoder<PCNT: esp_idf_hal::pcnt::Pcnt>(
+    config: &Config,
+    pcnt: impl esp_idf_hal::peripheral::Peripheral<P = PCNT> + 'static,
+) -> Option<esp_idf_hal::pcnt::PcntDriver<'static>> {
+    if config.encoder_pin_a == 0 || config.encoder_pin_b == 0 {
+        debug!("Rotary encoder disabled (pins not configured)");
+        return None;
+    }
+
+    info!(
+        "Initializing rotary encoder on GPIO {} (A) and {} (B)...",
+        config.encoder_pin_a, config.encoder_pin_b
+    );
+
+    // Configure pins with internal pull-ups (~45kΩ) for the encoder
+    // SAFETY: We trust the user-configured GPIO pin numbers are valid
+    unsafe {
+        gpio_set_pull_mode(i32::from(config.encoder_pin_a), gpio_pull_mode_t_GPIO_PULLUP_ONLY);
+        gpio_set_pull_mode(i32::from(config.encoder_pin_b), gpio_pull_mode_t_GPIO_PULLUP_ONLY);
+        gpio_pullup_en(i32::from(config.encoder_pin_a));
+        gpio_pullup_en(i32::from(config.encoder_pin_b));
+    }
+
+    let pin_a = unsafe { esp_idf_hal::gpio::AnyInputPin::new(i32::from(config.encoder_pin_a)) };
+    let pin_b = unsafe { esp_idf_hal::gpio::AnyInputPin::new(i32::from(config.encoder_pin_b)) };
+
+    match rotary_encoder::init_encoder(pcnt, pin_a, pin_b) {
+        Ok(driver) => {
+            info!("Rotary encoder initialized");
+            Some(driver)
+        }
+        Err(e) => {
+            error!("Failed to initialize rotary encoder: {e:?}");
+            None
+        }
+    }
+}
+
 /// Initialize WiFi driver and network interfaces
 fn init_wifi(
     config: &Config,
@@ -284,6 +325,7 @@ fn init_wifi(
 fn spawn_background_tasks(
     state: &Arc<State>,
     led_controller: LedController,
+    encoder_driver: Option<esp_idf_hal::pcnt::PcntDriver<'static>>,
     sse_rx: std::sync::mpsc::Receiver<sse_server::SseMessage>,
     dongle_control_rx: obd2::DongleReceiver,
     dongle_control_tx: DongleSender,
@@ -359,6 +401,14 @@ fn spawn_background_tasks(
             wifi_connection_manager(&state);
         });
     }
+
+    // Start rotary encoder task (if configured)
+    if let Some(driver) = encoder_driver {
+        let state = state.clone();
+        thread_util::spawn_named(c"encoder", move || {
+            rotary_encoder::encoder_task(&state, driver);
+        });
+    }
 }
 
 fn main() -> Result<()> {
@@ -377,6 +427,8 @@ fn main() -> Result<()> {
 
     let config = init_logging_and_config(nvs.clone())?;
     let led_controller = init_led_controller(&config, peripherals.rmt.channel0)?;
+    let encoder_driver = init_encoder(&config, peripherals.pcnt0);
+
     let (wifi, ap_ssid) = init_wifi(&config, peripherals.modem, sys_loop, nvs)?;
 
     let ap_hostname = ap_ssid.to_lowercase();
@@ -410,6 +462,7 @@ fn main() -> Result<()> {
     spawn_background_tasks(
         &state,
         led_controller,
+        encoder_driver,
         sse_rx,
         dongle_control_rx,
         dongle_control_tx,

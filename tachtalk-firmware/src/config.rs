@@ -226,6 +226,12 @@ pub struct Config {
     /// Dump socket info to serial console every 5 seconds
     #[serde(default)]
     pub dump_socket_info: bool,
+    /// Rotary encoder pin A (CLK) - set to 0 to disable encoder
+    #[serde(default)]
+    pub encoder_pin_a: u8,
+    /// Rotary encoder pin B (DT) - set to 0 to disable encoder
+    #[serde(default)]
+    pub encoder_pin_b: u8,
 }
 
 const fn default_led_gpio() -> u8 {
@@ -333,6 +339,8 @@ impl Default for Config {
             brightness: default_brightness(),
             dump_cpu_metrics: false,
             dump_socket_info: false,
+            encoder_pin_a: 0, // Disabled by default
+            encoder_pin_b: 0,
         }
     }
 }
