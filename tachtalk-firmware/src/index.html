@@ -505,6 +505,11 @@
             opacity: 0.7;
             cursor: not-allowed;
         }
+        input:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+            background-color: #222;
+        }
     </style>
 </head>
 <body>
@@ -907,19 +912,24 @@
                         '<label>Blink ms:</label>' +
                         '<input type="number" min="50" step="50" value="' + (threshold.blink_ms || 500) + '" onchange="updateThreshold(' + index + ', \'blink_ms\', parseInt(this.value))">' +
                     '</div>' : '<div class="form-group"></div>';
+                const hasRpmUpper = threshold.rpm_upper !== null && threshold.rpm_upper !== undefined;
+                const rpmUpperValue = hasRpmUpper ? threshold.rpm_upper : (threshold.rpm_lower + 1000);
+                const rpmUpperHtml = 
+                    '<div class="form-group">' +
+                        '<label>RPM Upper:</label>' +
+                        '<input type="number" value="' + rpmUpperValue + '" ' + (hasRpmUpper ? '' : 'disabled') + ' onchange="updateThreshold(' + index + ', \'rpm_upper\', parseInt(this.value))">' +
+                        '<input type="checkbox" ' + (hasRpmUpper ? 'checked' : '') + ' onchange="this.previousElementSibling.disabled = !this.checked; updateThreshold(' + index + ', \'rpm_upper\', this.checked ? parseInt(this.previousElementSibling.value) : null)">' +
+                    '</div>';
                 div.innerHTML = 
                     '<div class="threshold-header">' +
                         '<input type="text" class="threshold-title" value="' + (threshold.name || 'Threshold ' + (index + 1)) + '" onchange="updateThreshold(' + index + ', \'name\', this.value)">' +
                     '</div>' +
                     '<div class="threshold-grid">' +
                         '<div class="form-group">' +
-                            '<label>RPM:</label>' +
-                            '<input type="number" value="' + threshold.rpm + '" onchange="updateThreshold(' + index + ', \'rpm\', parseInt(this.value))">' +
+                            '<label>RPM Lower:</label>' +
+                            '<input type="number" value="' + threshold.rpm_lower + '" onchange="updateThreshold(' + index + ', \'rpm_lower\', parseInt(this.value))">' +
                         '</div>' +
-                        '<div class="form-group">' +
-                            '<label>Color:</label>' +
-                            '<input type="color" value="' + rgbToHex(threshold.color) + '" onchange="updateThreshold(' + index + ', \'color\', hexToRgb(this.value))">' +
-                        '</div>' +
+                        rpmUpperHtml +
                         '<div class="form-group">' +
                             '<label>From LED:</label>' +
                             '<input type="number" min="0" value="' + threshold.start_led + '" onchange="updateThreshold(' + index + ', \'start_led\', parseInt(this.value))">' +
@@ -927,6 +937,10 @@
                         '<div class="form-group">' +
                             '<label>To LED:</label>' +
                             '<input type="number" min="0" value="' + threshold.end_led + '" onchange="updateThreshold(' + index + ', \'end_led\', parseInt(this.value))">' +
+                        '</div>' +
+                        '<div class="form-group">' +
+                            '<label>Color:</label>' +
+                            '<input type="color" value="' + rgbToHex(threshold.color) + '" onchange="updateThreshold(' + index + ', \'color\', hexToRgb(this.value))">' +
                         '</div>' +
                         '<div class="form-group">' +
                             '<label>Blink:</label>' +
@@ -950,7 +964,8 @@
         function addThreshold() {
             config.thresholds.push({
                 name: 'New Threshold',
-                rpm: 5000,
+                rpm_lower: 5000,
+                rpm_upper: null,
                 start_led: 0,
                 end_led: 7,
                 color: { r: 255, g: 0, b: 0 },

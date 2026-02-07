@@ -8,10 +8,18 @@ pub use rgb::RGB8;
 use serde::{Deserialize, Serialize};
 
 /// Threshold configuration for shift lights
+///
+/// When only `rpm_lower` is set, all LEDs in the range light up when RPM exceeds it.
+/// When `rpm_upper` is also set, LEDs light up proportionally within the RPM range.
+/// `start_led` can be greater than `end_led` for mirror effect (LEDs light from outside in).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ThresholdConfig {
     pub name: String,
-    pub rpm: u32,
+    /// Lower RPM threshold (inclusive)
+    pub rpm_lower: u32,
+    /// Optional upper RPM threshold for proportional LED lighting
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rpm_upper: Option<u32>,
     pub start_led: usize,
     pub end_led: usize,
     pub color: RGB8,
@@ -45,9 +53,17 @@ fn is_blink_on(timestamp_ms: u64, blink_ms: u32) -> bool {
 
 /// Compute LED colors based on RPM and threshold configuration
 ///
-/// All matching thresholds (where `rpm >= threshold.rpm`) are applied cumulatively
+/// All matching thresholds (where `rpm >= threshold.rpm_lower`) are applied cumulatively
 /// in order. This allows different LED ranges to have different colors at the same
 /// RPM. Later thresholds override earlier ones for overlapping LED ranges.
+///
+/// When a threshold has `rpm_upper` set, LEDs light up proportionally:
+/// - At `rpm_lower`: first LED lights up
+/// - At `rpm_upper`: all LEDs light up
+/// - Values in between light up a proportional number of LEDs
+///
+/// `start_led` can be greater than `end_led` for mirror effect (e.g., LEDs 7->4 lights
+/// from outside in on a strip).
 ///
 /// Blinking thresholds independently compute their on/off state based on the
 /// provided timestamp, allowing multiple blinking thresholds with different
@@ -71,7 +87,7 @@ pub fn compute_led_state(
     let mut leds = vec![RGB8::default(); total_leds];
 
     // Find all matching thresholds (evaluated in order)
-    let matching: Vec<_> = thresholds.iter().filter(|t| rpm >= t.rpm).collect();
+    let matching: Vec<_> = thresholds.iter().filter(|t| rpm >= t.rpm_lower).collect();
 
     let mut has_blinking = false;
 
@@ -86,17 +102,61 @@ pub fn compute_led_state(
         }
 
         let color = threshold.color;
-        let start = threshold.start_led.min(total_leds);
-        let end = (threshold.end_led + 1).min(total_leds); // end_led is inclusive
+        let leds_to_light = compute_leds_to_light(rpm, threshold, total_leds);
 
-        for led in &mut leds[start..end] {
-            *led = color;
+        for &led_idx in &leds_to_light {
+            if led_idx < total_leds {
+                leds[led_idx] = color;
+            }
         }
     }
 
     LedState {
         leds,
         has_blinking,
+    }
+}
+
+/// Compute which LED indices should be lit for a threshold
+///
+/// Handles both forward ranges (start < end) and reverse ranges (start > end)
+/// for mirror effects. When `rpm_upper` is set, computes proportional lighting.
+fn compute_leds_to_light(rpm: u32, threshold: &ThresholdConfig, total_leds: usize) -> Vec<usize> {
+    let start = threshold.start_led.min(total_leds.saturating_sub(1));
+    let end = threshold.end_led.min(total_leds.saturating_sub(1));
+
+    // Calculate number of LEDs in the range (inclusive)
+    let led_count = if start <= end {
+        end - start + 1
+    } else {
+        start - end + 1
+    };
+
+    // Determine how many LEDs to light based on RPM
+    let active_count = match threshold.rpm_upper {
+        None => led_count, // No upper bound: all LEDs on when threshold met
+        Some(upper) if upper <= threshold.rpm_lower => led_count, // Invalid range: all on
+        Some(upper) => {
+            // Proportional: divide RPM range into led_count equal buckets
+            // Each bucket adds one more LED
+            let rpm_range = upper - threshold.rpm_lower;
+            let rpm_progress = rpm.saturating_sub(threshold.rpm_lower).min(rpm_range);
+            // Formula: 1 + (rpm_progress * led_count) / rpm_range, capped at led_count
+            let progress_scaled = u64::from(rpm_progress) * led_count as u64;
+            // Safe truncation: result is bounded by led_count which fits in usize
+            #[allow(clippy::cast_possible_truncation)]
+            let count = 1 + (progress_scaled / u64::from(rpm_range)) as usize;
+            count.min(led_count)
+        }
+    };
+
+    // Generate LED indices based on direction
+    if start <= end {
+        // Forward: light from start toward end
+        (start..start + active_count).collect()
+    } else {
+        // Reverse: light from start toward end (going down)
+        (end + led_count - active_count..=start).rev().collect()
     }
 }
 
@@ -145,7 +205,8 @@ mod tests {
         vec![
             ThresholdConfig {
                 name: "Green".to_string(),
-                rpm: 3000,
+                rpm_lower: 3000,
+                rpm_upper: None,
                 start_led: 0,
                 end_led: 2,
                 color: RGB8::new(0, 255, 0),
@@ -154,7 +215,8 @@ mod tests {
             },
             ThresholdConfig {
                 name: "Yellow".to_string(),
-                rpm: 5000,
+                rpm_lower: 5000,
+                rpm_upper: None,
                 start_led: 0,
                 end_led: 4,
                 color: RGB8::new(255, 255, 0),
@@ -163,7 +225,8 @@ mod tests {
             },
             ThresholdConfig {
                 name: "Red".to_string(),
-                rpm: 6500,
+                rpm_lower: 6500,
+                rpm_upper: None,
                 start_led: 0,
                 end_led: 7,
                 color: RGB8::new(255, 0, 0),
@@ -172,7 +235,8 @@ mod tests {
             },
             ThresholdConfig {
                 name: "Blink".to_string(),
-                rpm: 7000,
+                rpm_lower: 7000,
+                rpm_upper: None,
                 start_led: 0,
                 end_led: 7,
                 color: RGB8::new(255, 0, 0),
@@ -248,7 +312,8 @@ mod tests {
     fn test_blink_timing() {
         let thresholds = vec![ThresholdConfig {
             name: "Blink".to_string(),
-            rpm: 1000,
+            rpm_lower: 1000,
+            rpm_upper: None,
             start_led: 0,
             end_led: 0,
             color: RGB8::new(255, 0, 0),
@@ -281,7 +346,8 @@ mod tests {
     fn test_led_bounds_clamping() {
         let thresholds = vec![ThresholdConfig {
             name: "OutOfBounds".to_string(),
-            rpm: 1000,
+            rpm_lower: 1000,
+            rpm_upper: None,
             start_led: 5,
             end_led: 100, // Way beyond total LEDs
             color: RGB8::new(255, 0, 0),
@@ -303,7 +369,8 @@ mod tests {
         let thresholds = vec![
             ThresholdConfig {
                 name: "Off".to_string(),
-                rpm: 0,
+                rpm_lower: 0,
+                rpm_upper: None,
                 start_led: 0,
                 end_led: 11,
                 color: RGB8::new(0, 0, 0),
@@ -312,7 +379,8 @@ mod tests {
             },
             ThresholdConfig {
                 name: "Blue".to_string(),
-                rpm: 1000,
+                rpm_lower: 1000,
+                rpm_upper: None,
                 start_led: 0,
                 end_led: 2,
                 color: RGB8::new(0, 0, 255),
@@ -321,7 +389,8 @@ mod tests {
             },
             ThresholdConfig {
                 name: "Green".to_string(),
-                rpm: 1500,
+                rpm_lower: 1500,
+                rpm_upper: None,
                 start_led: 3,
                 end_led: 5,
                 color: RGB8::new(0, 255, 0),
@@ -330,7 +399,8 @@ mod tests {
             },
             ThresholdConfig {
                 name: "Yellow".to_string(),
-                rpm: 2000,
+                rpm_lower: 2000,
+                rpm_upper: None,
                 start_led: 6,
                 end_led: 8,
                 color: RGB8::new(255, 255, 0),
@@ -339,7 +409,8 @@ mod tests {
             },
             ThresholdConfig {
                 name: "Red".to_string(),
-                rpm: 2500,
+                rpm_lower: 2500,
+                rpm_upper: None,
                 start_led: 9,
                 end_led: 11,
                 color: RGB8::new(255, 0, 0),
@@ -387,7 +458,8 @@ mod tests {
         let thresholds = vec![
             ThresholdConfig {
                 name: "Off".to_string(),
-                rpm: 0,
+                rpm_lower: 0,
+                rpm_upper: None,
                 start_led: 0,
                 end_led: 2,
                 color: RGB8::new(0, 0, 0),
@@ -396,7 +468,8 @@ mod tests {
             },
             ThresholdConfig {
                 name: "Blue 1".to_string(),
-                rpm: 1000,
+                rpm_lower: 1000,
+                rpm_upper: None,
                 start_led: 0,
                 end_led: 0,
                 color: RGB8::new(0, 0, 255),
@@ -405,7 +478,8 @@ mod tests {
             },
             ThresholdConfig {
                 name: "Blue 2".to_string(),
-                rpm: 1167,
+                rpm_lower: 1167,
+                rpm_upper: None,
                 start_led: 1,
                 end_led: 1,
                 color: RGB8::new(0, 0, 255),
@@ -414,7 +488,8 @@ mod tests {
             },
             ThresholdConfig {
                 name: "Blue 3".to_string(),
-                rpm: 1333,
+                rpm_lower: 1333,
+                rpm_upper: None,
                 start_led: 2,
                 end_led: 2,
                 color: RGB8::new(0, 0, 255),
@@ -448,7 +523,8 @@ mod tests {
         let thresholds = vec![
             ThresholdConfig {
                 name: "Blue".to_string(),
-                rpm: 1000,
+                rpm_lower: 1000,
+                rpm_upper: None,
                 start_led: 0,
                 end_led: 2,
                 color: RGB8::new(0, 0, 255),
@@ -457,7 +533,8 @@ mod tests {
             },
             ThresholdConfig {
                 name: "Green".to_string(),
-                rpm: 1500,
+                rpm_lower: 1500,
+                rpm_upper: None,
                 start_led: 3,
                 end_led: 5,
                 color: RGB8::new(0, 255, 0),
@@ -466,7 +543,8 @@ mod tests {
             },
             ThresholdConfig {
                 name: "Shift".to_string(),
-                rpm: 2000,
+                rpm_lower: 2000,
+                rpm_upper: None,
                 start_led: 0,
                 end_led: 5,
                 color: RGB8::new(255, 0, 0),
@@ -498,7 +576,8 @@ mod tests {
         let thresholds = vec![
             ThresholdConfig {
                 name: "Blue".to_string(),
-                rpm: 1000,
+                rpm_lower: 1000,
+                rpm_upper: None,
                 start_led: 0,
                 end_led: 2,
                 color: RGB8::new(0, 0, 255),
@@ -507,7 +586,8 @@ mod tests {
             },
             ThresholdConfig {
                 name: "Green".to_string(),
-                rpm: 1500,
+                rpm_lower: 1500,
+                rpm_upper: None,
                 start_led: 3,
                 end_led: 5,
                 color: RGB8::new(0, 255, 0),
@@ -516,7 +596,8 @@ mod tests {
             },
             ThresholdConfig {
                 name: "Black".to_string(),
-                rpm: 2000,
+                rpm_lower: 2000,
+                rpm_upper: None,
                 start_led: 0,
                 end_led: 5,
                 color: RGB8::new(0, 0, 0), // All off
@@ -525,7 +606,8 @@ mod tests {
             },
             ThresholdConfig {
                 name: "Shift".to_string(),
-                rpm: 2000,
+                rpm_lower: 2000,
+                rpm_upper: None,
                 start_led: 0,
                 end_led: 5,
                 color: RGB8::new(255, 0, 0),
@@ -555,7 +637,8 @@ mod tests {
         let thresholds = vec![
             ThresholdConfig {
                 name: "Slow Blink".to_string(),
-                rpm: 1000,
+                rpm_lower: 1000,
+                rpm_upper: None,
                 start_led: 0,
                 end_led: 2,
                 color: RGB8::new(0, 0, 255),
@@ -564,7 +647,8 @@ mod tests {
             },
             ThresholdConfig {
                 name: "Fast Blink".to_string(),
-                rpm: 1000,
+                rpm_lower: 1000,
+                rpm_upper: None,
                 start_led: 3,
                 end_led: 5,
                 color: RGB8::new(255, 0, 0),
@@ -592,5 +676,160 @@ mod tests {
         let state = compute_led_state(1500, &thresholds, 6, 300);
         assert_eq!(state.leds[0], RGB8::default()); // slow blink off
         assert_eq!(state.leds[3], RGB8::default()); // fast blink off
+    }
+
+    /// Test proportional LED lighting with `rpm_upper`
+    #[test]
+    fn test_proportional_leds_forward() {
+        // 4 LEDs (0-3) with RPM range 1000-2000
+        let thresholds = vec![ThresholdConfig {
+            name: "Progressive".to_string(),
+            rpm_lower: 1000,
+            rpm_upper: Some(2000),
+            start_led: 0,
+            end_led: 3,
+            color: RGB8::new(0, 255, 0),
+            blink: false,
+            blink_ms: 500,
+        }];
+
+        // At 1000 RPM: 1 LED (LED 0) - bucket 0-249
+        let state = compute_led_state(1000, &thresholds, 4, 0);
+        assert_eq!(state.leds[0], RGB8::new(0, 255, 0));
+        assert_eq!(state.leds[1], RGB8::default());
+        assert_eq!(state.leds[2], RGB8::default());
+        assert_eq!(state.leds[3], RGB8::default());
+
+        // At 1249 RPM: still 1 LED - progress=249, bucket 0-249
+        let state = compute_led_state(1249, &thresholds, 4, 0);
+        assert_eq!(state.leds[0], RGB8::new(0, 255, 0));
+        assert_eq!(state.leds[1], RGB8::default());
+
+        // At 1250 RPM: 2 LEDs (0-1) - progress=250, bucket 250-499
+        let state = compute_led_state(1250, &thresholds, 4, 0);
+        assert_eq!(state.leds[0], RGB8::new(0, 255, 0));
+        assert_eq!(state.leds[1], RGB8::new(0, 255, 0));
+        assert_eq!(state.leds[2], RGB8::default());
+        assert_eq!(state.leds[3], RGB8::default());
+
+        // At 1500 RPM: 3 LEDs (0-2) - progress=500, bucket 500-749
+        let state = compute_led_state(1500, &thresholds, 4, 0);
+        assert_eq!(state.leds[0], RGB8::new(0, 255, 0));
+        assert_eq!(state.leds[1], RGB8::new(0, 255, 0));
+        assert_eq!(state.leds[2], RGB8::new(0, 255, 0));
+        assert_eq!(state.leds[3], RGB8::default());
+
+        // At 1750 RPM: 4 LEDs - progress=750, bucket 750-1000
+        let state = compute_led_state(1750, &thresholds, 4, 0);
+        assert_eq!(state.leds[0], RGB8::new(0, 255, 0));
+        assert_eq!(state.leds[1], RGB8::new(0, 255, 0));
+        assert_eq!(state.leds[2], RGB8::new(0, 255, 0));
+        assert_eq!(state.leds[3], RGB8::new(0, 255, 0));
+
+        // At 2000 RPM: all 4 LEDs
+        let state = compute_led_state(2000, &thresholds, 4, 0);
+        assert_eq!(state.leds[0], RGB8::new(0, 255, 0));
+        assert_eq!(state.leds[1], RGB8::new(0, 255, 0));
+        assert_eq!(state.leds[2], RGB8::new(0, 255, 0));
+        assert_eq!(state.leds[3], RGB8::new(0, 255, 0));
+
+        // Above 2000 RPM: still all 4 LEDs (capped)
+        let state = compute_led_state(3000, &thresholds, 4, 0);
+        assert_eq!(state.leds[0], RGB8::new(0, 255, 0));
+        assert_eq!(state.leds[3], RGB8::new(0, 255, 0));
+    }
+
+    /// Test proportional LED lighting with reversed range (mirror effect)
+    #[test]
+    fn test_proportional_leds_reverse() {
+        // LEDs 3->0 (reversed) with RPM range 1000-2000
+        let thresholds = vec![ThresholdConfig {
+            name: "Mirror".to_string(),
+            rpm_lower: 1000,
+            rpm_upper: Some(2000),
+            start_led: 3,
+            end_led: 0,
+            color: RGB8::new(255, 0, 0),
+            blink: false,
+            blink_ms: 500,
+        }];
+
+        // At 1000 RPM: 1 LED (LED 3 - starts from the "outside")
+        let state = compute_led_state(1000, &thresholds, 4, 0);
+        assert_eq!(state.leds[0], RGB8::default());
+        assert_eq!(state.leds[1], RGB8::default());
+        assert_eq!(state.leds[2], RGB8::default());
+        assert_eq!(state.leds[3], RGB8::new(255, 0, 0));
+
+        // At 1250 RPM: 2 LEDs (3, 2)
+        let state = compute_led_state(1250, &thresholds, 4, 0);
+        assert_eq!(state.leds[0], RGB8::default());
+        assert_eq!(state.leds[1], RGB8::default());
+        assert_eq!(state.leds[2], RGB8::new(255, 0, 0));
+        assert_eq!(state.leds[3], RGB8::new(255, 0, 0));
+
+        // At 1500 RPM: 3 LEDs (3, 2, 1)
+        let state = compute_led_state(1500, &thresholds, 4, 0);
+        assert_eq!(state.leds[0], RGB8::default());
+        assert_eq!(state.leds[1], RGB8::new(255, 0, 0));
+        assert_eq!(state.leds[2], RGB8::new(255, 0, 0));
+        assert_eq!(state.leds[3], RGB8::new(255, 0, 0));
+
+        // At 2000 RPM: all 4 LEDs
+        let state = compute_led_state(2000, &thresholds, 4, 0);
+        assert_eq!(state.leds[0], RGB8::new(255, 0, 0));
+        assert_eq!(state.leds[1], RGB8::new(255, 0, 0));
+        assert_eq!(state.leds[2], RGB8::new(255, 0, 0));
+        assert_eq!(state.leds[3], RGB8::new(255, 0, 0));
+    }
+
+    /// Test mirror effect for symmetric shift light (both sides light toward center)
+    #[test]
+    fn test_symmetric_mirror_shift_light() {
+        // 8 LEDs: left side (0-3) lights right, right side (7-4) lights left
+        let thresholds = vec![
+            ThresholdConfig {
+                name: "Left".to_string(),
+                rpm_lower: 1000,
+                rpm_upper: Some(2000),
+                start_led: 0,
+                end_led: 3,
+                color: RGB8::new(0, 255, 0),
+                blink: false,
+                blink_ms: 500,
+            },
+            ThresholdConfig {
+                name: "Right".to_string(),
+                rpm_lower: 1000,
+                rpm_upper: Some(2000),
+                start_led: 7,
+                end_led: 4,
+                color: RGB8::new(0, 255, 0),
+                blink: false,
+                blink_ms: 500,
+            },
+        ];
+
+        // At 1000 RPM: outer LEDs only (0 and 7)
+        let state = compute_led_state(1000, &thresholds, 8, 0);
+        assert_eq!(state.leds[0], RGB8::new(0, 255, 0));
+        assert_eq!(state.leds[1], RGB8::default());
+        assert_eq!(state.leds[6], RGB8::default());
+        assert_eq!(state.leds[7], RGB8::new(0, 255, 0));
+
+        // At 1250 RPM: 2 on each side (0,1 and 6,7)
+        let state = compute_led_state(1250, &thresholds, 8, 0);
+        assert_eq!(state.leds[0], RGB8::new(0, 255, 0));
+        assert_eq!(state.leds[1], RGB8::new(0, 255, 0));
+        assert_eq!(state.leds[2], RGB8::default());
+        assert_eq!(state.leds[5], RGB8::default());
+        assert_eq!(state.leds[6], RGB8::new(0, 255, 0));
+        assert_eq!(state.leds[7], RGB8::new(0, 255, 0));
+
+        // At 2000 RPM: all LEDs on
+        let state = compute_led_state(2000, &thresholds, 8, 0);
+        for i in 0..8 {
+            assert_eq!(state.leds[i], RGB8::new(0, 255, 0), "LED {i} should be on");
+        }
     }
 }

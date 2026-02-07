@@ -271,7 +271,8 @@ impl Default for Config {
             thresholds: vec![
                 ThresholdConfig {
                     name: "Off".to_string(),
-                    rpm: 0,
+                    rpm_lower: 0,
+                    rpm_upper: None,
                     start_led: 0,
                     end_led: 0,
                     color: RGB8::new(0, 0, 0),
@@ -280,7 +281,8 @@ impl Default for Config {
                 },
                 ThresholdConfig {
                     name: "Blue".to_string(),
-                    rpm: 1000,
+                    rpm_lower: 1000,
+                    rpm_upper: None,
                     start_led: 0,
                     end_led: 0,
                     color: RGB8::new(0, 0, 255),
@@ -289,7 +291,8 @@ impl Default for Config {
                 },
                 ThresholdConfig {
                     name: "Green".to_string(),
-                    rpm: 1500,
+                    rpm_lower: 1500,
+                    rpm_upper: None,
                     start_led: 0,
                     end_led: 0,
                     color: RGB8::new(0, 255, 0),
@@ -298,7 +301,8 @@ impl Default for Config {
                 },
                 ThresholdConfig {
                     name: "Yellow".to_string(),
-                    rpm: 2000,
+                    rpm_lower: 2000,
+                    rpm_upper: None,
                     start_led: 0,
                     end_led: 0,
                     color: RGB8::new(255, 255, 0),
@@ -307,7 +311,8 @@ impl Default for Config {
                 },
                 ThresholdConfig {
                     name: "Red".to_string(),
-                    rpm: 2500,
+                    rpm_lower: 2500,
+                    rpm_upper: None,
                     start_led: 0,
                     end_led: 0,
                     color: RGB8::new(255, 0, 0),
@@ -316,7 +321,8 @@ impl Default for Config {
                 },
                 ThresholdConfig {
                     name: "Off".to_string(),
-                    rpm: 3000,
+                    rpm_lower: 3000,
+                    rpm_upper: None,
                     start_led: 0,
                     end_led: 0,
                     color: RGB8::new(0, 0, 0),
@@ -325,7 +331,8 @@ impl Default for Config {
                 },
                 ThresholdConfig {
                     name: "Shift".to_string(),
-                    rpm: 3000,
+                    rpm_lower: 3000,
+                    rpm_upper: None,
                     start_led: 0,
                     end_led: 0,
                     color: RGB8::new(0, 0, 255),
