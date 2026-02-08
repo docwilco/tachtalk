@@ -1478,6 +1478,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "tachtalk-capture-decode"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "tachtalk-capture-format",
+]
+
+[[package]]
+name = "tachtalk-capture-format"
+version = "0.1.0"
+
+[[package]]
 name = "tachtalk-elm327-lib"
 version = "0.1.0"
 
@@ -1518,6 +1530,25 @@ dependencies = [
  "rgb",
  "serde",
  "smallvec",
+]
+
+[[package]]
+name = "tachtalk-test-firmware"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "embedded-svc",
+ "embuild",
+ "esp-idf-hal",
+ "esp-idf-svc",
+ "esp-idf-sys",
+ "log",
+ "oneshot",
+ "serde",
+ "serde_json",
+ "smallvec",
+ "tachtalk-capture-format",
+ "tachtalk-elm327-lib",
 ]
 
 [[package]]

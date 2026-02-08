@@ -1,8 +1,0 @@
-{
-  "servers": {
-    "pdf-reader": {
-      "command": "uvx",
-      "args": ["--from", "git+https://github.com/gstiebler/pdf-mcp-server.git", "pdf-mcp-server"]
-    }
-  }
-}

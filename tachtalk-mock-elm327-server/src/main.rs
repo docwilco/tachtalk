@@ -235,6 +235,13 @@ fn process_command(cmd: &str, start_time: &Instant, state: &mut ClientState) -> 
         c if c.starts_with("01") && c.len() >= 4 => {
             let pid_data = &c[2..]; // Everything after "01"
 
+            // Check if response count is specified (e.g., "0C 1" has a space)
+            // If no count specified, simulate adaptive timing wait
+            let has_response_count = pid_data.contains(' ');
+            if !has_response_count {
+                std::thread::sleep(Duration::from_millis(200));
+            }
+
             // Strip optional response count (e.g., "0C 1" -> "0C")
             // The number after space tells ELM327 how many responses to wait for
             let pid_data = pid_data.split_whitespace().next().unwrap_or(pid_data);

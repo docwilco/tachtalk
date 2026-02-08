@@ -1,0 +1,726 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>TachTalk Test Firmware</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <script>const SSE_PORT = {{SSE_PORT}};</script>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 20px;
+            background-color: #1a1a1a;
+            color: #ffffff;
+        }
+        .container {
+            max-width: 800px;
+            margin: 0 auto;
+        }
+        h1 {
+            color: #00ff00;
+        }
+        h2 {
+            color: #88ff88;
+            margin-top: 30px;
+        }
+        .section {
+            background-color: #2a2a2a;
+            padding: 15px;
+            margin: 15px 0;
+            border-radius: 5px;
+            border-left: 4px solid #00ff00;
+        }
+        .test-controls {
+            background-color: #2a3a2a;
+            border-left-color: #00ff00;
+        }
+        .wifi-section {
+            background-color: #2a2a3a;
+            border-left-color: #0088ff;
+        }
+        .metrics-section {
+            background-color: #3a2a2a;
+            border-left-color: #ff8800;
+        }
+        .form-group {
+            margin: 10px 0;
+        }
+        label {
+            display: inline-block;
+            width: 150px;
+            font-weight: bold;
+        }
+        input[type="text"], input[type="password"], input[type="number"], select {
+            padding: 8px;
+            border: 1px solid #444;
+            background-color: #333;
+            color: #fff;
+            border-radius: 3px;
+            width: 200px;
+        }
+        select {
+            width: 218px;
+        }
+        button {
+            background-color: #00ff00;
+            color: #000;
+            padding: 10px 20px;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+            font-weight: bold;
+            margin: 5px;
+        }
+        button:hover {
+            background-color: #00dd00;
+        }
+        button:disabled {
+            background-color: #555;
+            color: #888;
+            cursor: not-allowed;
+        }
+        button.danger {
+            background-color: #ff4444;
+            color: #fff;
+        }
+        button.danger:hover {
+            background-color: #dd2222;
+        }
+        .metric {
+            display: inline-block;
+            margin: 10px 20px 10px 0;
+            padding: 10px 15px;
+            background-color: #333;
+            border-radius: 5px;
+            min-width: 120px;
+            text-align: center;
+        }
+        .metric-value {
+            font-size: 24px;
+            font-weight: bold;
+            color: #00ff00;
+        }
+        .metric-label {
+            font-size: 12px;
+            color: #888;
+            margin-top: 5px;
+        }
+        .status-indicator {
+            display: inline-block;
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            margin-right: 8px;
+        }
+        .status-connected {
+            background-color: #00ff00;
+        }
+        .status-disconnected {
+            background-color: #ff4444;
+        }
+        .status-running {
+            background-color: #ffaa00;
+            animation: pulse 1s infinite;
+        }
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+        }
+        #status {
+            padding: 10px;
+            margin: 10px 0;
+            border-radius: 5px;
+            display: none;
+        }
+        .success {
+            background-color: #2d5016;
+            border: 1px solid #00ff00;
+        }
+        .error {
+            background-color: #5a1a1a;
+            border: 1px solid #ff0000;
+        }
+        .pid-list {
+            margin: 5px 0;
+        }
+        .pid-list input {
+            width: 100%;
+            font-family: monospace;
+        }
+        .help-text {
+            font-size: 12px;
+            color: #888;
+            margin-top: 3px;
+        }
+        .mode-description {
+            margin: 10px 0;
+            padding: 10px;
+            background-color: #333;
+            border-radius: 5px;
+            font-size: 14px;
+        }
+        .capture-section {
+            display: none;
+        }
+        .capture-section.visible {
+            display: block;
+        }
+        .progress-bar {
+            width: 100%;
+            height: 20px;
+            background-color: #333;
+            border-radius: 3px;
+            overflow: hidden;
+        }
+        .progress-fill {
+            height: 100%;
+            background-color: #00ff00;
+            transition: width 0.3s;
+        }
+        .progress-fill.warning {
+            background-color: #ffaa00;
+        }
+        .progress-fill.danger {
+            background-color: #ff4444;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>TachTalk Test Firmware</h1>
+        <div id="status"></div>
+
+        <!-- Test Controls -->
+        <div class="section test-controls">
+            <h2 style="margin-top: 0;">Test Controls</h2>
+            
+            <div class="form-group">
+                <label>Query Mode:</label>
+                <select id="queryMode">
+                    <option value="0">1. NoCount (baseline)</option>
+                    <option value="1">2. AlwaysOne (append " 1")</option>
+                    <option value="2">3. AdaptiveCount (detect count)</option>
+                    <option value="3">4. Pipelined (multi-request)</option>
+                    <option value="4">5. RawCapture (TCP proxy)</option>
+                </select>
+            </div>
+            
+            <div id="modeDescription" class="mode-description"></div>
+            
+            <div style="margin: 15px 0;">
+                <button id="startBtn" onclick="startTest()">Start Test</button>
+                <button id="stopBtn" onclick="stopTest()" disabled>Stop Test</button>
+            </div>
+            
+            <div style="margin-top: 10px;">
+                <span id="testStatus">
+                    <span class="status-indicator status-disconnected"></span>
+                    Stopped
+                </span>
+            </div>
+        </div>
+
+        <!-- Live Metrics -->
+        <div class="section metrics-section">
+            <h2 style="margin-top: 0;">Live Metrics</h2>
+            <div>
+                <div class="metric">
+                    <div class="metric-value" id="reqsPerSec">0</div>
+                    <div class="metric-label">Requests/sec</div>
+                </div>
+                <div class="metric">
+                    <div class="metric-value" id="totalReqs">0</div>
+                    <div class="metric-label">Total Requests</div>
+                </div>
+                <div class="metric">
+                    <div class="metric-value" id="totalErrors">0</div>
+                    <div class="metric-label">Errors</div>
+                </div>
+            </div>
+            <div style="margin-top: 15px;">
+                <span id="dongleStatus">
+                    <span class="status-indicator status-disconnected"></span>
+                    Dongle: Disconnected
+                </span>
+            </div>
+            
+            <!-- Capture-specific metrics (Mode 5) -->
+            <div id="captureMetrics" class="capture-section">
+                <h3>Capture Status</h3>
+                <div style="margin: 10px 0;">
+                    <span id="clientStatus">
+                        <span class="status-indicator status-disconnected"></span>
+                        Client: Disconnected
+                    </span>
+                </div>
+                <div class="form-group">
+                    <label>Buffer Usage:</label>
+                    <div class="progress-bar">
+                        <div id="bufferProgress" class="progress-fill" style="width: 0%"></div>
+                    </div>
+                </div>
+                <div>
+                    <span id="bytesCapture">0</span> bytes / 
+                    <span id="recordsCapture">0</span> records
+                </div>
+                <div id="overflowWarning" style="color: #ff4444; display: none;">
+                    ⚠️ Buffer overflow - capture stopped
+                </div>
+                <div style="margin-top: 10px;">
+                    <button id="downloadCaptureBtn" onclick="downloadCapture()" disabled>Download Capture</button>
+                    <button id="clearCaptureBtn" onclick="clearCapture()" class="danger" disabled>Clear Buffer</button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Test Configuration -->
+        <div class="section">
+            <h2 style="margin-top: 0;">Test Configuration</h2>
+            
+            <div class="form-group">
+                <label>Dongle IP:</label>
+                <input type="text" id="dongleIp" value="192.168.0.10">
+            </div>
+            <div class="form-group">
+                <label>Dongle Port:</label>
+                <input type="number" id="donglePort" value="35000" min="1" max="65535">
+            </div>
+            <div class="form-group">
+                <label>OBD2 Timeout (ms):</label>
+                <input type="number" id="obd2Timeout" value="1000" min="100" max="10000">
+            </div>
+            
+            <h3>PIDs to Poll</h3>
+            <div class="form-group pid-list">
+                <label>Fast PIDs:</label>
+                <input type="text" id="fastPids" value="010C,0149">
+                <div class="help-text">Comma-separated, polled at 6:1 ratio vs slow PIDs</div>
+            </div>
+            <div class="form-group pid-list">
+                <label>Slow PIDs:</label>
+                <input type="text" id="slowPids" value="0105">
+                <div class="help-text">Comma-separated, polled less frequently</div>
+            </div>
+            
+            <!-- Mode 4 specific -->
+            <div id="pipelineConfig" class="capture-section">
+                <h3>Pipeline Settings</h3>
+                <div class="form-group">
+                    <label>Pipeline Bytes:</label>
+                    <input type="number" id="pipelineBytes" value="32" min="8" max="256">
+                    <div class="help-text">Max bytes on wire before waiting for responses</div>
+                </div>
+            </div>
+            
+            <!-- Mode 5 specific -->
+            <div id="captureConfig" class="capture-section">
+                <h3>Capture Settings</h3>
+                <div class="form-group">
+                    <label>Listen Port:</label>
+                    <input type="number" id="listenPort" value="35000" min="1" max="65535">
+                </div>
+                <div class="form-group">
+                    <label>Buffer Size (MB):</label>
+                    <input type="number" id="captureBuffer" value="4" min="1" max="6">
+                </div>
+                <div class="form-group">
+                    <label>On Overflow:</label>
+                    <select id="captureOverflow">
+                        <option value="0">Stop capture</option>
+                        <option value="1">Wrap (lose oldest)</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label>Response Count:</label>
+                    <select id="responseCountMethod">
+                        <option value="0">Count "41" headers</option>
+                        <option value="1">Count lines</option>
+                    </select>
+                </div>
+            </div>
+            
+            <button onclick="saveConfig()">Save Configuration</button>
+        </div>
+
+        <!-- WiFi Configuration -->
+        <div class="section wifi-section">
+            <h2 style="margin-top: 0;">WiFi Configuration</h2>
+            
+            <h3>Station (Connect to OBD2 Dongle)</h3>
+            <div class="form-group">
+                <label>SSID:</label>
+                <input type="text" id="wifiSsid">
+                <button onclick="scanWifi()" style="padding: 5px 10px; margin-left: 5px;">Scan</button>
+            </div>
+            <div id="wifiList" style="display: none; margin: 10px 0 10px 155px;"></div>
+            <div class="form-group">
+                <label>Password:</label>
+                <input type="password" id="wifiPassword">
+            </div>
+            <div class="form-group">
+                <label>Use DHCP:</label>
+                <input type="checkbox" id="useDhcp" checked>
+            </div>
+            <div id="staticIpConfig" style="display: none;">
+                <div class="form-group">
+                    <label>Static IP:</label>
+                    <input type="text" id="staticIp" value="192.168.0.100">
+                </div>
+                <div class="form-group">
+                    <label>Prefix Length:</label>
+                    <input type="number" id="prefixLen" value="24" min="1" max="32">
+                </div>
+            </div>
+            
+            <h3>Access Point</h3>
+            <div class="form-group">
+                <label>AP SSID:</label>
+                <input type="text" id="apSsid" value="TachTalk-Test">
+            </div>
+            <div class="form-group">
+                <label>AP Password:</label>
+                <input type="password" id="apPassword" placeholder="Leave empty for open">
+            </div>
+            
+            <button onclick="saveConfig()">Save WiFi Settings</button>
+        </div>
+
+        <!-- System -->
+        <div class="section">
+            <h2 style="margin-top: 0;">System</h2>
+            <div class="form-group">
+                <label>Log Level:</label>
+                <select id="logLevel">
+                    <option value="Error">Error</option>
+                    <option value="Warn">Warn</option>
+                    <option value="Info">Info</option>
+                    <option value="Debug">Debug</option>
+                </select>
+            </div>
+            <button onclick="rebootDevice()" class="danger">Reboot Device</button>
+        </div>
+    </div>
+
+    <script>
+        let config = {};
+        let eventSource = null;
+        const modeDescriptions = {
+            0: "Send PIDs as-is without response count. Baseline for comparison - dongle uses adaptive timing (~200ms wait).",
+            1: "Append ' 1' to all requests to tell dongle to return after 1 ECU response. Should be faster than NoCount.",
+            2: "First request detects how many responses the ECU sends, then uses that count for subsequent requests.",
+            3: "Send multiple requests before waiting for responses. Configurable bytes on wire.",
+            4: "Pure TCP proxy mode. Records all traffic to PSRAM buffer for later download and analysis."
+        };
+
+        async function loadConfig() {
+            try {
+                const response = await fetch('/api/config');
+                config = await response.json();
+                populateForm();
+            } catch (e) {
+                showStatus('Failed to load config: ' + e, 'error');
+            }
+        }
+
+        function populateForm() {
+            // Test config
+            document.getElementById('queryMode').value = config.test?.query_mode || 0;
+            document.getElementById('dongleIp').value = config.test?.dongle_ip || '192.168.0.10';
+            document.getElementById('donglePort').value = config.test?.dongle_port || 35000;
+            document.getElementById('obd2Timeout').value = config.test?.obd2_timeout_ms || 1000;
+            document.getElementById('fastPids').value = config.test?.fast_pids || '010C,0149';
+            document.getElementById('slowPids').value = config.test?.slow_pids || '0105';
+            document.getElementById('pipelineBytes').value = config.test?.pipeline_bytes || 32;
+            document.getElementById('listenPort').value = config.test?.listen_port || 35000;
+            document.getElementById('captureBuffer').value = (config.test?.capture_buffer_size || 4194304) / 1048576;
+            document.getElementById('captureOverflow').value = config.test?.capture_overflow || 0;
+            document.getElementById('responseCountMethod').value = config.test?.response_count_method || 0;
+            
+            // WiFi config
+            document.getElementById('wifiSsid').value = config.wifi?.ssid || '';
+            document.getElementById('wifiPassword').value = config.wifi?.password || '';
+            document.getElementById('useDhcp').checked = config.ip?.use_dhcp !== false;
+            document.getElementById('staticIp').value = config.ip?.ip || '192.168.0.100';
+            document.getElementById('prefixLen').value = config.ip?.prefix_len || 24;
+            document.getElementById('apSsid').value = config.ap_ssid || 'TachTalk-Test';
+            document.getElementById('apPassword').value = config.ap_password || '';
+            document.getElementById('logLevel').value = config.log_level || 'Info';
+            
+            updateModeUI();
+            updateDhcpUI();
+        }
+
+        function updateModeUI() {
+            const mode = parseInt(document.getElementById('queryMode').value);
+            document.getElementById('modeDescription').textContent = modeDescriptions[mode];
+            
+            // Show/hide mode-specific config
+            document.getElementById('pipelineConfig').classList.toggle('visible', mode === 3);
+            document.getElementById('captureConfig').classList.toggle('visible', mode === 4);
+            document.getElementById('captureMetrics').classList.toggle('visible', mode === 4);
+        }
+
+        function updateDhcpUI() {
+            document.getElementById('staticIpConfig').style.display = 
+                document.getElementById('useDhcp').checked ? 'none' : 'block';
+        }
+
+        async function saveConfig() {
+            const newConfig = {
+                ...config,
+                test: {
+                    query_mode: parseInt(document.getElementById('queryMode').value),
+                    dongle_ip: document.getElementById('dongleIp').value,
+                    dongle_port: parseInt(document.getElementById('donglePort').value),
+                    obd2_timeout_ms: parseInt(document.getElementById('obd2Timeout').value),
+                    fast_pids: document.getElementById('fastPids').value,
+                    slow_pids: document.getElementById('slowPids').value,
+                    pipeline_bytes: parseInt(document.getElementById('pipelineBytes').value),
+                    listen_port: parseInt(document.getElementById('listenPort').value),
+                    capture_buffer_size: parseInt(document.getElementById('captureBuffer').value) * 1048576,
+                    capture_overflow: parseInt(document.getElementById('captureOverflow').value),
+                    response_count_method: parseInt(document.getElementById('responseCountMethod').value)
+                },
+                wifi: {
+                    ssid: document.getElementById('wifiSsid').value,
+                    password: document.getElementById('wifiPassword').value || null
+                },
+                ip: {
+                    use_dhcp: document.getElementById('useDhcp').checked,
+                    ip: document.getElementById('staticIp').value,
+                    prefix_len: parseInt(document.getElementById('prefixLen').value)
+                },
+                ap_ssid: document.getElementById('apSsid').value,
+                ap_password: document.getElementById('apPassword').value || null,
+                log_level: document.getElementById('logLevel').value
+            };
+
+            try {
+                const checkResponse = await fetch('/api/config/check', {
+                    method: 'POST',
+                    body: JSON.stringify(newConfig)
+                });
+                const checkResult = await checkResponse.json();
+                
+                if (checkResult.restart) {
+                    if (!confirm('This change requires a device restart. Continue?')) {
+                        return;
+                    }
+                }
+
+                const response = await fetch('/api/config', {
+                    method: 'POST',
+                    body: JSON.stringify(newConfig)
+                });
+                
+                if (response.ok) {
+                    const result = await response.json().catch(() => ({}));
+                    if (result.restart) {
+                        showStatus('Config saved. Device restarting...', 'success');
+                    } else {
+                        showStatus('Config saved!', 'success');
+                        config = newConfig;
+                    }
+                } else {
+                    showStatus('Failed to save config', 'error');
+                }
+            } catch (e) {
+                showStatus('Error: ' + e, 'error');
+            }
+        }
+
+        async function startTest() {
+            try {
+                await fetch('/api/test/start', { method: 'POST' });
+                document.getElementById('startBtn').disabled = true;
+                document.getElementById('stopBtn').disabled = false;
+            } catch (e) {
+                showStatus('Failed to start test: ' + e, 'error');
+            }
+        }
+
+        async function stopTest() {
+            try {
+                await fetch('/api/test/stop', { method: 'POST' });
+                document.getElementById('startBtn').disabled = false;
+                document.getElementById('stopBtn').disabled = true;
+            } catch (e) {
+                showStatus('Failed to stop test: ' + e, 'error');
+            }
+        }
+
+        async function scanWifi() {
+            const listDiv = document.getElementById('wifiList');
+            listDiv.style.display = 'block';
+            listDiv.innerHTML = 'Scanning...';
+            
+            try {
+                const response = await fetch('/api/wifi/scan');
+                const networks = await response.json();
+                
+                if (networks.length === 0) {
+                    listDiv.innerHTML = 'No networks found';
+                    return;
+                }
+                
+                listDiv.innerHTML = networks.map(n => 
+                    `<div style="cursor: pointer; padding: 5px; margin: 2px 0; background: #333; border-radius: 3px;" 
+                         onclick="selectWifi('${n.ssid}')">${n.ssid} (${n.rssi} dBm)</div>`
+                ).join('');
+            } catch (e) {
+                listDiv.innerHTML = 'Scan failed: ' + e;
+            }
+        }
+
+        function selectWifi(ssid) {
+            document.getElementById('wifiSsid').value = ssid;
+            document.getElementById('wifiList').style.display = 'none';
+        }
+
+        async function rebootDevice() {
+            if (!confirm('Are you sure you want to reboot?')) return;
+            
+            try {
+                await fetch('/api/reboot', { method: 'POST' });
+                showStatus('Device rebooting...', 'success');
+            } catch (e) {
+                showStatus('Reboot command sent', 'success');
+            }
+        }
+
+        async function downloadCapture() {
+            try {
+                const response = await fetch('/api/capture');
+                if (response.status === 204) {
+                    showStatus('No capture data to download', 'error');
+                    return;
+                }
+                if (response.status === 409) {
+                    showStatus('Stop the test before downloading', 'error');
+                    return;
+                }
+                if (!response.ok) {
+                    showStatus('Download failed: ' + response.statusText, 'error');
+                    return;
+                }
+                const blob = await response.blob();
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = 'capture_' + new Date().toISOString().replace(/[:.]/g, '-') + '.ttcap';
+                a.click();
+                URL.revokeObjectURL(url);
+                showStatus('Capture downloaded (' + blob.size + ' bytes)', 'success');
+            } catch (e) {
+                showStatus('Download error: ' + e, 'error');
+            }
+        }
+
+        async function clearCapture() {
+            if (!confirm('Clear the capture buffer? This cannot be undone.')) return;
+            
+            try {
+                const response = await fetch('/api/capture/clear', { method: 'POST' });
+                if (response.status === 409) {
+                    showStatus('Stop the test before clearing', 'error');
+                    return;
+                }
+                if (response.ok) {
+                    showStatus('Capture buffer cleared', 'success');
+                } else {
+                    showStatus('Clear failed: ' + response.statusText, 'error');
+                }
+            } catch (e) {
+                showStatus('Clear error: ' + e, 'error');
+            }
+        }
+
+        function showStatus(message, type) {
+            const status = document.getElementById('status');
+            status.textContent = message;
+            status.className = type;
+            status.style.display = 'block';
+            setTimeout(() => { status.style.display = 'none'; }, 5000);
+        }
+
+        function updateMetrics(data) {
+            document.getElementById('reqsPerSec').textContent = data.requests_per_sec || 0;
+            document.getElementById('totalReqs').textContent = data.total_requests || 0;
+            document.getElementById('totalErrors').textContent = data.total_errors || 0;
+            
+            // Update dongle status
+            const dongleIndicator = document.querySelector('#dongleStatus .status-indicator');
+            dongleIndicator.className = 'status-indicator ' + (data.dongle_connected ? 'status-connected' : 'status-disconnected');
+            document.getElementById('dongleStatus').innerHTML = 
+                `<span class="status-indicator ${data.dongle_connected ? 'status-connected' : 'status-disconnected'}"></span>` +
+                `Dongle: ${data.dongle_connected ? 'Connected' : 'Disconnected'}`;
+            
+            // Update test status
+            const testRunning = data.test_running;
+            document.getElementById('startBtn').disabled = testRunning;
+            document.getElementById('stopBtn').disabled = !testRunning;
+            document.getElementById('testStatus').innerHTML = 
+                `<span class="status-indicator ${testRunning ? 'status-running' : 'status-disconnected'}"></span>` +
+                `${testRunning ? 'Running' : 'Stopped'}`;
+            
+            // Update capture metrics (Mode 5)
+            if (parseInt(document.getElementById('queryMode').value) === 4) {
+                document.getElementById('clientStatus').innerHTML = 
+                    `<span class="status-indicator ${data.client_connected ? 'status-connected' : 'status-disconnected'}"></span>` +
+                    `Client: ${data.client_connected ? 'Connected' : 'Disconnected'}`;
+                
+                const bufferPct = data.buffer_usage_pct || 0;
+                const progressBar = document.getElementById('bufferProgress');
+                progressBar.style.width = bufferPct + '%';
+                progressBar.className = 'progress-fill' + 
+                    (bufferPct > 90 ? ' danger' : bufferPct > 70 ? ' warning' : '');
+                
+                document.getElementById('bytesCapture').textContent = data.bytes_captured || 0;
+                document.getElementById('recordsCapture').textContent = data.records_captured || 0;
+                document.getElementById('overflowWarning').style.display = data.capture_overflow ? 'block' : 'none';
+
+                // Enable download/clear only when test is stopped and buffer has data
+                const hasData = (data.bytes_captured || 0) > 0;
+                document.getElementById('downloadCaptureBtn').disabled = testRunning || !hasData;
+                document.getElementById('clearCaptureBtn').disabled = testRunning || !hasData;
+            } else {
+                document.getElementById('downloadCaptureBtn').disabled = true;
+                document.getElementById('clearCaptureBtn').disabled = true;
+            }
+        }
+
+        function connectSSE() {
+            if (eventSource) {
+                eventSource.close();
+            }
+            
+            const port = typeof SSE_PORT !== 'undefined' ? SSE_PORT : 81;
+            const sseUrl = `http://${window.location.hostname}:${port}/events`;
+            
+            eventSource = new EventSource(sseUrl);
+            
+            eventSource.addEventListener('metrics', (e) => {
+                try {
+                    const data = JSON.parse(e.data);
+                    updateMetrics(data);
+                } catch (err) {
+                    console.error('Failed to parse metrics:', err);
+                }
+            });
+            
+            eventSource.onerror = () => {
+                console.log('SSE connection lost, reconnecting...');
+                setTimeout(connectSSE, 2000);
+            };
+        }
+
+        // Event listeners
+        document.getElementById('queryMode').addEventListener('change', updateModeUI);
+        document.getElementById('useDhcp').addEventListener('change', updateDhcpUI);
+
+        // Initialize
+        loadConfig();
+        connectSSE();
+    </script>
+</body>
+</html>

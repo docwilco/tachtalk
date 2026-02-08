@@ -10,7 +10,7 @@ To run pedantic clippy on all crates:
 
 ```bash
 # Non-firmware crates (from workspace root)
-cargo clippy --all-targets --all-features --workspace --exclude tachtalk-firmware -- -W clippy::pedantic
+cargo clippy --all-targets --all-features --workspace --exclude tachtalk-firmware --exclude tachtalk-test-firmware -- -W clippy::pedantic
 
 # Firmware crate (from tachtalk-firmware directory)
 cd tachtalk-firmware && cargo clippy --all-targets --all-features -- -W clippy::pedantic

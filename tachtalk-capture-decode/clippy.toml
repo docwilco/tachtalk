@@ -1,0 +1,2 @@
+allowed-idents-below-min-chars = ["f"]
+doc-valid-idents = ["TachTalk"]

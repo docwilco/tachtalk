@@ -1,0 +1,7 @@
+[package]
+name = "tachtalk-capture-format"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Binary capture file format for TachTalk OBD2 traffic recording"

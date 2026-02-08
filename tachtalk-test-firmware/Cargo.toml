@@ -1,0 +1,31 @@
+[package]
+name = "tachtalk-test-firmware"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "tachtalk-test"
+path = "src/main.rs"
+
+[dependencies]
+tachtalk-capture-format = { workspace = true }
+tachtalk-elm327-lib = { path = "../tachtalk-elm327-lib" }
+anyhow.workspace = true
+embedded-svc.workspace = true
+esp-idf-hal.workspace = true
+esp-idf-svc.workspace = true
+esp-idf-sys.workspace = true
+log.workspace = true
+oneshot.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+smallvec.workspace = true
+
+[build-dependencies]
+embuild.workspace = true
+
+# Add mDNS component from ESP-IDF component registry
+[[package.metadata.esp-idf-sys.extra_components]]
+remote_component = { name = "espressif/mdns", version = "1.8" }
