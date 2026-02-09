@@ -238,8 +238,15 @@ fn process_command(cmd: &str, start_time: &Instant, state: &mut ClientState) -> 
             // Check if response count is specified (e.g., "0C 1" has a space)
             // If no count specified, simulate adaptive timing wait
             let has_response_count = pid_data.contains(' ');
+            println!(
+                "  [debug] cmd={:?} effective={:?} pid_data={:?} pid_data_bytes={:?} has_count={}",
+                cmd, c, pid_data, pid_data.as_bytes(), has_response_count
+            );
             if !has_response_count {
+                println!("  [debug] No response count -> sleeping 200ms");
                 std::thread::sleep(Duration::from_millis(200));
+            } else {
+                println!("  [debug] Response count present -> no delay");
             }
 
             // Strip optional response count (e.g., "0C 1" -> "0C")
