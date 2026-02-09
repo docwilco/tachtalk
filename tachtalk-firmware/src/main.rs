@@ -104,8 +104,8 @@ pub struct State {
     /// PID polling metrics
     pub polling_metrics: PollingMetrics,
     /// Cached responses for supported PIDs queries (0100, 0120, ..., 01E0)
-    /// Indexed by (PID byte / 0x20), e.g., 0x00→0, 0x20→1, 0x40→2, etc.
-    pub supported_pids: Mutex<[Option<obd2::Obd2Buffer>; 8]>,
+    /// plus a `ready` flag indicating whether capability queries have completed.
+    pub supported_pids: Mutex<obd2::SupportedPidsCache>,
     /// Whether the ECU supports multi-PID queries (e.g., `010C0D` for RPM + vehicle speed)
     pub supports_multi_pid: AtomicBool,
 }
@@ -355,7 +355,7 @@ fn spawn_background_tasks(
         obd2_client_count: AtomicU32::new(0),
         client_tcp_info: Mutex::new(Vec::new()),
         polling_metrics: PollingMetrics::default(),
-        supported_pids: Mutex::new([None, None, None, None, None, None, None, None]),
+        supported_pids: Mutex::new(obd2::SupportedPidsCache::default()),
         supports_multi_pid: AtomicBool::new(false),
     });
 

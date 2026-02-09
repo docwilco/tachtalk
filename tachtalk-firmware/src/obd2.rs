@@ -37,6 +37,16 @@ pub type Obd2Buffer = SmallVec<[u8; 12]>;
 /// Cached OBD2 response: one entry per ECU response. Most PIDs get exactly 1.
 pub type CachedResponse = SmallVec<[Obd2Buffer; 1]>;
 
+/// Cached supported-PID query responses plus a readiness flag.
+///
+/// The `ready` flag is `false` while connecting or after a disconnect, and
+/// `true` once all 8 supported-PID queries have been attempted.
+#[derive(Default)]
+pub struct SupportedPidsCache {
+    pub entries: [Option<Obd2Buffer>; 8],
+    pub ready: bool,
+}
+
 /// Supported PID query commands (0100, 0120, 0140, 0160, 0180, 01A0, 01C0, 01E0)
 const SUPPORTED_PID_QUERIES: [&[u8]; 8] = [
     b"0100", b"0120", b"0140", b"0160", b"0180", b"01A0", b"01C0", b"01E0",
@@ -707,6 +717,7 @@ fn try_reconnect(
         } else {
             state.dongle_connected.store(false, Ordering::Relaxed);
             *state.dongle_tcp_info.lock().unwrap() = None;
+            *state.supported_pids.lock().unwrap() = Default::default();
         }
     }
 }
@@ -724,6 +735,9 @@ fn handle_connection_error(
         *connection = None;
         state.dongle_connected.store(false, Ordering::Relaxed);
         *state.dongle_tcp_info.lock().unwrap() = None;
+        // Clear stale capability data so a reconnect to a different vehicle
+        // doesn't serve outdated supported-PID responses.
+        *state.supported_pids.lock().unwrap() = Default::default();
     }
 }
 
@@ -1103,7 +1117,7 @@ fn test_multi_pid_support(
     info!("Testing multi-PID query support...");
     watchdog.feed();
 
-    let supported_0100 = if let Some(response) = &state.supported_pids.lock().unwrap()[0] {
+    let supported_0100 = if let Some(response) = &state.supported_pids.lock().unwrap().entries[0] {
         response.clone()
     } else {
         info!("No 0100 response available, skipping multi-PID test");
@@ -1214,8 +1228,9 @@ fn try_connect(
 
     info!("Connected to OBD2 dongle, querying supported PIDs...");
 
-    // Query supported PIDs and store in state
+    // Clear stale data and mark not-ready before re-querying
     let mut supported_pids_guard = state.supported_pids.lock().unwrap();
+    *supported_pids_guard = Default::default();
     for (idx, query) in SUPPORTED_PID_QUERIES.iter().enumerate() {
         watchdog.feed();
         match execute_command(&mut stream, query, timeout) {
@@ -1225,17 +1240,19 @@ fn try_connect(
                     String::from_utf8_lossy(query),
                     String::from_utf8_lossy(&response)
                 );
-                supported_pids_guard[idx] = Some(response);
+                supported_pids_guard.entries[idx] = Some(response);
             }
             Err(e) => {
                 debug!(
                     "Supported PIDs query {:?} failed: {e}",
                     String::from_utf8_lossy(query)
                 );
-                supported_pids_guard[idx] = None;
+                supported_pids_guard.entries[idx] = None;
             }
         }
     }
+    // All 8 queries attempted — mark capabilities as ready
+    supported_pids_guard.ready = true;
     drop(supported_pids_guard);
 
     // Test multi-PID query support
@@ -1496,6 +1513,16 @@ impl Obd2Proxy {
             return Ok(());
         }
 
+        // If capability queries haven't completed yet, reject OBD2 commands.
+        // Clients will see "UNABLE TO CONNECT" and should retry, which is the
+        // same response they'd get from a real ELM327 before protocol detection.
+        if !state.supported_pids.lock().unwrap().ready {
+            let le = client_state.line_ending();
+            let error_response = format!("{le}UNABLE TO CONNECT{le}>");
+            writer.write_all(error_response.as_bytes())?;
+            return Ok(());
+        }
+
         // Handle "1" repeat command
         let (effective_command, effective_raw): (String, Obd2Buffer) = if command == "1" {
             if let Some(last) = &client_state.last_obd_command {
@@ -1522,7 +1549,7 @@ impl Obd2Proxy {
         // Check if this is a supported PIDs query - return from State cache
         if let Some(idx) = supported_pids_index(&cache_key) {
             let supported_pids_guard = state.supported_pids.lock().unwrap();
-            if let Some(ref cached_response) = supported_pids_guard[idx] {
+            if let Some(ref cached_response) = supported_pids_guard.entries[idx] {
                 client_state.last_obd_command = Some(effective_command);
                 let formatted = client_state.format_response(cached_response);
                 drop(supported_pids_guard);
