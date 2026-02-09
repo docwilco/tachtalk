@@ -559,10 +559,12 @@ impl PollingState {
             let result = dongle_state.execute_with_repeat(&pid, timeout);
             handle_connection_error(&result, connection, state);
 
-            let _ = state.cache_manager_tx.send(CacheManagerMessage::DongleResponse {
-                pid: pid.clone(),
-                response: result.map(|raw| parse_response_lines(&raw)),
-            });
+            let _ = state
+                .cache_manager_tx
+                .send(CacheManagerMessage::DongleResponse {
+                    pid: pid.clone(),
+                    response: result.map(|raw| parse_response_lines(&raw)),
+                });
 
             requests += 1;
             self.fast_requests_since_slow += 1;
@@ -572,7 +574,10 @@ impl PollingState {
                 .fetch_add(1, Ordering::Relaxed);
         } else {
             // RPM is always in fast queue, so we should always poll something
-            debug_assert!(false, "Expected to poll at least RPM, but fast_pids is empty");
+            debug_assert!(
+                false,
+                "Expected to poll at least RPM, but fast_pids is empty"
+            );
         }
 
         // Poll slow PID based on mode (interval or ratio)
@@ -588,10 +593,12 @@ impl PollingState {
                     let result = dongle_state.execute_with_repeat(&pid, timeout);
                     handle_connection_error(&result, connection, state);
 
-                    let _ = state.cache_manager_tx.send(CacheManagerMessage::DongleResponse {
-                        pid: pid.clone(),
-                        response: result.map(|raw| parse_response_lines(&raw)),
-                    });
+                    let _ = state
+                        .cache_manager_tx
+                        .send(CacheManagerMessage::DongleResponse {
+                            pid: pid.clone(),
+                            response: result.map(|raw| parse_response_lines(&raw)),
+                        });
 
                     requests += 1;
                     state
@@ -609,10 +616,7 @@ impl PollingState {
 }
 
 /// Run the dongle task - owns the connection and polls PIDs
-pub fn dongle_task(
-    state: &Arc<State>,
-    control_rx: &DongleReceiver,
-) {
+pub fn dongle_task(state: &Arc<State>, control_rx: &DongleReceiver) {
     info!("OBD2 dongle task starting...");
 
     let mut connection: Option<DongleState> = None;
@@ -667,11 +671,7 @@ pub fn dongle_task(
 
         // Poll PIDs if connected
         if connection.is_some() {
-            requests_this_second += polling.poll_pids(
-                &mut connection,
-                state,
-                timeout,
-            );
+            requests_this_second += polling.poll_pids(&mut connection, state, timeout);
         } else {
             // Not connected, sleep before retry
             std::thread::sleep(Duration::from_millis(100));
@@ -717,7 +717,7 @@ fn try_reconnect(
         } else {
             state.dongle_connected.store(false, Ordering::Relaxed);
             *state.dongle_tcp_info.lock().unwrap() = None;
-            *state.supported_pids.lock().unwrap() = Default::default();
+            *state.supported_pids.lock().unwrap() = SupportedPidsCache::default();
         }
     }
 }
@@ -737,7 +737,7 @@ fn handle_connection_error(
         *state.dongle_tcp_info.lock().unwrap() = None;
         // Clear stale capability data so a reconnect to a different vehicle
         // doesn't serve outdated supported-PID responses.
-        *state.supported_pids.lock().unwrap() = Default::default();
+        *state.supported_pids.lock().unwrap() = SupportedPidsCache::default();
     }
 }
 
@@ -810,7 +810,9 @@ fn run_maintenance(
             .demotions
             .fetch_add(1, Ordering::Relaxed);
         info!("PID {:?}: demoted to slow", String::from_utf8_lossy(&pid));
-        let _ = state.dongle_control_tx.send(DongleMessage::SetPidPriority(pid, false));
+        let _ = state
+            .dongle_control_tx
+            .send(DongleMessage::SetPidPriority(pid, false));
     }
 
     // Remove inactive PIDs
@@ -820,7 +822,10 @@ fn run_maintenance(
             .polling_metrics
             .removals
             .fetch_add(1, Ordering::Relaxed);
-        info!("PID {:?}: removed (inactive)", String::from_utf8_lossy(&pid));
+        info!(
+            "PID {:?}: removed (inactive)",
+            String::from_utf8_lossy(&pid)
+        );
         let _ = state.dongle_control_tx.send(DongleMessage::RemovePid(pid));
     }
 
@@ -929,10 +934,17 @@ fn handle_waiting_pid(
             .promotions
             .fetch_add(1, Ordering::Relaxed);
         log::info!("PID {:?}: promoted to fast", String::from_utf8_lossy(pid));
-        let _ = state.dongle_control_tx.send(DongleMessage::SetPidPriority(pid.clone(), true));
+        let _ = state
+            .dongle_control_tx
+            .send(DongleMessage::SetPidPriority(pid.clone(), true));
     } else if is_new {
-        log::info!("PID {:?}: added to fast queue", String::from_utf8_lossy(pid));
-        let _ = state.dongle_control_tx.send(DongleMessage::SetPidPriority(pid.clone(), true));
+        log::info!(
+            "PID {:?}: added to fast queue",
+            String::from_utf8_lossy(pid)
+        );
+        let _ = state
+            .dongle_control_tx
+            .send(DongleMessage::SetPidPriority(pid.clone(), true));
     }
 }
 
@@ -972,7 +984,9 @@ fn handle_consumed_pid(
                 wait_duration.unwrap().as_millis(),
                 promotion_threshold.as_millis()
             );
-            let _ = state.dongle_control_tx.send(DongleMessage::SetPidPriority(pid.clone(), true));
+            let _ = state
+                .dongle_control_tx
+                .send(DongleMessage::SetPidPriority(pid.clone(), true));
         }
     }
     if let Some(duration) = wait_duration {
@@ -984,10 +998,7 @@ fn handle_consumed_pid(
 }
 
 /// Run the cache manager task
-pub fn cache_manager_task(
-    state: &Arc<State>,
-    manager_rx: &Receiver<CacheManagerMessage>,
-) {
+pub fn cache_manager_task(state: &Arc<State>, manager_rx: &Receiver<CacheManagerMessage>) {
     info!("Cache manager task starting...");
 
     let watchdog = WatchdogHandle::register(c"cache_manager");
@@ -1028,8 +1039,7 @@ pub fn cache_manager_task(
                     // Extract RPM from the first ECU response line
                     if pid.as_slice() == RPM_PID {
                         if let Some(first) = data.first() {
-                            if let Some(rpm) =
-                                tachtalk_elm327_lib::extract_rpm_from_response(first)
+                            if let Some(rpm) = tachtalk_elm327_lib::extract_rpm_from_response(first)
                             {
                                 debug!("Cache manager extracted RPM: {rpm}");
                                 let _ = state.rpm_tx.send(RpmTaskMessage::Rpm(rpm));
@@ -1043,7 +1053,13 @@ pub fn cache_manager_task(
                 handle_waiting_pid(&pid, &mut pid_info, state);
             }
             Ok(CacheManagerMessage::Consumed { pid, wait_duration }) => {
-                handle_consumed_pid(&pid, wait_duration, &mut pid_info, state, &mut cache_metrics);
+                handle_consumed_pid(
+                    &pid,
+                    wait_duration,
+                    &mut pid_info,
+                    state,
+                    &mut cache_metrics,
+                );
             }
             Ok(CacheManagerMessage::RegisterClient(reply_tx)) => {
                 let id = next_client_id;
@@ -1068,7 +1084,12 @@ pub fn cache_manager_task(
 
         // Periodic maintenance: check promotion/demotion/removal
         if last_maintenance.elapsed() >= MAINTENANCE_INTERVAL {
-            run_maintenance(&mut pid_info, state, &mut cache_metrics, last_maintenance.elapsed());
+            run_maintenance(
+                &mut pid_info,
+                state,
+                &mut cache_metrics,
+                last_maintenance.elapsed(),
+            );
             last_maintenance = Instant::now();
         }
     }
@@ -1090,7 +1111,7 @@ fn is_valid_multi_pid_response(response_str: &str) -> bool {
     let has_rpm = response_str.contains("410C");
     let has_speed = if let Some(pos) = response_str.find("410C") {
         let after_rpm = &response_str[pos + 4..]; // skip "410C"
-        // RPM is 2 bytes = 4 hex chars, then look for 0D or 410D
+                                                  // RPM is 2 bytes = 4 hex chars, then look for 0D or 410D
         after_rpm.len() >= 4 && {
             let after_rpm_data = &after_rpm[4..]; // skip RPM data
             after_rpm_data.starts_with("410D") || after_rpm_data.starts_with("0D")
@@ -1230,7 +1251,7 @@ fn try_connect(
 
     // Clear stale data and mark not-ready before re-querying
     let mut supported_pids_guard = state.supported_pids.lock().unwrap();
-    *supported_pids_guard = Default::default();
+    *supported_pids_guard = SupportedPidsCache::default();
     for (idx, query) in SUPPORTED_PID_QUERIES.iter().enumerate() {
         watchdog.feed();
         match execute_command(&mut stream, query, timeout) {
@@ -1362,9 +1383,7 @@ impl Drop for ClientCountGuard<'_> {
 
 impl Obd2Proxy {
     pub fn new(state: Arc<State>) -> Self {
-        Self {
-            state,
-        }
+        Self { state }
     }
 
     pub fn run(self) -> Result<()> {
@@ -1403,17 +1422,15 @@ impl Obd2Proxy {
 
     // TcpStream is moved into this function for exclusive ownership of the connection
     #[allow(clippy::needless_pass_by_value)]
-    fn handle_client(
-        client_stream: TcpStream,
-        state: &Arc<State>,
-    ) -> Result<()> {
+    fn handle_client(client_stream: TcpStream, state: &Arc<State>) -> Result<()> {
         let peer = client_stream.peer_addr()?;
         let local = client_stream.local_addr()?;
         info!("OBD2 client connected: {peer}");
 
         // Register with cache manager
         let (reply_tx, reply_rx) = oneshot::channel();
-        state.cache_manager_tx
+        state
+            .cache_manager_tx
             .send(CacheManagerMessage::RegisterClient(reply_tx))
             .map_err(|_| anyhow::anyhow!("Cache manager channel closed"))?;
         let (client_id, client_cache) = reply_rx
@@ -1608,11 +1625,15 @@ impl Obd2Proxy {
             }
             Some(CacheEntry::Empty) | None => {
                 // Cache miss - signal that we need this PID (may promote to fast)
-                let _ = state.cache_manager_tx.send(CacheManagerMessage::Waiting(pid.clone()));
+                let _ = state
+                    .cache_manager_tx
+                    .send(CacheManagerMessage::Waiting(pid.clone()));
 
                 // Register waiter
                 let (tx, rx) = oneshot::channel();
-                cache_guard.entries.insert(pid.clone(), CacheEntry::Waiting(tx));
+                cache_guard
+                    .entries
+                    .insert(pid.clone(), CacheEntry::Waiting(tx));
                 let wait_start = Instant::now();
                 drop(cache_guard);
 
@@ -1630,7 +1651,9 @@ impl Obd2Proxy {
 
                 // Re-lock and take the value
                 let mut cache_guard = client_cache.lock().unwrap();
-                let Some(CacheEntry::Fresh(v)) = cache_guard.entries.insert(pid.clone(), CacheEntry::Empty) else {
+                let Some(CacheEntry::Fresh(v)) =
+                    cache_guard.entries.insert(pid.clone(), CacheEntry::Empty)
+                else {
                     // Not Fresh after notification - logic error or race
                     return Err(DongleError::NotConnected);
                 };

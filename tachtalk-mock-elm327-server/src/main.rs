@@ -94,7 +94,8 @@ fn handle_client(
                         }
 
                         // Rate limiting: wait if needed before responding
-                        if let (Some(interval), Some(last_time)) = (min_interval, last_response_time)
+                        if let (Some(interval), Some(last_time)) =
+                            (min_interval, last_response_time)
                         {
                             if let Some(remaining) = interval.checked_sub(last_time.elapsed()) {
                                 std::thread::sleep(remaining);
@@ -135,17 +136,17 @@ fn get_rpm_value(start_time: &Instant) -> u32 {
     const RAMP_TIME: f64 = 4.0;
     const HOLD_TIME: f64 = 3.0;
     const BLIP_TIME: f64 = 0.4; // Time for each half of a blip (up or down)
-    // Cycle: ramp up (4s) + hold max (3s) + ramp down (4s) + blip1 (0.8s) + blip2 (0.8s) + hold min (1.4s)
+                                // Cycle: ramp up (4s) + hold max (3s) + ramp down (4s) + blip1 (0.8s) + blip2 (0.8s) + hold min (1.4s)
     const CYCLE_TIME: f64 = 2.0 * RAMP_TIME + HOLD_TIME + 4.0 * BLIP_TIME + 1.4;
 
     let elapsed = start_time.elapsed().as_secs_f64();
     let phase = elapsed % CYCLE_TIME;
 
     let ramp_down_end = 2.0 * RAMP_TIME + HOLD_TIME; // 11s
-    let blip1_up_end = ramp_down_end + BLIP_TIME;     // 11.4s
-    let blip1_down_end = blip1_up_end + BLIP_TIME;    // 11.8s
-    let blip2_up_end = blip1_down_end + BLIP_TIME;    // 12.2s
-    let blip2_down_end = blip2_up_end + BLIP_TIME;    // 12.6s
+    let blip1_up_end = ramp_down_end + BLIP_TIME; // 11.4s
+    let blip1_down_end = blip1_up_end + BLIP_TIME; // 11.8s
+    let blip2_up_end = blip1_down_end + BLIP_TIME; // 12.2s
+    let blip2_down_end = blip2_up_end + BLIP_TIME; // 12.6s
 
     let rpm = if phase < RAMP_TIME {
         // Slow ramp up
@@ -198,7 +199,7 @@ fn get_pid_response(pid: &str, start_time: &Instant) -> Option<String> {
         "20" => Some("80000001".to_string()), // PIDs supported 21-40
         "40" => Some("FED08000".to_string()), // PIDs supported 41-60
         #[allow(clippy::match_same_arms)] // Different PIDs, same value is coincidental
-        "49" => Some("45".to_string()),       // Accelerator pedal position D: 27%
+        "49" => Some("45".to_string()), // Accelerator pedal position D: 27%
         _ => None,
     }
 }
@@ -297,7 +298,7 @@ fn process_command(cmd: &str, start_time: &Instant, state: &mut ClientState) -> 
             // Format the hex data with spaces if enabled
             let formatted_data = state.format_response(hex_data.as_bytes());
             let formatted_str = String::from_utf8_lossy(&formatted_data);
-            
+
             // Add header if enabled (7E8 is standard ECM response address)
             let response = if state.headers_enabled {
                 // With headers: "7E8 06 41 00 BE 3F A8 13" (header + length + data)
@@ -311,7 +312,7 @@ fn process_command(cmd: &str, start_time: &Instant, state: &mut ClientState) -> 
             } else {
                 formatted_str.to_string()
             };
-            
+
             format!("{response}{le}{le}>")
         }
         None => format!("?{le}{le}>"),

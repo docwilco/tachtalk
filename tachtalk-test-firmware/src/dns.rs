@@ -26,23 +26,26 @@ pub fn start_dns_server(ap_ip: Ipv4Addr) {
 
 fn run_dns_server() -> std::io::Result<()> {
     info!("DNS server starting on port {DNS_PORT}...");
-    
+
     let socket = UdpSocket::bind(("0.0.0.0", DNS_PORT))?;
     // Set timeout to ~3s so we feed watchdog well within 5s default timeout
     socket.set_read_timeout(Some(Duration::from_secs(3)))?;
-    
+
     let watchdog = WatchdogHandle::register(c"dns_server");
-    
+
     info!("DNS server started");
 
     let mut buf = [0u8; 512];
 
     loop {
         watchdog.feed();
-        
+
         let (len, src) = match socket.recv_from(&mut buf) {
             Ok(result) => result,
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::TimedOut => {
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
                 // Timeout - just continue to feed watchdog
                 continue;
             }
@@ -58,7 +61,7 @@ fn run_dns_server() -> std::io::Result<()> {
         }
 
         let query = &buf[..len];
-        
+
         // Log DNS query with parsed name
         let name = parse_dns_name(&query[12..]).unwrap_or_else(|| "<invalid>".to_string());
         info!("DNS: {name} from {}", src.ip());

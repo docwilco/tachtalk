@@ -94,7 +94,10 @@ fn run_sse_server(rx: &Receiver<SseMessage>, state: &Arc<State>) -> std::io::Res
             clients.retain(|client| send_to_client(client, b": heartbeat\n\n").is_ok());
             let removed = before - clients.len();
             if removed > 0 {
-                info!("SSE: Heartbeat removed {removed} dead clients, {} remaining", clients.len());
+                info!(
+                    "SSE: Heartbeat removed {removed} dead clients, {} remaining",
+                    clients.len()
+                );
             }
             last_heartbeat = Instant::now();
         }
@@ -112,7 +115,10 @@ fn run_sse_server(rx: &Receiver<SseMessage>, state: &Arc<State>) -> std::io::Res
             clients.retain(|client| send_to_client(client, msg.as_bytes()).is_ok());
             let removed = before - clients.len();
             if removed > 0 {
-                debug!("SSE: Removed {removed} dead clients during metrics broadcast, {} remaining", clients.len());
+                debug!(
+                    "SSE: Removed {removed} dead clients during metrics broadcast, {} remaining",
+                    clients.len()
+                );
             }
             last_metrics = Instant::now();
         }
@@ -127,7 +133,10 @@ fn run_sse_server(rx: &Receiver<SseMessage>, state: &Arc<State>) -> std::io::Res
                 clients.retain(|client| send_to_client(client, msg.as_bytes()).is_ok());
                 let removed = before - clients.len();
                 if removed > 0 {
-                    debug!("SSE: Removed {removed} dead clients during broadcast, {} remaining", clients.len());
+                    debug!(
+                        "SSE: Removed {removed} dead clients during broadcast, {} remaining",
+                        clients.len()
+                    );
                 }
             }
             Err(TryRecvError::Empty) => {
@@ -148,7 +157,9 @@ fn run_sse_server(rx: &Receiver<SseMessage>, state: &Arc<State>) -> std::io::Res
 fn handle_new_connection(mut stream: TcpStream) -> Option<TcpStream> {
     // Set timeout for reading the HTTP request
     stream.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
-    stream.set_write_timeout(Some(Duration::from_secs(5))).ok()?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(5)))
+        .ok()?;
 
     // Read the HTTP request (we don't really parse it, just consume it)
     let mut buf = [0u8; 1024];

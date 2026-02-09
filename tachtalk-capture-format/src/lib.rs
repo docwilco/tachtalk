@@ -25,7 +25,6 @@
 //! - `data_len`: u16 LE — length of the following data
 //! - `data`: `[u8; data_len]`
 
-
 /// Capture file magic bytes: `TachTalk` (8 bytes).
 pub const MAGIC: &[u8; 8] = b"TachTalk";
 
@@ -255,8 +254,6 @@ impl CaptureHeader {
         }))
     }
 }
-
-
 
 /// A parsed capture record.
 #[derive(Debug, Clone)]

@@ -85,7 +85,11 @@ impl ClientState {
     /// Mutates the state if the command changes settings
     pub fn handle_at_command(&mut self, command: &str) -> String {
         // ELM327 ignores spaces in AT commands
-        let cmd: String = command.to_uppercase().chars().filter(|c| *c != ' ').collect();
+        let cmd: String = command
+            .to_uppercase()
+            .chars()
+            .filter(|c| *c != ' ')
+            .collect();
         let le = self.line_ending();
 
         // Determine response content (without line endings)
@@ -207,7 +211,7 @@ mod tests {
     fn test_line_ending() {
         let mut state = ClientState::default();
         assert_eq!(state.line_ending(), "\r\n");
-        
+
         state.linefeeds_enabled = false;
         assert_eq!(state.line_ending(), "\r");
     }
@@ -215,17 +219,17 @@ mod tests {
     #[test]
     fn test_at_commands() {
         let mut state = ClientState::default();
-        
+
         // Test echo off
         let resp = state.handle_at_command("ATE0");
         assert!(resp.contains("OK"));
         assert!(!state.echo_enabled);
-        
+
         // Test spaces off
         let resp = state.handle_at_command("ATS0");
         assert!(resp.contains("OK"));
         assert!(!state.spaces_enabled);
-        
+
         // Test reset
         let resp = state.handle_at_command("ATZ");
         assert!(resp.contains("ELM327"));
@@ -238,11 +242,11 @@ mod tests {
         // Test with spaces
         let data = b"41 0C 1A F8\r\r>";
         assert_eq!(extract_rpm_from_response(data), Some(1726));
-        
+
         // Test without spaces
         let data = b"410C1AF8\r\r>";
         assert_eq!(extract_rpm_from_response(data), Some(1726));
-        
+
         // Test no RPM data
         let data = b"41 0D 28\r\r>";
         assert_eq!(extract_rpm_from_response(data), None);
@@ -258,7 +262,10 @@ mod tests {
 
     #[test]
     fn test_format_response_without_spaces() {
-        let state = ClientState { spaces_enabled: false, ..Default::default() };
+        let state = ClientState {
+            spaces_enabled: false,
+            ..Default::default()
+        };
         let input = b"410C1AF8\r\r>";
         let output = state.format_response(input);
         assert_eq!(&output, b"410C1AF8\r\r>");

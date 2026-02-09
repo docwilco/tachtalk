@@ -95,17 +95,8 @@ impl LedController {
         self.brightness = brightness;
     }
 
-    pub fn update(
-        &mut self,
-        rpm: u32,
-        baked: &BakedLedRules,
-        timestamp_ms: u64,
-    ) -> Result<()> {
-        let led_state = compute_led_state(
-            rpm,
-            baked,
-            timestamp_ms,
-        );
+    pub fn update(&mut self, rpm: u32, baked: &BakedLedRules, timestamp_ms: u64) -> Result<()> {
+        let led_state = compute_led_state(rpm, baked, timestamp_ms);
 
         self.write_leds(&led_state.leds)?;
         Ok(())
@@ -258,18 +249,21 @@ pub fn rpm_led_task(
         // Update LEDs only when needed (RPM changed or blinking)
         if should_render {
             let timestamp_ms = get_wallclock_ms();
-            
+
             // Determine which RPM to render: preview override or actual
             let render_rpm = if preview_override_until.is_some_and(|until| timestamp_ms < until) {
                 // Use preview_rpm from active profile during brightness adjustment
-                state.config.lock().ok().and_then(|cfg| {
-                    cfg.profiles.get(cfg.active_profile).map(|p| p.preview_rpm)
-                }).or(current_rpm)
+                state
+                    .config
+                    .lock()
+                    .ok()
+                    .and_then(|cfg| cfg.profiles.get(cfg.active_profile).map(|p| p.preview_rpm))
+                    .or(current_rpm)
             } else {
                 preview_override_until = None; // Clear expired override
                 current_rpm
             };
-            
+
             if let Some(rpm) = render_rpm {
                 // Only send SSE if actual RPM changed (not during preview override)
                 if preview_override_until.is_none() && last_rendered_rpm != current_rpm {

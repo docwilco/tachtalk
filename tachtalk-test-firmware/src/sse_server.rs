@@ -91,7 +91,10 @@ fn run_sse_server(rx: &Receiver<SseMessage>, state: &Arc<State>) -> std::io::Res
             clients.retain(|client| send_to_client(client, b": heartbeat\n\n").is_ok());
             let removed = before - clients.len();
             if removed > 0 {
-                info!("SSE: Heartbeat removed {removed} dead clients, {} remaining", clients.len());
+                info!(
+                    "SSE: Heartbeat removed {removed} dead clients, {} remaining",
+                    clients.len()
+                );
             }
             last_heartbeat = Instant::now();
         }
@@ -103,7 +106,10 @@ fn run_sse_server(rx: &Receiver<SseMessage>, state: &Arc<State>) -> std::io::Res
             clients.retain(|client| send_to_client(client, msg.as_bytes()).is_ok());
             let removed = before - clients.len();
             if removed > 0 {
-                debug!("SSE: Removed {removed} dead clients during metrics broadcast, {} remaining", clients.len());
+                debug!(
+                    "SSE: Removed {removed} dead clients during metrics broadcast, {} remaining",
+                    clients.len()
+                );
             }
             last_metrics = Instant::now();
         }
@@ -130,20 +136,20 @@ fn run_sse_server(rx: &Receiver<SseMessage>, state: &Arc<State>) -> std::io::Res
 /// Build metrics JSON message for SSE
 fn build_metrics_message(state: &State) -> String {
     let metrics = &state.metrics;
-    
+
     let test_running = metrics.test_running.load(Ordering::Relaxed);
     let requests_per_sec = metrics.requests_per_sec.load(Ordering::Relaxed);
     let total_requests = metrics.total_requests.load(Ordering::Relaxed);
     let total_errors = metrics.total_errors.load(Ordering::Relaxed);
     let dongle_connected = state.dongle_connected.load(Ordering::Relaxed);
-    
+
     // Mode 5 specific
     let bytes_captured = metrics.bytes_captured.load(Ordering::Relaxed);
     let records_captured = metrics.records_captured.load(Ordering::Relaxed);
     let buffer_usage_pct = metrics.buffer_usage_pct.load(Ordering::Relaxed);
     let client_connected = metrics.client_connected.load(Ordering::Relaxed);
     let capture_overflow = metrics.capture_overflow.load(Ordering::Relaxed);
-    
+
     format!(
         "event: metrics\ndata: {{\"test_running\":{test_running},\"requests_per_sec\":{requests_per_sec},\"total_requests\":{total_requests},\"total_errors\":{total_errors},\"dongle_connected\":{dongle_connected},\"bytes_captured\":{bytes_captured},\"records_captured\":{records_captured},\"buffer_usage_pct\":{buffer_usage_pct},\"client_connected\":{client_connected},\"capture_overflow\":{capture_overflow}}}\n\n"
     )
@@ -153,7 +159,9 @@ fn build_metrics_message(state: &State) -> String {
 fn handle_new_connection(mut stream: TcpStream) -> Option<TcpStream> {
     // Set timeout for reading the HTTP request
     stream.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
-    stream.set_write_timeout(Some(Duration::from_secs(5))).ok()?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(5)))
+        .ok()?;
 
     let mut buf = [0u8; 512];
     let mut total_read = 0;

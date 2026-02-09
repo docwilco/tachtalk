@@ -160,11 +160,7 @@ fn is_blink_on(timestamp_ms: u64, blink_ms: u32) -> bool {
 /// # Returns
 /// `LedState` containing the RGB values for each LED
 #[must_use]
-pub fn compute_led_state(
-    rpm: u32,
-    baked: &BakedLedRules,
-    timestamp_ms: u64,
-) -> LedState {
+pub fn compute_led_state(rpm: u32, baked: &BakedLedRules, timestamp_ms: u64) -> LedState {
     let mut leds = vec![RGB8::default(); baked.total_leds];
     let mut has_blinking = false;
 
@@ -193,10 +189,7 @@ pub fn compute_led_state(
         }
     }
 
-    LedState {
-        leds,
-        has_blinking,
-    }
+    LedState { leds, has_blinking }
 }
 
 /// Pre-compute the gradient color for every LED position in a range.
@@ -445,7 +438,7 @@ mod tests {
         let state = compute_led_state_simple(3500, &rules, 8, 0);
 
         assert!(!state.has_blinking);
-        
+
         // LEDs 0-2 should be green
         assert_eq!(state.leds[0], RGB8::new(0, 255, 0));
         assert_eq!(state.leds[1], RGB8::new(0, 255, 0));
@@ -473,7 +466,7 @@ mod tests {
         let state = compute_led_state_simple(7500, &rules, 8, 0);
 
         assert!(state.has_blinking);
-        
+
         // During blink ON, all LEDs should be red
         assert_eq!(state.leds[0], RGB8::new(255, 0, 0));
         assert_eq!(state.leds[7], RGB8::new(255, 0, 0));
@@ -486,7 +479,7 @@ mod tests {
         let state = compute_led_state_simple(7500, &rules, 8, 100);
 
         assert!(state.has_blinking);
-        
+
         // During blink OFF, should show Red rule underneath (LEDs 0-7)
         assert_eq!(state.leds[0], RGB8::new(255, 0, 0));
         assert_eq!(state.leds[7], RGB8::new(255, 0, 0));
@@ -1086,7 +1079,11 @@ mod tests {
             rpm_upper: None,
             start_led: 0,
             end_led: 4,
-            colors: smallvec::smallvec![RGB8::new(255, 0, 0), RGB8::new(0, 255, 0), RGB8::new(0, 0, 255)],
+            colors: smallvec::smallvec![
+                RGB8::new(255, 0, 0),
+                RGB8::new(0, 255, 0),
+                RGB8::new(0, 0, 255)
+            ],
             blink: false,
             blink_ms: 500,
         }];

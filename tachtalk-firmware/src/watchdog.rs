@@ -53,7 +53,10 @@ impl Drop for WatchdogHandle {
         debug!("Watchdog: unregistering user '{:?}'", self.name);
         let result = unsafe { esp_task_wdt_delete_user(self.handle) };
         if result != 0 {
-            error!("Watchdog: failed to unregister '{:?}': error code {result}", self.name);
+            error!(
+                "Watchdog: failed to unregister '{:?}': error code {result}",
+                self.name
+            );
         }
     }
 }

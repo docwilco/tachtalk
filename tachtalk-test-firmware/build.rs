@@ -23,6 +23,7 @@ fn main() {
     );
 
     let out_path = Path::new(&out_dir);
-    fs::write(out_path.join("index_start.html"), parts[0]).expect("Failed to write index_start.html");
+    fs::write(out_path.join("index_start.html"), parts[0])
+        .expect("Failed to write index_start.html");
     fs::write(out_path.join("index_end.html"), parts[1]).expect("Failed to write index_end.html");
 }

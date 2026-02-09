@@ -115,6 +115,14 @@ Access the configuration interface at `http://tachtalk.local` or the device IP. 
 - **[WEBUI_GUIDE.md](WEBUI_GUIDE.md)** - Configuration interface guide
 - **[ARCHITECTURE.md](ARCHITECTURE.md)** - System architecture and design
 
+## Development
+
+After cloning, install the git hooks (runs `cargo fmt` and pedantic clippy on commit):
+
+```bash
+./setup.sh
+```
+
 ## License
 
 See LICENSE file for details.

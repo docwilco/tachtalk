@@ -1,0 +1,77 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Colors for output (disabled if not a terminal)
+if [ -t 1 ]; then
+    RED='\033[0;31m'
+    GREEN='\033[0;32m'
+    BOLD='\033[1m'
+    RESET='\033[0m'
+else
+    RED='' GREEN='' BOLD='' RESET=''
+fi
+
+failed=0
+
+step() {
+    printf "${BOLD}== %s${RESET}\n" "$1"
+}
+
+fail() {
+    printf "${RED}FAILED:${RESET} %s\n" "$1" >&2
+    failed=1
+}
+
+ok() {
+    printf "${GREEN}OK${RESET}\n"
+}
+
+# Resolve workspace root (where this repo lives)
+root="$(git rev-parse --show-toplevel)"
+
+# ---------- cargo fmt (workspace + firmware crates) ----------
+# Auto-format, then re-stage any .rs files that were already staged.
+# This avoids accidentally staging unrelated work-in-progress changes.
+restage_formatted() {
+    # Get list of .rs files that are staged (added/modified)
+    local staged_rs
+    staged_rs=$(git diff --cached --name-only --diff-filter=ACM -- '*.rs')
+    if [ -n "$staged_rs" ]; then
+        echo "$staged_rs" | xargs git add
+    fi
+}
+
+step "cargo fmt --all"
+(cd "$root" && cargo fmt --all)
+
+restage_formatted
+
+# ---------- clippy: host crates ----------
+step "clippy (host crates)"
+if ! (cd "$root" && cargo clippy --all-targets --all-features \
+        --workspace --exclude tachtalk-firmware --exclude tachtalk-test-firmware \
+        -- -W clippy::pedantic -D warnings); then
+    fail "clippy (host crates)"
+fi
+
+# ---------- clippy: tachtalk-firmware ----------
+step "clippy (tachtalk-firmware)"
+if ! (cd "$root/tachtalk-firmware" && cargo clippy --all-targets --all-features \
+        -- -W clippy::pedantic -D warnings); then
+    fail "clippy (tachtalk-firmware)"
+fi
+
+# ---------- clippy: tachtalk-test-firmware ----------
+step "clippy (tachtalk-test-firmware)"
+if ! (cd "$root/tachtalk-test-firmware" && cargo clippy --all-targets --all-features \
+        -- -W clippy::pedantic -D warnings); then
+    fail "clippy (tachtalk-test-firmware)"
+fi
+
+# ---------- summary ----------
+if [ "$failed" -ne 0 ]; then
+    printf "\n${RED}${BOLD}Pre-commit checks failed.${RESET}\n" >&2
+    exit 1
+fi
+
+printf "\n${GREEN}${BOLD}All pre-commit checks passed.${RESET}\n"

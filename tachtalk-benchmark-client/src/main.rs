@@ -119,9 +119,18 @@ impl Stats {
                 / u32::try_from(self.requests).expect("request count exceeded u32::MAX");
 
             println!("Request rate:   {rate:.1} req/s");
-            println!("Min latency:    {:.3}ms", self.min_latency.as_secs_f64() * 1000.0);
-            println!("Max latency:    {:.3}ms", self.max_latency.as_secs_f64() * 1000.0);
-            println!("Avg latency:    {:.3}ms", avg_latency.as_secs_f64() * 1000.0);
+            println!(
+                "Min latency:    {:.3}ms",
+                self.min_latency.as_secs_f64() * 1000.0
+            );
+            println!(
+                "Max latency:    {:.3}ms",
+                self.max_latency.as_secs_f64() * 1000.0
+            );
+            println!(
+                "Avg latency:    {:.3}ms",
+                avg_latency.as_secs_f64() * 1000.0
+            );
         }
     }
 }
@@ -129,7 +138,7 @@ impl Stats {
 fn read_until_prompt(stream: &mut TcpStream) -> std::io::Result<String> {
     let mut response = Vec::new();
     let mut byte = [0u8; 1];
-    
+
     loop {
         stream.read_exact(&mut byte)?;
         response.push(byte[0]);
@@ -137,7 +146,7 @@ fn read_until_prompt(stream: &mut TcpStream) -> std::io::Result<String> {
             break;
         }
     }
-    
+
     Ok(String::from_utf8_lossy(&response).to_string())
 }
 
@@ -199,7 +208,8 @@ fn run_benchmark(args: &Args) -> std::io::Result<()> {
     println!("Connected. Initializing ELM327...");
     initialize_connection(&mut stream)?;
 
-    println!("Starting benchmark{}...\n",
+    println!(
+        "Starting benchmark{}...\n",
         if args.duration > 0 {
             format!(" for {}s", args.duration)
         } else {
@@ -235,7 +245,11 @@ fn run_benchmark(args: &Args) -> std::io::Result<()> {
                 stats.record_success(latency, rpm);
 
                 if args.verbose {
-                    println!("RPM: {} (latency: {:.2}ms)", rpm, latency.as_secs_f64() * 1000.0);
+                    println!(
+                        "RPM: {} (latency: {:.2}ms)",
+                        rpm,
+                        latency.as_secs_f64() * 1000.0
+                    );
                 }
             }
             Ok(None) => {

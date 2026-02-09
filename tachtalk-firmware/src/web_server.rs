@@ -3,9 +3,9 @@ use embedded_svc::http::Method;
 use embedded_svc::io::Write;
 use esp_idf_svc::http::server::{Configuration, EspHttpServer};
 use log::{debug, error, info, warn};
-use std::sync::atomic::Ordering;
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use esp_idf_svc::sys::{
@@ -14,10 +14,10 @@ use esp_idf_svc::sys::{
 };
 use std::mem::MaybeUninit;
 
+use crate::config::Config;
 use crate::rpm_leds::RpmTaskMessage;
 use crate::sse_server::SSE_PORT;
 use crate::State;
-use crate::config::Config;
 use smallvec::SmallVec;
 
 // Redefine bindgen u32 constants as i32 to match C socket API function signatures
@@ -48,8 +48,8 @@ fn check_restart_needed(current: &Config, new: &Config) -> (SmallVec<[u8; 4]>, b
     let encoder_a_changed = current.encoder_pin_a != new.encoder_pin_a;
     let encoder_b_changed = current.encoder_pin_b != new.encoder_pin_b;
     let button_changed = current.button_pin != new.button_pin;
-    let wifi_changed = current.wifi.ssid != new.wifi.ssid
-        || current.wifi.password != new.wifi.password;
+    let wifi_changed =
+        current.wifi.ssid != new.wifi.ssid || current.wifi.password != new.wifi.password;
     let ip_changed = current.ip.use_dhcp != new.ip.use_dhcp
         || current.ip.ip != new.ip.ip
         || current.ip.prefix_len != new.ip.prefix_len;
@@ -57,7 +57,7 @@ fn check_restart_needed(current: &Config, new: &Config) -> (SmallVec<[u8; 4]>, b
         || current.ap_password != new.ap_password
         || current.ap_ip != new.ap_ip
         || current.ap_prefix_len != new.ap_prefix_len;
-    
+
     // Collect old GPIO pins that need reset (to disconnect from RMT/PCNT peripherals)
     let mut gpios_to_reset = SmallVec::new();
     if led_changed {
@@ -72,10 +72,15 @@ fn check_restart_needed(current: &Config, new: &Config) -> (SmallVec<[u8; 4]>, b
     if button_changed && current.button_pin != 0 {
         gpios_to_reset.push(current.button_pin);
     }
-    
-    let needs_restart = led_changed || encoder_a_changed || encoder_b_changed || button_changed
-        || wifi_changed || ip_changed || ap_changed;
-    
+
+    let needs_restart = led_changed
+        || encoder_a_changed
+        || encoder_b_changed
+        || button_changed
+        || wifi_changed
+        || ip_changed
+        || ap_changed;
+
     (gpios_to_reset, needs_restart)
 }
 
@@ -233,8 +238,12 @@ pub fn log_sockets() {
         warn!("No open sockets found (unexpected)");
         return;
     }
-    
-    warn!("Open sockets ({}/{}):", sockets.len(), CONFIG_LWIP_MAX_SOCKETS);
+
+    warn!(
+        "Open sockets ({}/{}):",
+        sockets.len(),
+        CONFIG_LWIP_MAX_SOCKETS
+    );
     for s in &sockets {
         let type_str = match &s.socket_type {
             SocketType::Tcp => "TCP",
@@ -288,158 +297,204 @@ fn register_config_routes(server: &mut EspHttpServer<'static>, state: &Arc<State
 }
 
 fn register_index_page(server: &mut EspHttpServer<'static>) -> Result<()> {
-    server.fn_handler("/", Method::Get, |req| -> Result<(), esp_idf_svc::io::EspIOError> {
-        let mut response = req.into_ok_response()?;
-        response.write_all(HTML_INDEX_START.as_bytes())?;
-        response.write_all(SSE_PORT.to_string().as_bytes())?;
-        response.write_all(HTML_INDEX_END.as_bytes())?;
-        Ok(())
-    })?;
+    server.fn_handler(
+        "/",
+        Method::Get,
+        |req| -> Result<(), esp_idf_svc::io::EspIOError> {
+            let mut response = req.into_ok_response()?;
+            response.write_all(HTML_INDEX_START.as_bytes())?;
+            response.write_all(SSE_PORT.to_string().as_bytes())?;
+            response.write_all(HTML_INDEX_END.as_bytes())?;
+            Ok(())
+        },
+    )?;
     Ok(())
 }
 
 fn register_get_config(server: &mut EspHttpServer<'static>, state: &Arc<State>) -> Result<()> {
     let state_clone = state.clone();
-    server.fn_handler("/api/config", Method::Get, move |req| -> Result<(), esp_idf_svc::io::EspIOError> {
-        info!("HTTP: GET /api/config");
-        let cfg = state_clone.config.lock().unwrap();
-        let json = serde_json::to_string(&*cfg).unwrap();
-        
-        let mut response = req.into_ok_response()?;
-        response.write_all(json.as_bytes())?;
-        Ok(())
-    })?;
+    server.fn_handler(
+        "/api/config",
+        Method::Get,
+        move |req| -> Result<(), esp_idf_svc::io::EspIOError> {
+            info!("HTTP: GET /api/config");
+            let cfg = state_clone.config.lock().unwrap();
+            let json = serde_json::to_string(&*cfg).unwrap();
+
+            let mut response = req.into_ok_response()?;
+            response.write_all(json.as_bytes())?;
+            Ok(())
+        },
+    )?;
     Ok(())
 }
 
 fn register_get_default_config(server: &mut EspHttpServer<'static>) -> Result<()> {
-    server.fn_handler("/api/config/default", Method::Get, |req| -> Result<(), esp_idf_svc::io::EspIOError> {
-        info!("HTTP: GET /api/config/default");
-        let default_config = crate::config::Config::default();
-        let json = serde_json::to_string(&default_config).unwrap();
-        
-        let mut response = req.into_ok_response()?;
-        response.write_all(json.as_bytes())?;
-        Ok(())
-    })?;
+    server.fn_handler(
+        "/api/config/default",
+        Method::Get,
+        |req| -> Result<(), esp_idf_svc::io::EspIOError> {
+            info!("HTTP: GET /api/config/default");
+            let default_config = crate::config::Config::default();
+            let json = serde_json::to_string(&default_config).unwrap();
+
+            let mut response = req.into_ok_response()?;
+            response.write_all(json.as_bytes())?;
+            Ok(())
+        },
+    )?;
     Ok(())
 }
 
-fn register_post_config_check(server: &mut EspHttpServer<'static>, state: &Arc<State>) -> Result<()> {
+fn register_post_config_check(
+    server: &mut EspHttpServer<'static>,
+    state: &Arc<State>,
+) -> Result<()> {
     let state_clone = state.clone();
-    server.fn_handler("/api/config/check", Method::Post, move |mut req| -> Result<(), esp_idf_svc::io::EspIOError> {
-        debug!("HTTP: POST /api/config/check");
-        let mut buf = vec![0u8; 8192];
-        let bytes_read = req.read(&mut buf)?;
-        
-        if let Ok(mut new_config) = serde_json::from_slice::<crate::config::Config>(&buf[..bytes_read]) {
-            new_config.validate();
-            let (_, needs_restart) = {
-                let cfg = state_clone.config.lock().unwrap();
-                check_restart_needed(&cfg, &new_config)
-            };
-            let mut response = req.into_ok_response()?;
-            if needs_restart {
-                response.write_all(b"{\"restart\":true}")?;
+    server.fn_handler(
+        "/api/config/check",
+        Method::Post,
+        move |mut req| -> Result<(), esp_idf_svc::io::EspIOError> {
+            debug!("HTTP: POST /api/config/check");
+            let mut buf = vec![0u8; 8192];
+            let bytes_read = req.read(&mut buf)?;
+
+            if let Ok(mut new_config) =
+                serde_json::from_slice::<crate::config::Config>(&buf[..bytes_read])
+            {
+                new_config.validate();
+                let (_, needs_restart) = {
+                    let cfg = state_clone.config.lock().unwrap();
+                    check_restart_needed(&cfg, &new_config)
+                };
+                let mut response = req.into_ok_response()?;
+                if needs_restart {
+                    response.write_all(b"{\"restart\":true}")?;
+                } else {
+                    response.write_all(b"{\"restart\":false}")?;
+                }
             } else {
-                response.write_all(b"{\"restart\":false}")?;
+                warn!("Invalid config JSON received");
+                req.into_status_response(400)?;
             }
-        } else {
-            warn!("Invalid config JSON received");
-            req.into_status_response(400)?;
-        }
-        
-        Ok(())
-    })?;
+
+            Ok(())
+        },
+    )?;
     Ok(())
 }
 
 fn register_post_config(server: &mut EspHttpServer<'static>, state: &Arc<State>) -> Result<()> {
     let state_clone = state.clone();
-    server.fn_handler("/api/config", Method::Post, move |mut req| -> Result<(), esp_idf_svc::io::EspIOError> {
-        info!("HTTP: POST /api/config");
-        let mut buf = vec![0u8; 8192];
-        let bytes_read = req.read(&mut buf)?;
-        
-        if let Ok(mut new_config) = serde_json::from_slice::<crate::config::Config>(&buf[..bytes_read]) {
-            // Validate/clamp values to safe ranges
-            new_config.validate();
-            
-            debug!("Config update: {} profiles, active={}, log_level={:?}", 
-                   new_config.profiles.len(), new_config.active_profile, new_config.log_level);
-            
-            // Check if any settings changed that require a restart
-            let (gpios_to_reset, needs_restart) = {
-                let cfg = state_clone.config.lock().unwrap();
-                check_restart_needed(&cfg, &new_config)
-            };
-            
+    server.fn_handler(
+        "/api/config",
+        Method::Post,
+        move |mut req| -> Result<(), esp_idf_svc::io::EspIOError> {
+            info!("HTTP: POST /api/config");
+            let mut buf = vec![0u8; 8192];
+            let bytes_read = req.read(&mut buf)?;
+
+            if let Ok(mut new_config) =
+                serde_json::from_slice::<crate::config::Config>(&buf[..bytes_read])
             {
-                let mut cfg = state_clone.config.lock().unwrap();
-                *cfg = new_config;
-                if let Err(e) = cfg.save() {
-                    warn!("Failed to save config: {e}");
+                // Validate/clamp values to safe ranges
+                new_config.validate();
+
+                debug!(
+                    "Config update: {} profiles, active={}, log_level={:?}",
+                    new_config.profiles.len(),
+                    new_config.active_profile,
+                    new_config.log_level
+                );
+
+                // Check if any settings changed that require a restart
+                let (gpios_to_reset, needs_restart) = {
+                    let cfg = state_clone.config.lock().unwrap();
+                    check_restart_needed(&cfg, &new_config)
+                };
+
+                {
+                    let mut cfg = state_clone.config.lock().unwrap();
+                    *cfg = new_config;
+                    if let Err(e) = cfg.save() {
+                        warn!("Failed to save config: {e}");
+                    }
                 }
-            }
-            
-            // Notify RPM task of config change (to recalculate render interval)
-            let _ = state_clone.rpm_tx.send(RpmTaskMessage::ConfigChanged);
-            
-            if needs_restart {
-                info!("Config changed (requires restart), restarting in 2 seconds...");
-                // Reset old GPIOs to disconnect from RMT/PCNT peripherals before restart
-                for gpio in gpios_to_reset {
-                    unsafe { esp_idf_svc::sys::gpio_reset_pin(i32::from(gpio)); }
+
+                // Notify RPM task of config change (to recalculate render interval)
+                let _ = state_clone.rpm_tx.send(RpmTaskMessage::ConfigChanged);
+
+                if needs_restart {
+                    info!("Config changed (requires restart), restarting in 2 seconds...");
+                    // Reset old GPIOs to disconnect from RMT/PCNT peripherals before restart
+                    for gpio in gpios_to_reset {
+                        unsafe {
+                            esp_idf_svc::sys::gpio_reset_pin(i32::from(gpio));
+                        }
+                    }
+                    let mut response = req.into_ok_response()?;
+                    response.write_all(b"{\"restart\":true}")?;
+                    crate::thread_util::spawn_named(c"restart", || {
+                        std::thread::sleep(std::time::Duration::from_secs(2));
+                        unsafe {
+                            esp_idf_svc::sys::esp_restart();
+                        }
+                    });
+                } else {
+                    req.into_ok_response()?;
                 }
-                let mut response = req.into_ok_response()?;
-                response.write_all(b"{\"restart\":true}")?;
-                crate::thread_util::spawn_named(c"restart", || {
-                    std::thread::sleep(std::time::Duration::from_secs(2));
-                    unsafe { esp_idf_svc::sys::esp_restart(); }
-                });
             } else {
-                req.into_ok_response()?;
+                warn!("Invalid config JSON received");
+                req.into_status_response(400)?;
             }
-        } else {
-            warn!("Invalid config JSON received");
-            req.into_status_response(400)?;
-        }
-        
-        Ok(())
-    })?;
+
+            Ok(())
+        },
+    )?;
     Ok(())
 }
 
 fn register_post_brightness(server: &mut EspHttpServer<'static>, state: &Arc<State>) -> Result<()> {
     let state_clone = state.clone();
-    server.fn_handler("/api/brightness", Method::Post, move |mut req| -> Result<(), esp_idf_svc::io::EspIOError> {
-        debug!("HTTP: POST /api/brightness");
-        let mut buf = [0u8; 32];
-        let bytes_read = req.read(&mut buf)?;
-        
-        if let Ok(brightness_req) = serde_json::from_slice::<BrightnessRequest>(&buf[..bytes_read]) {
-            debug!("Brightness update: {} (save={})", brightness_req.brightness, brightness_req.save);
-            
-            // Send brightness to LED task immediately
-            let _ = state_clone.rpm_tx.send(RpmTaskMessage::Brightness(brightness_req.brightness));
-            
-            // Optionally save to config
-            if brightness_req.save {
-                let mut cfg = state_clone.config.lock().unwrap();
-                cfg.brightness = brightness_req.brightness;
-                if let Err(e) = cfg.save() {
-                    warn!("Failed to save brightness config: {e}");
+    server.fn_handler(
+        "/api/brightness",
+        Method::Post,
+        move |mut req| -> Result<(), esp_idf_svc::io::EspIOError> {
+            debug!("HTTP: POST /api/brightness");
+            let mut buf = [0u8; 32];
+            let bytes_read = req.read(&mut buf)?;
+
+            if let Ok(brightness_req) =
+                serde_json::from_slice::<BrightnessRequest>(&buf[..bytes_read])
+            {
+                debug!(
+                    "Brightness update: {} (save={})",
+                    brightness_req.brightness, brightness_req.save
+                );
+
+                // Send brightness to LED task immediately
+                let _ = state_clone
+                    .rpm_tx
+                    .send(RpmTaskMessage::Brightness(brightness_req.brightness));
+
+                // Optionally save to config
+                if brightness_req.save {
+                    let mut cfg = state_clone.config.lock().unwrap();
+                    cfg.brightness = brightness_req.brightness;
+                    if let Err(e) = cfg.save() {
+                        warn!("Failed to save brightness config: {e}");
+                    }
                 }
+
+                req.into_ok_response()?;
+            } else {
+                warn!("Invalid brightness JSON received");
+                req.into_status_response(400)?;
             }
-            
-            req.into_ok_response()?;
-        } else {
-            warn!("Invalid brightness JSON received");
-            req.into_status_response(400)?;
-        }
-        
-        Ok(())
-    })?;
+
+            Ok(())
+        },
+    )?;
     Ok(())
 }
 
@@ -447,91 +502,106 @@ fn register_post_brightness(server: &mut EspHttpServer<'static>, state: &Arc<Sta
 fn register_network_routes(server: &mut EspHttpServer<'static>, state: &Arc<State>) -> Result<()> {
     // GET wifi scan endpoint
     let state_clone = state.clone();
-    server.fn_handler("/api/wifi/scan", Method::Get, move |req| -> Result<(), esp_idf_svc::io::EspIOError> {
-        info!("HTTP: GET /api/wifi/scan");
-        let mut wifi = state_clone.wifi.lock().unwrap();
-        
-        let networks: Vec<Network> = match wifi.scan() {
-            Ok(aps) => {
-                debug!("WiFi scan found {} networks", aps.len());
-                // Deduplicate by SSID, keeping strongest signal
-                let mut best_by_ssid: HashMap<String, i8> = HashMap::new();
-                for ap in &aps {
-                    let ssid = ap.ssid.to_string();
-                    if ssid.is_empty() {
-                        continue;
+    server.fn_handler(
+        "/api/wifi/scan",
+        Method::Get,
+        move |req| -> Result<(), esp_idf_svc::io::EspIOError> {
+            info!("HTTP: GET /api/wifi/scan");
+            let mut wifi = state_clone.wifi.lock().unwrap();
+
+            let networks: Vec<Network> = match wifi.scan() {
+                Ok(aps) => {
+                    debug!("WiFi scan found {} networks", aps.len());
+                    // Deduplicate by SSID, keeping strongest signal
+                    let mut best_by_ssid: HashMap<String, i8> = HashMap::new();
+                    for ap in &aps {
+                        let ssid = ap.ssid.to_string();
+                        if ssid.is_empty() {
+                            continue;
+                        }
+                        best_by_ssid
+                            .entry(ssid)
+                            .and_modify(|rssi| *rssi = (*rssi).max(ap.signal_strength))
+                            .or_insert(ap.signal_strength);
                     }
-                    best_by_ssid
-                        .entry(ssid)
-                        .and_modify(|rssi| *rssi = (*rssi).max(ap.signal_strength))
-                        .or_insert(ap.signal_strength);
+                    // Convert to vec and sort by signal strength (strongest first)
+                    let mut networks: Vec<Network> = best_by_ssid
+                        .into_iter()
+                        .map(|(ssid, rssi)| Network { ssid, rssi })
+                        .collect();
+                    networks.sort_by(|a, b| b.rssi.cmp(&a.rssi));
+                    networks
                 }
-                // Convert to vec and sort by signal strength (strongest first)
-                let mut networks: Vec<Network> = best_by_ssid
-                    .into_iter()
-                    .map(|(ssid, rssi)| Network { ssid, rssi })
-                    .collect();
-                networks.sort_by(|a, b| b.rssi.cmp(&a.rssi));
-                networks
-            }
-            Err(e) => {
-                error!("WiFi scan failed: {e:?}");
-                Vec::new()
-            }
-        };
-        
-        let json = serde_json::to_string(&networks).unwrap_or_else(|_| "[]".to_string());
-        
-        let mut response = req.into_ok_response()?;
-        response.write_all(json.as_bytes())?;
-        Ok(())
-    })?;
+                Err(e) => {
+                    error!("WiFi scan failed: {e:?}");
+                    Vec::new()
+                }
+            };
+
+            let json = serde_json::to_string(&networks).unwrap_or_else(|_| "[]".to_string());
+
+            let mut response = req.into_ok_response()?;
+            response.write_all(json.as_bytes())?;
+            Ok(())
+        },
+    )?;
 
     // GET network status endpoint
     let state_clone = state.clone();
-    server.fn_handler("/api/network", Method::Get, move |req| -> Result<(), esp_idf_svc::io::EspIOError> {
-        info!("HTTP: GET /api/network");
-        let wifi = state_clone.wifi.lock().unwrap();
-        
-        let sta_netif = wifi.sta_netif();
-        let ip_info = sta_netif.get_ip_info().ok();
-        
-        let mac_bytes = wifi.driver().get_mac(esp_idf_svc::wifi::WifiDeviceId::Sta).unwrap_or([0u8; 6]);
-        let mac = format!("{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
-            mac_bytes[0], mac_bytes[1], mac_bytes[2],
-            mac_bytes[3], mac_bytes[4], mac_bytes[5]);
-        
-        // Get SSID and RSSI from current STA connection info
-        let (ssid, rssi) = if wifi.is_connected().unwrap_or(false) {
-            let mut ap_info: esp_idf_svc::sys::wifi_ap_record_t = unsafe { std::mem::zeroed() };
-            let result = unsafe { esp_idf_svc::sys::esp_wifi_sta_get_ap_info(&mut ap_info) };
-            if result == esp_idf_svc::sys::ESP_OK {
-                let ssid_bytes = &ap_info.ssid;
-                let ssid_len = ssid_bytes.iter().position(|&b| b == 0).unwrap_or(ssid_bytes.len());
-                let ssid = String::from_utf8_lossy(&ssid_bytes[..ssid_len]).to_string();
-                (Some(ssid), Some(ap_info.rssi))
+    server.fn_handler(
+        "/api/network",
+        Method::Get,
+        move |req| -> Result<(), esp_idf_svc::io::EspIOError> {
+            info!("HTTP: GET /api/network");
+            let wifi = state_clone.wifi.lock().unwrap();
+
+            let sta_netif = wifi.sta_netif();
+            let ip_info = sta_netif.get_ip_info().ok();
+
+            let mac_bytes = wifi
+                .driver()
+                .get_mac(esp_idf_svc::wifi::WifiDeviceId::Sta)
+                .unwrap_or([0u8; 6]);
+            let mac = format!(
+                "{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
+                mac_bytes[0], mac_bytes[1], mac_bytes[2], mac_bytes[3], mac_bytes[4], mac_bytes[5]
+            );
+
+            // Get SSID and RSSI from current STA connection info
+            let (ssid, rssi) = if wifi.is_connected().unwrap_or(false) {
+                let mut ap_info: esp_idf_svc::sys::wifi_ap_record_t = unsafe { std::mem::zeroed() };
+                let result = unsafe { esp_idf_svc::sys::esp_wifi_sta_get_ap_info(&mut ap_info) };
+                if result == esp_idf_svc::sys::ESP_OK {
+                    let ssid_bytes = &ap_info.ssid;
+                    let ssid_len = ssid_bytes
+                        .iter()
+                        .position(|&b| b == 0)
+                        .unwrap_or(ssid_bytes.len());
+                    let ssid = String::from_utf8_lossy(&ssid_bytes[..ssid_len]).to_string();
+                    (Some(ssid), Some(ap_info.rssi))
+                } else {
+                    (None, None)
+                }
             } else {
                 (None, None)
-            }
-        } else {
-            (None, None)
-        };
-        
-        let status = NetworkStatus {
-            ssid,
-            ip: ip_info.as_ref().map(|i| {
-                format!("{}/{}", i.ip, i.subnet.mask.0)
-            }),
-            mac,
-            rssi,
-        };
-        
-        let json = serde_json::to_string(&status).unwrap_or_else(|_| "{}".to_string());
-        
-        let mut response = req.into_ok_response()?;
-        response.write_all(json.as_bytes())?;
-        Ok(())
-    })?;
+            };
+
+            let status = NetworkStatus {
+                ssid,
+                ip: ip_info
+                    .as_ref()
+                    .map(|i| format!("{}/{}", i.ip, i.subnet.mask.0)),
+                mac,
+                rssi,
+            };
+
+            let json = serde_json::to_string(&status).unwrap_or_else(|_| "{}".to_string());
+
+            let mut response = req.into_ok_response()?;
+            response.write_all(json.as_bytes())?;
+            Ok(())
+        },
+    )?;
 
     Ok(())
 }
@@ -540,88 +610,116 @@ fn register_network_routes(server: &mut EspHttpServer<'static>, state: &Arc<Stat
 fn register_status_routes(server: &mut EspHttpServer<'static>, state: &Arc<State>) -> Result<()> {
     // GET connection status endpoint for diagram
     let state_clone = state.clone();
-    server.fn_handler("/api/status", Method::Get, move |req| -> Result<(), esp_idf_svc::io::EspIOError> {
-        debug!("HTTP: GET /api/status");
-        
-        let wifi_connected = state_clone.wifi.lock().unwrap().is_connected().unwrap_or(false);
-        let dongle_tcp_connected = state_clone.dongle_connected.load(Ordering::Relaxed);
-        let obd2_client_count = state_clone.obd2_client_count.load(Ordering::Relaxed);
-        
-        let status = ConnectionStatus {
-            wifi_connected,
-            dongle_tcp_connected,
-            obd2_client_count,
-        };
-        
-        let json = serde_json::to_string(&status).unwrap_or_else(|_| "{}".to_string());
-        
-        let mut response = req.into_ok_response()?;
-        response.write_all(json.as_bytes())?;
-        Ok(())
-    })?;
+    server.fn_handler(
+        "/api/status",
+        Method::Get,
+        move |req| -> Result<(), esp_idf_svc::io::EspIOError> {
+            debug!("HTTP: GET /api/status");
+
+            let wifi_connected = state_clone
+                .wifi
+                .lock()
+                .unwrap()
+                .is_connected()
+                .unwrap_or(false);
+            let dongle_tcp_connected = state_clone.dongle_connected.load(Ordering::Relaxed);
+            let obd2_client_count = state_clone.obd2_client_count.load(Ordering::Relaxed);
+
+            let status = ConnectionStatus {
+                wifi_connected,
+                dongle_tcp_connected,
+                obd2_client_count,
+            };
+
+            let json = serde_json::to_string(&status).unwrap_or_else(|_| "{}".to_string());
+
+            let mut response = req.into_ok_response()?;
+            response.write_all(json.as_bytes())?;
+            Ok(())
+        },
+    )?;
 
     // GET TCP connection details endpoint
     let state_clone = state.clone();
-    server.fn_handler("/api/tcp", Method::Get, move |req| -> Result<(), esp_idf_svc::io::EspIOError> {
-        debug!("HTTP: GET /api/tcp");
-        
-        let dongle = state_clone.dongle_tcp_info.lock().unwrap()
-            .map(|(local, remote)| TcpConnectionInfo {
-                local: local.to_string(),
-                remote: remote.to_string(),
-            });
-        
-        let clients: Vec<TcpConnectionInfo> = state_clone.client_tcp_info.lock().unwrap()
-            .iter()
-            .map(|(local, remote)| TcpConnectionInfo {
-                local: local.to_string(),
-                remote: remote.to_string(),
-            })
-            .collect();
-        
-        let status = TcpStatus { dongle, clients };
-        let json = serde_json::to_string(&status).unwrap_or_else(|_| "{}".to_string());
-        
-        let mut response = req.into_ok_response()?;
-        response.write_all(json.as_bytes())?;
-        Ok(())
-    })?;
+    server.fn_handler(
+        "/api/tcp",
+        Method::Get,
+        move |req| -> Result<(), esp_idf_svc::io::EspIOError> {
+            debug!("HTTP: GET /api/tcp");
+
+            let dongle = state_clone
+                .dongle_tcp_info
+                .lock()
+                .unwrap()
+                .map(|(local, remote)| TcpConnectionInfo {
+                    local: local.to_string(),
+                    remote: remote.to_string(),
+                });
+
+            let clients: Vec<TcpConnectionInfo> = state_clone
+                .client_tcp_info
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(local, remote)| TcpConnectionInfo {
+                    local: local.to_string(),
+                    remote: remote.to_string(),
+                })
+                .collect();
+
+            let status = TcpStatus { dongle, clients };
+            let json = serde_json::to_string(&status).unwrap_or_else(|_| "{}".to_string());
+
+            let mut response = req.into_ok_response()?;
+            response.write_all(json.as_bytes())?;
+            Ok(())
+        },
+    )?;
 
     // GET RPM endpoint (fallback for non-SSE clients)
     let state_clone = state.clone();
-    server.fn_handler("/api/rpm", Method::Get, move |req| -> Result<(), esp_idf_svc::io::EspIOError> {
-        debug!("HTTP: GET /api/rpm");
-        let rpm = state_clone.shared_rpm.lock().unwrap();
-        let json = match *rpm {
-            Some(r) => format!(r#"{{"rpm":{r}}}"#),
-            None => r#"{"rpm":null}"#.to_string(),
-        };
-        let mut response = req.into_ok_response()?;
-        response.write_all(json.as_bytes())?;
-        Ok(())
-    })?;
+    server.fn_handler(
+        "/api/rpm",
+        Method::Get,
+        move |req| -> Result<(), esp_idf_svc::io::EspIOError> {
+            debug!("HTTP: GET /api/rpm");
+            let rpm = state_clone.shared_rpm.lock().unwrap();
+            let json = match *rpm {
+                Some(r) => format!(r#"{{"rpm":{r}}}"#),
+                None => r#"{"rpm":null}"#.to_string(),
+            };
+            let mut response = req.into_ok_response()?;
+            response.write_all(json.as_bytes())?;
+            Ok(())
+        },
+    )?;
 
     // GET polling metrics endpoint
     let state_clone = state.clone();
-    server.fn_handler("/api/metrics", Method::Get, move |req| -> Result<(), esp_idf_svc::io::EspIOError> {
-        debug!("HTTP: GET /api/metrics");
-        
-        let metrics = &state_clone.polling_metrics;
-        let response_data = PollingMetricsResponse {
-            fast_pid_count: metrics.fast_pid_count.load(Ordering::Relaxed),
-            slow_pid_count: metrics.slow_pid_count.load(Ordering::Relaxed),
-            promotions: metrics.promotions.load(Ordering::Relaxed),
-            demotions: metrics.demotions.load(Ordering::Relaxed),
-            removals: metrics.removals.load(Ordering::Relaxed),
-            dongle_requests_total: metrics.dongle_requests_total.load(Ordering::Relaxed),
-            dongle_requests_per_sec: metrics.dongle_requests_per_sec.load(Ordering::Relaxed),
-        };
-        
-        let json = serde_json::to_string(&response_data).unwrap_or_else(|_| r#"{"error":"serialization failed"}"#.to_string());
-        let mut response = req.into_ok_response()?;
-        response.write_all(json.as_bytes())?;
-        Ok(())
-    })?;
+    server.fn_handler(
+        "/api/metrics",
+        Method::Get,
+        move |req| -> Result<(), esp_idf_svc::io::EspIOError> {
+            debug!("HTTP: GET /api/metrics");
+
+            let metrics = &state_clone.polling_metrics;
+            let response_data = PollingMetricsResponse {
+                fast_pid_count: metrics.fast_pid_count.load(Ordering::Relaxed),
+                slow_pid_count: metrics.slow_pid_count.load(Ordering::Relaxed),
+                promotions: metrics.promotions.load(Ordering::Relaxed),
+                demotions: metrics.demotions.load(Ordering::Relaxed),
+                removals: metrics.removals.load(Ordering::Relaxed),
+                dongle_requests_total: metrics.dongle_requests_total.load(Ordering::Relaxed),
+                dongle_requests_per_sec: metrics.dongle_requests_per_sec.load(Ordering::Relaxed),
+            };
+
+            let json = serde_json::to_string(&response_data)
+                .unwrap_or_else(|_| r#"{"error":"serialization failed"}"#.to_string());
+            let mut response = req.into_ok_response()?;
+            response.write_all(json.as_bytes())?;
+            Ok(())
+        },
+    )?;
 
     Ok(())
 }
@@ -629,92 +727,112 @@ fn register_status_routes(server: &mut EspHttpServer<'static>, state: &Arc<State
 /// Register debug and system routes (sockets, debug info, reboot)
 fn register_debug_routes(server: &mut EspHttpServer<'static>, state: &Arc<State>) -> Result<()> {
     // GET all open sockets endpoint (for debugging FD exhaustion)
-    server.fn_handler("/api/sockets", Method::Get, move |req| -> Result<(), esp_idf_svc::io::EspIOError> {
-        debug!("HTTP: GET /api/sockets");
-        
-        let sockets = enumerate_sockets();
-        let json = serde_json::to_string(&sockets).unwrap_or_else(|_| "[]".to_string());
-        
-        let mut response = req.into_ok_response()?;
-        response.write_all(json.as_bytes())?;
-        Ok(())
-    })?;
+    server.fn_handler(
+        "/api/sockets",
+        Method::Get,
+        move |req| -> Result<(), esp_idf_svc::io::EspIOError> {
+            debug!("HTTP: GET /api/sockets");
+
+            let sockets = enumerate_sockets();
+            let json = serde_json::to_string(&sockets).unwrap_or_else(|_| "[]".to_string());
+
+            let mut response = req.into_ok_response()?;
+            response.write_all(json.as_bytes())?;
+            Ok(())
+        },
+    )?;
 
     // GET debug info endpoint (AT commands, PIDs, memory stats, etc.)
     let state_clone = state.clone();
-    server.fn_handler("/api/debug_info", Method::Get, move |req| -> Result<(), esp_idf_svc::io::EspIOError> {
-        debug!("HTTP: GET /api/debug_info");
-        
-        let at_commands: Vec<String> = state_clone.at_command_log
-            .lock()
-            .map(|log| {
-                let mut cmds: Vec<String> = log.iter().cloned().collect();
-                cmds.sort();
-                cmds
-            })
-            .unwrap_or_default();
-        
-        let pids: Vec<String> = state_clone.pid_log
-            .lock()
-            .map(|log| {
-                let mut pids: Vec<String> = log.iter().cloned().collect();
-                pids.sort();
-                pids
-            })
-            .unwrap_or_default();
-        
-        // SAFETY: These are simple C functions that return u32 values
-        let free_heap = unsafe { esp_get_free_heap_size() };
-        let min_free_heap = unsafe { esp_get_minimum_free_heap_size() };
-        
-        let info = DebugInfo {
-            at_commands,
-            pids,
-            free_heap,
-            min_free_heap,
-        };
-        
-        let json = serde_json::to_string(&info).unwrap_or_else(|_| r#"{"at_commands":[],"free_heap":0,"min_free_heap":0}"#.to_string());
-        
-        let mut response = req.into_ok_response()?;
-        response.write_all(json.as_bytes())?;
-        Ok(())
-    })?;
+    server.fn_handler(
+        "/api/debug_info",
+        Method::Get,
+        move |req| -> Result<(), esp_idf_svc::io::EspIOError> {
+            debug!("HTTP: GET /api/debug_info");
+
+            let at_commands: Vec<String> = state_clone
+                .at_command_log
+                .lock()
+                .map(|log| {
+                    let mut cmds: Vec<String> = log.iter().cloned().collect();
+                    cmds.sort();
+                    cmds
+                })
+                .unwrap_or_default();
+
+            let pids: Vec<String> = state_clone
+                .pid_log
+                .lock()
+                .map(|log| {
+                    let mut pids: Vec<String> = log.iter().cloned().collect();
+                    pids.sort();
+                    pids
+                })
+                .unwrap_or_default();
+
+            // SAFETY: These are simple C functions that return u32 values
+            let free_heap = unsafe { esp_get_free_heap_size() };
+            let min_free_heap = unsafe { esp_get_minimum_free_heap_size() };
+
+            let info = DebugInfo {
+                at_commands,
+                pids,
+                free_heap,
+                min_free_heap,
+            };
+
+            let json = serde_json::to_string(&info).unwrap_or_else(|_| {
+                r#"{"at_commands":[],"free_heap":0,"min_free_heap":0}"#.to_string()
+            });
+
+            let mut response = req.into_ok_response()?;
+            response.write_all(json.as_bytes())?;
+            Ok(())
+        },
+    )?;
 
     // POST reboot endpoint
     let state_clone = state.clone();
-    server.fn_handler("/api/reboot", Method::Post, move |req| -> Result<(), esp_idf_svc::io::EspIOError> {
-        info!("HTTP: POST /api/reboot - Device reboot requested");
-        
-        req.into_ok_response()?;
-        
-        // Schedule restart after response is sent
-        let state = state_clone.clone();
-        crate::thread_util::spawn_named(c"restart", move || {
-            std::thread::sleep(std::time::Duration::from_secs(1));
-            
-            // Stop WiFi before restarting to ensure clean shutdown
-            info!("Stopping WiFi before reboot...");
-            if let Ok(mut wifi) = state.wifi.lock() {
-                if let Err(e) = wifi.stop() {
-                    warn!("Failed to stop WiFi: {e:?}");
+    server.fn_handler(
+        "/api/reboot",
+        Method::Post,
+        move |req| -> Result<(), esp_idf_svc::io::EspIOError> {
+            info!("HTTP: POST /api/reboot - Device reboot requested");
+
+            req.into_ok_response()?;
+
+            // Schedule restart after response is sent
+            let state = state_clone.clone();
+            crate::thread_util::spawn_named(c"restart", move || {
+                std::thread::sleep(std::time::Duration::from_secs(1));
+
+                // Stop WiFi before restarting to ensure clean shutdown
+                info!("Stopping WiFi before reboot...");
+                if let Ok(mut wifi) = state.wifi.lock() {
+                    if let Err(e) = wifi.stop() {
+                        warn!("Failed to stop WiFi: {e:?}");
+                    }
                 }
-            }
-            
-            info!("Rebooting device now...");
-            unsafe {
-                esp_idf_svc::sys::esp_restart();
-            }
-        });
-        
-        Ok(())
-    })?;
+
+                info!("Rebooting device now...");
+                unsafe {
+                    esp_idf_svc::sys::esp_restart();
+                }
+            });
+
+            Ok(())
+        },
+    )?;
 
     Ok(())
 }
 
 /// Register captive portal wildcard handler (must be registered last)
-fn register_captive_portal(server: &mut EspHttpServer<'static>, hostname: &str, ap_ip: Ipv4Addr) -> Result<()> {
+fn register_captive_portal(
+    server: &mut EspHttpServer<'static>,
+    hostname: &str,
+    ap_ip: Ipv4Addr,
+) -> Result<()> {
     let hostname = hostname.to_owned();
     let ap_ip_str = ap_ip.to_string();
     let valid_hosts: Vec<String> = vec![
@@ -737,41 +855,53 @@ fn register_captive_portal(server: &mut EspHttpServer<'static>, hostname: &str, 
 </html>
 "#
     );
-    
+
     info!("Captive portal enabled for hostname: {hostname}");
-    
-    server.fn_handler("/*", Method::Get, move |req| -> Result<(), esp_idf_svc::io::EspIOError> {
-        // Check Host header
-        let host = req.header("Host").unwrap_or("");
-        let host_lower = host.to_lowercase();
-        // Strip port if present
-        let host_without_port = host_lower.split(':').next().unwrap_or("");
-        
-        let is_valid_host = valid_hosts.iter().any(|h| h == host_without_port);
-        
-        if is_valid_host {
-            // Valid host but unknown path - return 404
-            info!("HTTP: GET {} -> 404 (host: {})", req.uri(), host);
-            req.into_status_response(404)?;
-        } else {
-            // Wrong host - redirect to captive portal
-            info!("HTTP: GET {} -> 302 captive (host: {})", req.uri(), host);
-            let mut response = req.into_response(302, Some("Found"), &[
-                ("Location", &redirect_url),
-                ("Cache-Control", "no-cache"),
-                ("Connection", "close"),
-            ])?;
-            response.write_all(captive_portal_html.as_bytes())?;
-        }
-        Ok(())
-    })?;
+
+    server.fn_handler(
+        "/*",
+        Method::Get,
+        move |req| -> Result<(), esp_idf_svc::io::EspIOError> {
+            // Check Host header
+            let host = req.header("Host").unwrap_or("");
+            let host_lower = host.to_lowercase();
+            // Strip port if present
+            let host_without_port = host_lower.split(':').next().unwrap_or("");
+
+            let is_valid_host = valid_hosts.iter().any(|h| h == host_without_port);
+
+            if is_valid_host {
+                // Valid host but unknown path - return 404
+                info!("HTTP: GET {} -> 404 (host: {})", req.uri(), host);
+                req.into_status_response(404)?;
+            } else {
+                // Wrong host - redirect to captive portal
+                info!("HTTP: GET {} -> 302 captive (host: {})", req.uri(), host);
+                let mut response = req.into_response(
+                    302,
+                    Some("Found"),
+                    &[
+                        ("Location", &redirect_url),
+                        ("Cache-Control", "no-cache"),
+                        ("Connection", "close"),
+                    ],
+                )?;
+                response.write_all(captive_portal_html.as_bytes())?;
+            }
+            Ok(())
+        },
+    )?;
 
     Ok(())
 }
 
-pub fn start_server(state: &Arc<State>, ap_hostname: Option<String>, ap_ip: Ipv4Addr) -> Result<()> {
+pub fn start_server(
+    state: &Arc<State>,
+    ap_hostname: Option<String>,
+    ap_ip: Ipv4Addr,
+) -> Result<()> {
     info!("Web server starting...");
-    
+
     // Enable wildcard URI matching for captive portal fallback handler
     // Enable LRU purge to handle abrupt disconnections from captive portal browsers
     // LWIP max is 16 sockets; leave room for DNS, SSE, mDNS, OBD2 proxy, dongle, httpd control
@@ -795,9 +925,9 @@ pub fn start_server(state: &Arc<State>, ap_hostname: Option<String>, ap_ip: Ipv4
     }
 
     info!("Web server started on http://0.0.0.0:80");
-    
+
     // Keep server alive
     std::mem::forget(server);
-    
+
     Ok(())
 }

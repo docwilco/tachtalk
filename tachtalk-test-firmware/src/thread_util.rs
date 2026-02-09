@@ -24,20 +24,22 @@ where
 {
     // Get current config to restore after spawn
     let prev_conf = ThreadSpawnConfiguration::get();
-    
+
     // Create new config with our name
     let conf = ThreadSpawnConfiguration {
         name: Some(name.to_bytes_with_nul()),
         ..Default::default()
     };
-    conf.set().expect("Failed to set thread spawn configuration");
-    
+    conf.set()
+        .expect("Failed to set thread spawn configuration");
+
     // Spawn the thread
     let handle = std::thread::spawn(f);
-    
+
     // Restore previous config (or default if none was set)
     if let Some(prev) = prev_conf {
-        prev.set().expect("Failed to restore thread spawn configuration");
+        prev.set()
+            .expect("Failed to restore thread spawn configuration");
     }
 
     handle

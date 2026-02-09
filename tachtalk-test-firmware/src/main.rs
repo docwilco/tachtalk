@@ -2,20 +2,19 @@ use anyhow::Result;
 use esp_idf_hal::delay::FreeRtos;
 use esp_idf_hal::prelude::*;
 use esp_idf_svc::eventloop::EspSystemEventLoop;
-use esp_idf_svc::mdns::EspMdns;
-use esp_idf_svc::nvs::EspDefaultNvsPartition;
-use esp_idf_svc::netif::{EspNetif, NetifConfiguration, NetifStack};
-use esp_idf_svc::wifi::{
-    AccessPointConfiguration, AuthMethod, ClientConfiguration, Configuration,
-    EspWifi, WifiDriver,
-};
 use esp_idf_svc::ipv4::{
     self, ClientConfiguration as IpClientConfiguration, ClientSettings as IpClientSettings,
     Configuration as IpConfiguration, Ipv4Addr, Mask, Subnet,
 };
+use esp_idf_svc::mdns::EspMdns;
+use esp_idf_svc::netif::{EspNetif, NetifConfiguration, NetifStack};
+use esp_idf_svc::nvs::EspDefaultNvsPartition;
+use esp_idf_svc::wifi::{
+    AccessPointConfiguration, AuthMethod, ClientConfiguration, Configuration, EspWifi, WifiDriver,
+};
 use log::{debug, error, info, warn};
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
 
 mod config;
 mod cpu_metrics;
@@ -114,16 +113,18 @@ fn create_sta_netif(config: &Config) -> Result<EspNetif> {
         info!("STA netif: DHCP mode");
         Ok(EspNetif::new(NetifStack::Sta)?)
     } else {
-        let ip: Ipv4Addr = config.ip.ip.parse().map_err(|_| {
-            anyhow::anyhow!("Invalid static IP: {}", config.ip.ip)
-        })?;
+        let ip: Ipv4Addr = config
+            .ip
+            .ip
+            .parse()
+            .map_err(|_| anyhow::anyhow!("Invalid static IP: {}", config.ip.ip))?;
         let mask = config.ip.prefix_len;
 
         info!("STA netif: Static IP {ip}/{mask} (no gateway)");
 
         let mut sta_config = NetifConfiguration::wifi_default_client();
-        sta_config.ip_configuration = Some(IpConfiguration::Client(
-            IpClientConfiguration::Fixed(IpClientSettings {
+        sta_config.ip_configuration = Some(IpConfiguration::Client(IpClientConfiguration::Fixed(
+            IpClientSettings {
                 ip,
                 subnet: Subnet {
                     gateway: Ipv4Addr::UNSPECIFIED,
@@ -131,8 +132,8 @@ fn create_sta_netif(config: &Config) -> Result<EspNetif> {
                 },
                 dns: None,
                 secondary_dns: None,
-            }),
-        ));
+            },
+        )));
         Ok(EspNetif::new_with_conf(&sta_config)?)
     }
 }
@@ -181,7 +182,11 @@ fn start_wifi(
 ) -> Result<EspWifi<'static>> {
     let sta_ssid = config.wifi.ssid.clone();
     let sta_password = config.wifi.password.clone().unwrap_or_default();
-    let sta_auth_method = if sta_password.is_empty() { AuthMethod::None } else { AuthMethod::WPA2Personal };
+    let sta_auth_method = if sta_password.is_empty() {
+        AuthMethod::None
+    } else {
+        AuthMethod::WPA2Personal
+    };
 
     let ap_pw = ap_password.unwrap_or("");
 
@@ -243,10 +248,19 @@ fn init_wifi(
         _ => AuthMethod::None,
     };
 
-    let wifi = start_wifi(config, wifi, &ap_ssid, ap_password.as_deref(), ap_auth_method)?;
+    let wifi = start_wifi(
+        config,
+        wifi,
+        &ap_ssid,
+        ap_password.as_deref(),
+        ap_auth_method,
+    )?;
 
     let ap_ip_info = wifi.ap_netif().get_ip_info()?;
-    info!("AP started - connect to '{ap_ssid}' and navigate to http://{}", ap_ip_info.ip);
+    info!(
+        "AP started - connect to '{ap_ssid}' and navigate to http://{}",
+        ap_ip_info.ip
+    );
 
     Ok((wifi, ap_ssid))
 }
@@ -329,13 +343,7 @@ fn main() -> Result<()> {
         capture_buffer: Mutex::new(Vec::new()),
     });
 
-    spawn_background_tasks(
-        &state,
-        sse_rx,
-        test_control_rx,
-        ap_hostname,
-        ap_ip,
-    );
+    spawn_background_tasks(&state, sse_rx, test_control_rx, ap_hostname, ap_ip);
 
     // Start mDNS for local discovery
     let _mdns = setup_mdns();
@@ -408,9 +416,7 @@ fn wifi_connection_manager(state: &Arc<State>) {
             };
             if l2_connected {
                 match wifi_guard.sta_netif().get_ip_info() {
-                    Ok(info) if !info.ip.is_unspecified() => {
-                        StaConnectionState::Connected(info.ip)
-                    }
+                    Ok(info) if !info.ip.is_unspecified() => StaConnectionState::Connected(info.ip),
                     Ok(_) => StaConnectionState::AwaitingIp,
                     Err(e) => {
                         error!("Failed to get STA IP info: {e}");

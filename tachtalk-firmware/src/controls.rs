@@ -25,7 +25,9 @@ use std::time::{Duration, Instant};
 
 use esp_idf_hal::delay::TickType;
 use esp_idf_hal::gpio::{AnyIOPin, Input, InputPin, InterruptType, PinDriver, Pull};
-use esp_idf_hal::pcnt::{Pcnt, PcntChannelConfig, PcntControlMode, PcntCountMode, PcntDriver, PinIndex};
+use esp_idf_hal::pcnt::{
+    Pcnt, PcntChannelConfig, PcntControlMode, PcntCountMode, PcntDriver, PinIndex,
+};
 use esp_idf_hal::peripheral::Peripheral;
 use esp_idf_hal::task::notification::Notification;
 use log::{debug, info, warn};
@@ -70,8 +72,8 @@ pub fn init_encoder<'d, PCNT: Pcnt>(
     // Create PCNT driver with A on pin0, B on pin1
     let mut driver = PcntDriver::new(
         pcnt,
-        Some(pin_a), // pin0 = A (pulse)
-        Some(pin_b), // pin1 = B (control)
+        Some(pin_a),                            // pin0 = A (pulse)
+        Some(pin_b),                            // pin1 = B (control)
         None::<esp_idf_hal::gpio::AnyInputPin>, // pin2 unused
         None::<esp_idf_hal::gpio::AnyInputPin>, // pin3 unused
     )?;
@@ -111,9 +113,7 @@ pub fn init_encoder<'d, PCNT: Pcnt>(
 ///
 /// Returns a tuple of (button driver, notification) for handling presses.
 /// The button uses internal pull-up and triggers on falling edge (press).
-fn init_button(
-    button_pin: u8,
-) -> Option<(PinDriver<'static, AnyIOPin, Input>, Notification)> {
+fn init_button(button_pin: u8) -> Option<(PinDriver<'static, AnyIOPin, Input>, Notification)> {
     // SAFETY: We trust the user-configured GPIO pin number is valid
     let pin = unsafe { AnyIOPin::new(i32::from(button_pin)) };
 
@@ -173,7 +173,9 @@ pub fn controls_task(state: &Arc<State>, driver: PcntDriver<'static>) {
 
     // Track button press timing for debounce
     // Use checked_sub to avoid potential underflow (though unlikely at boot time)
-    let mut last_button_press = Instant::now().checked_sub(BUTTON_DEBOUNCE).unwrap_or_else(Instant::now);
+    let mut last_button_press = Instant::now()
+        .checked_sub(BUTTON_DEBOUNCE)
+        .unwrap_or_else(Instant::now);
 
     // Convert poll interval to FreeRTOS ticks
     let poll_ticks = TickType::from(POLL_INTERVAL).ticks();
@@ -255,7 +257,10 @@ pub fn controls_task(state: &Arc<State>, driver: PcntDriver<'static>) {
                     }
 
                     if pending_profile_save {
-                        debug!("Controls: saving active_profile {} to NVS", cfg_guard.active_profile);
+                        debug!(
+                            "Controls: saving active_profile {} to NVS",
+                            cfg_guard.active_profile
+                        );
                     }
 
                     if let Err(e) = cfg_guard.save() {

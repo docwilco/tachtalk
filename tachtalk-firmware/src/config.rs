@@ -389,10 +389,7 @@ fn martijn_profile() -> LedProfile {
                 rpm_upper: Some(3000),
                 start_led: 0,
                 end_led: 5,
-                colors: smallvec::smallvec![
-                    RGB8::new(0, 0, 255),
-                    RGB8::new(255, 0, 0),
-                ],
+                colors: smallvec::smallvec![RGB8::new(0, 0, 255), RGB8::new(255, 0, 0),],
                 blink: false,
                 blink_ms: 500,
             },
@@ -402,10 +399,7 @@ fn martijn_profile() -> LedProfile {
                 rpm_upper: Some(3000),
                 start_led: 11,
                 end_led: 6,
-                colors: smallvec::smallvec![
-                    RGB8::new(0, 0, 255),
-                    RGB8::new(255, 0, 0),
-                ],
+                colors: smallvec::smallvec![RGB8::new(0, 0, 255), RGB8::new(255, 0, 0),],
                 blink: false,
                 blink_ms: 500,
             },
@@ -473,7 +467,10 @@ impl Config {
     /// Clamp values to valid ranges and fix invalid values
     pub fn validate(&mut self) {
         if self.obd2_timeout_ms > MAX_OBD2_TIMEOUT_MS {
-            warn!("Clamping obd2_timeout_ms from {} to {}", self.obd2_timeout_ms, MAX_OBD2_TIMEOUT_MS);
+            warn!(
+                "Clamping obd2_timeout_ms from {} to {}",
+                self.obd2_timeout_ms, MAX_OBD2_TIMEOUT_MS
+            );
             self.obd2_timeout_ms = MAX_OBD2_TIMEOUT_MS;
         }
         if self.wifi.ssid.is_empty() {
@@ -507,8 +504,10 @@ impl Config {
     pub fn load() -> Result<Self> {
         debug!("Loading config from NVS");
         let nvs_guard = NVS.lock().unwrap();
-        let nvs = nvs_guard.as_ref().ok_or_else(|| anyhow!("NVS not initialized"))?;
-        
+        let nvs = nvs_guard
+            .as_ref()
+            .ok_or_else(|| anyhow!("NVS not initialized"))?;
+
         // Get the blob length first
         let len = nvs.blob_len(NVS_CONFIG_KEY)?;
         if let Some(len) = len {
@@ -516,7 +515,10 @@ impl Config {
             let mut buf = vec![0u8; len];
             nvs.get_blob(NVS_CONFIG_KEY, &mut buf)?;
             let config: Config = serde_json::from_slice(&buf)?;
-            debug!("Config parsed: wifi.ssid={:?}, log_level={:?}, led_gpio={}", config.wifi.ssid, config.log_level, config.led_gpio);
+            debug!(
+                "Config parsed: wifi.ssid={:?}, log_level={:?}, led_gpio={}",
+                config.wifi.ssid, config.log_level, config.led_gpio
+            );
             Ok(config)
         } else {
             Err(anyhow!("No config found in NVS"))
@@ -526,8 +528,10 @@ impl Config {
     pub fn save(&self) -> Result<()> {
         debug!("Saving config to NVS");
         let mut nvs_guard = NVS.lock().unwrap();
-        let nvs = nvs_guard.as_mut().ok_or_else(|| anyhow!("NVS not initialized"))?;
-        
+        let nvs = nvs_guard
+            .as_mut()
+            .ok_or_else(|| anyhow!("NVS not initialized"))?;
+
         let json = serde_json::to_vec(self)?;
         debug!("Config JSON size: {} bytes", json.len());
         nvs.set_blob(NVS_CONFIG_KEY, &json)?;

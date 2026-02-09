@@ -3,19 +3,18 @@ use esp_idf_hal::delay::FreeRtos;
 use esp_idf_hal::gpio::AnyIOPin;
 use esp_idf_hal::prelude::*;
 use esp_idf_svc::eventloop::EspSystemEventLoop;
-use esp_idf_svc::mdns::EspMdns;
-use esp_idf_svc::nvs::EspDefaultNvsPartition;
-use esp_idf_svc::netif::{EspNetif, NetifConfiguration, NetifStack};
-use esp_idf_svc::wifi::{
-    AccessPointConfiguration, AuthMethod, ClientConfiguration, Configuration,
-    EspWifi, WifiDriver,
-};
 use esp_idf_svc::ipv4::{
     self, ClientConfiguration as IpClientConfiguration, ClientSettings as IpClientSettings,
     Configuration as IpConfiguration, Ipv4Addr, Mask, Subnet,
 };
-use esp_idf_svc::sys::{gpio_pullup_en, gpio_set_pull_mode, gpio_pull_mode_t_GPIO_PULLUP_ONLY};
-use log::{debug, info, warn, error};
+use esp_idf_svc::mdns::EspMdns;
+use esp_idf_svc::netif::{EspNetif, NetifConfiguration, NetifStack};
+use esp_idf_svc::nvs::EspDefaultNvsPartition;
+use esp_idf_svc::sys::{gpio_pull_mode_t_GPIO_PULLUP_ONLY, gpio_pullup_en, gpio_set_pull_mode};
+use esp_idf_svc::wifi::{
+    AccessPointConfiguration, AuthMethod, ClientConfiguration, Configuration, EspWifi, WifiDriver,
+};
+use log::{debug, error, info, warn};
 use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -33,7 +32,7 @@ mod web_server;
 
 use crate::watchdog::WatchdogHandle;
 use config::Config;
-use obd2::{dongle_task, cache_manager_task, Obd2Proxy, CacheManagerSender, DongleSender};
+use obd2::{cache_manager_task, dongle_task, CacheManagerSender, DongleSender, Obd2Proxy};
 use rpm_leds::{rpm_led_task, LedController, RpmTaskSender};
 use sse_server::{sse_server_task, SseSender};
 
@@ -117,16 +116,18 @@ fn create_sta_netif(config: &Config) -> Result<EspNetif> {
         Ok(EspNetif::new(NetifStack::Sta)?)
     } else {
         // Parse static IP configuration
-        let ip: Ipv4Addr = config.ip.ip.parse().map_err(|_| {
-            anyhow::anyhow!("Invalid static IP: {}", config.ip.ip)
-        })?;
+        let ip: Ipv4Addr = config
+            .ip
+            .ip
+            .parse()
+            .map_err(|_| anyhow::anyhow!("Invalid static IP: {}", config.ip.ip))?;
         let mask = config.ip.prefix_len;
 
         info!("STA netif: Static IP {ip}/{mask} (no gateway)");
 
         let mut sta_config = NetifConfiguration::wifi_default_client();
-        sta_config.ip_configuration = Some(IpConfiguration::Client(
-            IpClientConfiguration::Fixed(IpClientSettings {
+        sta_config.ip_configuration = Some(IpConfiguration::Client(IpClientConfiguration::Fixed(
+            IpClientSettings {
                 ip,
                 subnet: Subnet {
                     gateway: Ipv4Addr::UNSPECIFIED,
@@ -134,8 +135,8 @@ fn create_sta_netif(config: &Config) -> Result<EspNetif> {
                 },
                 dns: None,
                 secondary_dns: None,
-            }),
-        ));
+            },
+        )));
         Ok(EspNetif::new_with_conf(&sta_config)?)
     }
 }
@@ -187,7 +188,11 @@ fn start_wifi(
     // Get STA credentials from config
     let sta_ssid = config.wifi.ssid.clone();
     let sta_password = config.wifi.password.clone().unwrap_or_default();
-    let sta_auth_method = if sta_password.is_empty() { AuthMethod::None } else { AuthMethod::WPA2Personal };
+    let sta_auth_method = if sta_password.is_empty() {
+        AuthMethod::None
+    } else {
+        AuthMethod::WPA2Personal
+    };
 
     // Determine AP password for config
     let ap_pw = ap_password.unwrap_or("");
@@ -268,8 +273,14 @@ fn init_encoder<PCNT: esp_idf_hal::pcnt::Pcnt>(
     // Configure pins with internal pull-ups (~45kΩ) for the encoder
     // SAFETY: We trust the user-configured GPIO pin numbers are valid
     unsafe {
-        gpio_set_pull_mode(i32::from(config.encoder_pin_a), gpio_pull_mode_t_GPIO_PULLUP_ONLY);
-        gpio_set_pull_mode(i32::from(config.encoder_pin_b), gpio_pull_mode_t_GPIO_PULLUP_ONLY);
+        gpio_set_pull_mode(
+            i32::from(config.encoder_pin_a),
+            gpio_pull_mode_t_GPIO_PULLUP_ONLY,
+        );
+        gpio_set_pull_mode(
+            i32::from(config.encoder_pin_b),
+            gpio_pull_mode_t_GPIO_PULLUP_ONLY,
+        );
         gpio_pullup_en(i32::from(config.encoder_pin_a));
         gpio_pullup_en(i32::from(config.encoder_pin_b));
     }
@@ -314,10 +325,19 @@ fn init_wifi(
     };
 
     // Start WiFi in Mixed mode
-    let wifi = start_wifi(config, wifi, &ap_ssid, ap_password.as_deref(), ap_auth_method)?;
+    let wifi = start_wifi(
+        config,
+        wifi,
+        &ap_ssid,
+        ap_password.as_deref(),
+        ap_auth_method,
+    )?;
 
     let ap_ip_info = wifi.ap_netif().get_ip_info()?;
-    info!("AP started - connect to '{ap_ssid}' and navigate to http://{}", ap_ip_info.ip);
+    info!(
+        "AP started - connect to '{ap_ssid}' and navigate to http://{}",
+        ap_ip_info.ip
+    );
 
     Ok((wifi, ap_ssid))
 }
@@ -443,8 +463,14 @@ fn main() -> Result<()> {
     esp_idf_svc::log::EspLogger::initialize_default();
 
     info!("Starting tachtalk firmware...");
-    info!("LWIP_MAX_SOCKETS: {}", esp_idf_svc::sys::CONFIG_LWIP_MAX_SOCKETS);
-    info!("Obd2Buffer size: {} bytes", std::mem::size_of::<obd2::Obd2Buffer>());
+    info!(
+        "LWIP_MAX_SOCKETS: {}",
+        esp_idf_svc::sys::CONFIG_LWIP_MAX_SOCKETS
+    );
+    info!(
+        "Obd2Buffer size: {} bytes",
+        std::mem::size_of::<obd2::Obd2Buffer>()
+    );
 
     let peripherals = Peripherals::take()?;
     let sys_loop = EspSystemEventLoop::take()?;
@@ -472,7 +498,7 @@ fn main() -> Result<()> {
         for _ in 0..5 {
             FreeRtos::delay_ms(1000);
         }
-        
+
         // Check config for debug dump settings
         let (dump_cpu, dump_sockets) = {
             let cfg = state.config.lock().unwrap();
@@ -484,7 +510,7 @@ fn main() -> Result<()> {
         if dump_sockets {
             web_server::log_sockets();
         }
-        
+
         // Print polling metrics
         let metrics = &state.polling_metrics;
         info!(
@@ -523,7 +549,7 @@ enum StaConnectionState {
 /// Always runs in Mixed mode (AP + STA) - AP is never disabled
 fn wifi_connection_manager(state: &Arc<State>) {
     let watchdog = WatchdogHandle::register(c"wifi_manager");
-    
+
     // Read STA SSID from config (cached at task start - changes require reboot)
     let sta_ssid = {
         let cfg_guard = state.config.lock().unwrap();
@@ -534,7 +560,7 @@ fn wifi_connection_manager(state: &Arc<State>) {
 
     loop {
         watchdog.feed();
-        
+
         let connection_state = {
             let wifi_guard = state.wifi.lock().unwrap();
             let l2_connected = match wifi_guard.is_connected() {
@@ -546,9 +572,7 @@ fn wifi_connection_manager(state: &Arc<State>) {
             };
             if l2_connected {
                 match wifi_guard.sta_netif().get_ip_info() {
-                    Ok(info) if !info.ip.is_unspecified() => {
-                        StaConnectionState::Connected(info.ip)
-                    }
+                    Ok(info) if !info.ip.is_unspecified() => StaConnectionState::Connected(info.ip),
                     Ok(_) => StaConnectionState::AwaitingIp,
                     Err(e) => {
                         error!("Failed to get STA IP info: {e}");
@@ -559,7 +583,7 @@ fn wifi_connection_manager(state: &Arc<State>) {
                 StaConnectionState::Disconnected
             }
         };
-        
+
         match connection_state {
             StaConnectionState::Connected(ip) => {
                 // Fully connected with IP - just monitor
@@ -579,9 +603,9 @@ fn wifi_connection_manager(state: &Arc<State>) {
                     warn!("WiFi STA disconnected from '{sta_ssid}'");
                     was_connected = false;
                 }
-                
+
                 debug!("Attempting to connect to '{sta_ssid}'...");
-                
+
                 // Initiate connection (non-blocking)
                 {
                     let mut wifi_guard = state.wifi.lock().unwrap();
@@ -589,12 +613,12 @@ fn wifi_connection_manager(state: &Arc<State>) {
                         debug!("STA connection initiation failed: {e:?}");
                     }
                 }
-                
+
                 // Wait for L2 connection or timeout (15s)
                 for _ in 0..15 {
                     watchdog.feed();
                     FreeRtos::delay_ms(1000);
-                    
+
                     let wifi_guard = state.wifi.lock().unwrap();
                     match wifi_guard.is_connected() {
                         Ok(true) => break,

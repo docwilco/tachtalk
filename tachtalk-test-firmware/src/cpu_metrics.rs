@@ -3,8 +3,8 @@
 //! Tracks per-task CPU time deltas and prints usage percentages.
 
 use esp_idf_sys::{
-    configNUM_CORES, esp_timer_get_time, uxTaskGetNumberOfTasks,
-    uxTaskGetSystemState, TaskStatus_t, UBaseType_t,
+    configNUM_CORES, esp_timer_get_time, uxTaskGetNumberOfTasks, uxTaskGetSystemState,
+    TaskStatus_t, UBaseType_t,
 };
 use log::info;
 use std::collections::HashMap;
