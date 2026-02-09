@@ -303,7 +303,7 @@ struct DongleState {
     stream: TcpStream,
     /// Whether the dongle supports the "1" repeat command (None = untested)
     supports_repeat: Option<bool>,
-    /// Last OBD2 command sent (base PID, without response count suffix)
+    /// Last wire command sent to the dongle (includes response count suffix if learned)
     last_command: Option<Obd2Buffer>,
     /// Learned response counts per PID (how many ECUs respond).
     /// On first request for a PID, we send without a count to learn it.
@@ -347,16 +347,28 @@ impl DongleState {
     ///
     /// On the first request for a PID, sends without a response count to learn
     /// how many ECUs respond. Subsequent requests append the learned count.
+    /// The repeat comparison uses the full wire command (including any count
+    /// suffix), so learning a count naturally forces a full resend.
     fn execute_with_repeat(
         &mut self,
         command: &Obd2Buffer,
         timeout: Duration,
     ) -> Result<Obd2Buffer, DongleError> {
+        let is_at = command.starts_with(b"AT");
+
+        // Build the wire command (may include learned response count)
+        let wire_cmd = if is_at {
+            command.clone()
+        } else {
+            self.build_wire_command(command)
+        };
+
         // Check if we can try repeat command optimization
-        // Only try if not proven unsupported, and same command as last
+        // Compare against the full wire command so that learning a count
+        // (e.g., "010C" → "010C 1") naturally forces a full resend.
         let can_try_repeat = self.supports_repeat != Some(false)
-            && self.last_command.as_ref() == Some(command)
-            && !command.starts_with(b"AT");
+            && self.last_command.as_ref() == Some(&wire_cmd)
+            && !is_at;
 
         if can_try_repeat {
             debug!("Trying repeat command");
@@ -369,8 +381,7 @@ impl DongleState {
                     // Repeat not supported, mark and resend full command
                     info!("Dongle does not support repeat command");
                     self.supports_repeat = Some(false);
-                    let wire_cmd = self.build_wire_command(command);
-                    self.last_command = Some(command.clone());
+                    self.last_command = Some(wire_cmd.clone());
                     let result = execute_command(&mut self.stream, &wire_cmd, timeout);
                     if let Ok(ref resp) = result {
                         self.learn_response_count(command, resp);
@@ -392,16 +403,9 @@ impl DongleState {
                 repeat_result
             }
         } else {
-            // Build wire command with response count if known
-            let wire_cmd = if command.starts_with(b"AT") {
-                command.clone()
-            } else {
-                self.build_wire_command(command)
-            };
-
             // Update last_command before sending
-            if !command.starts_with(b"AT") {
-                self.last_command = Some(command.clone());
+            if !is_at {
+                self.last_command = Some(wire_cmd.clone());
             }
             let result = execute_command(&mut self.stream, &wire_cmd, timeout);
             match &result {
