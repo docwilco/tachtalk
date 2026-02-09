@@ -197,6 +197,8 @@ fn get_pid_response(pid: &str, start_time: &Instant) -> Option<String> {
         "11" => Some("45".to_string()),       // Throttle: 27%
         "20" => Some("80000001".to_string()), // PIDs supported 21-40
         "40" => Some("FED08000".to_string()), // PIDs supported 41-60
+        #[allow(clippy::match_same_arms)] // Different PIDs, same value is coincidental
+        "49" => Some("45".to_string()),       // Accelerator pedal position D: 27%
         _ => None,
     }
 }
@@ -238,15 +240,8 @@ fn process_command(cmd: &str, start_time: &Instant, state: &mut ClientState) -> 
             // Check if response count is specified (e.g., "0C 1" has a space)
             // If no count specified, simulate adaptive timing wait
             let has_response_count = pid_data.contains(' ');
-            println!(
-                "  [debug] cmd={:?} effective={:?} pid_data={:?} pid_data_bytes={:?} has_count={}",
-                cmd, c, pid_data, pid_data.as_bytes(), has_response_count
-            );
             if !has_response_count {
-                println!("  [debug] No response count -> sleeping 200ms");
                 std::thread::sleep(Duration::from_millis(200));
-            } else {
-                println!("  [debug] Response count present -> no delay");
             }
 
             // Strip optional response count (e.g., "0C 1" -> "0C")
