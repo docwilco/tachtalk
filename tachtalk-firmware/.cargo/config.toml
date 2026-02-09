@@ -1,5 +1,9 @@
 [build]
 target = "xtensa-esp32s3-espidf"
+# Use a per-crate target dir instead of the workspace target dir, so that
+# switching between firmware crates doesn't trigger esp-idf-sys recompilation
+# (each has different sdkconfig and ESP_IDF_SYS_ROOT_CRATE settings).
+target-dir = "target"
 
 [target.xtensa-esp32s3-espidf]
 linker = "ldproxy"
