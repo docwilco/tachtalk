@@ -159,9 +159,6 @@ pub struct TestConfig {
     /// Port to listen on for proxy clients (mode 5)
     #[serde(default = "default_listen_port")]
     pub listen_port: u16,
-    /// Query mode
-    #[serde(default)]
-    pub query_mode: QueryMode,
     /// Fast PIDs to poll (comma-separated, e.g., "010C,0149")
     #[serde(default = "default_fast_pids")]
     pub fast_pids: String,
@@ -226,7 +223,6 @@ impl Default for TestConfig {
             dongle_ip: default_dongle_ip(),
             dongle_port: default_dongle_port(),
             listen_port: default_listen_port(),
-            query_mode: QueryMode::default(),
             fast_pids: default_fast_pids(),
             slow_pids: default_slow_pids(),
             pipeline_bytes: default_pipeline_bytes(),

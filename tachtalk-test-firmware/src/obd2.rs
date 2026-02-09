@@ -44,10 +44,10 @@ struct TestConfig {
 
 impl TestConfig {
     /// Take a snapshot of the current test configuration.
-    fn snapshot(state: &State) -> Self {
+    fn snapshot(state: &State, query_mode: QueryMode) -> Self {
         let cfg_guard = state.config.lock().unwrap();
         Self {
-            query_mode: cfg_guard.test.query_mode,
+            query_mode,
             dongle_ip: cfg_guard.test.dongle_ip.clone(),
             dongle_port: cfg_guard.test.dongle_port,
             timeout: Duration::from_millis(cfg_guard.test.obd2_timeout_ms),
@@ -141,7 +141,7 @@ impl TestContext<'_> {
                 info!("Stop command received");
                 Ok(true)
             }
-            Ok(TestControlMessage::Start) => {
+            Ok(TestControlMessage::Start(_)) => {
                 debug!("Ignoring start command while running");
                 Ok(false)
             }
@@ -307,9 +307,9 @@ pub fn test_task(state: &Arc<State>, control_rx: &std::sync::mpsc::Receiver<Test
 
         // Wait for start command
         match control_rx.recv_timeout(Duration::from_secs(1)) {
-            Ok(TestControlMessage::Start) => {
+            Ok(TestControlMessage::Start(query_mode)) => {
                 info!("Test start command received");
-                run_test(&ctx);
+                run_test(&ctx, query_mode);
             }
             Ok(TestControlMessage::Stop) => {
                 debug!("Stop command received while idle");
@@ -326,8 +326,8 @@ pub fn test_task(state: &Arc<State>, control_rx: &std::sync::mpsc::Receiver<Test
 }
 
 /// Run a test with the current configuration
-fn run_test(ctx: &TestContext) {
-    let config = TestConfig::snapshot(ctx.state);
+fn run_test(ctx: &TestContext, query_mode: QueryMode) {
+    let config = TestConfig::snapshot(ctx.state, query_mode);
 
     // Reset metrics
     ctx.state.metrics.reset();
@@ -634,7 +634,7 @@ fn run_capture_test(
 
         match listener.accept() {
             Ok((client_stream, client_addr)) => {
-                handle_capture_client(
+                let stopped = handle_capture_client(
                     ctx,
                     config,
                     client_stream,
@@ -642,6 +642,9 @@ fn run_capture_test(
                     capture_start,
                     &mut bytes_this_second,
                 );
+                if stopped {
+                    return Ok(());
+                }
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 std::thread::sleep(Duration::from_millis(10));
@@ -654,6 +657,8 @@ fn run_capture_test(
 }
 
 /// Handle a single client connection in capture mode.
+///
+/// Returns `true` if stop was requested, `false` if client disconnected normally.
 fn handle_capture_client(
     ctx: &TestContext,
     config: &TestConfig,
@@ -661,13 +666,13 @@ fn handle_capture_client(
     client_addr: std::net::SocketAddr,
     capture_start: Instant,
     bytes_this_second: &mut u32,
-) {
+) -> bool {
     let capture = config.capture;
 
     if ctx.state.metrics.client_connected.load(Ordering::Relaxed) {
         warn!("Rejecting connection from {client_addr}: already have a client");
         drop(client_stream);
-        return;
+        return false;
     }
 
     info!("Client connected from {client_addr}");
@@ -681,6 +686,7 @@ fn handle_capture_client(
 
     // Connect to dongle
     let dongle_addr = config.dongle_addr();
+    let mut stop_requested = false;
     match TcpStream::connect(&dongle_addr) {
         Ok(dongle_stream) => {
             ctx.state.dongle_connected.store(true, Ordering::Relaxed);
@@ -697,8 +703,9 @@ fn handle_capture_client(
 
             ctx.state.dongle_connected.store(false, Ordering::Relaxed);
 
-            if let Err(e) = result {
-                warn!("Proxy loop ended: {e}");
+            match result {
+                Ok(stopped) => stop_requested = stopped,
+                Err(e) => warn!("Proxy loop ended: {e}"),
             }
         }
         Err(e) => {
@@ -713,6 +720,8 @@ fn handle_capture_client(
         .client_connected
         .store(false, Ordering::Relaxed);
     info!("Client disconnected");
+
+    stop_requested
 }
 
 /// Record an event to the shared capture buffer in `State`.
@@ -781,7 +790,7 @@ fn proxy_loop(
     capture_start: Instant,
     capture: CaptureConfig,
     bytes_this_second: &mut u32,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     client.set_nonblocking(true).ok();
     dongle.set_nonblocking(true).ok();
 
@@ -792,14 +801,14 @@ fn proxy_loop(
         ctx.watchdog.feed();
 
         if ctx.check_stop()? {
-            return Ok(());
+            return Ok(true);
         }
 
         let mut activity = false;
 
         // Read from client, forward to dongle
         match client.read(&mut client_buf) {
-            Ok(0) => return Ok(()), // Client disconnected
+            Ok(0) => return Ok(false), // Client disconnected
             Ok(n) => {
                 activity = true;
                 let data = &client_buf[..n];

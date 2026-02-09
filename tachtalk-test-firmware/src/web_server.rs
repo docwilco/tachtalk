@@ -76,7 +76,6 @@ struct NetworkStatus {
 #[allow(clippy::struct_excessive_bools)] // JSON response struct — bools map directly to API fields
 struct TestStatus {
     test_running: bool,
-    query_mode: u8,
     requests_per_sec: u32,
     total_requests: u32,
     total_errors: u32,
@@ -297,8 +296,8 @@ fn register_config_routes(
         if let Ok(mut new_config) = serde_json::from_slice::<Config>(&buf[..bytes_read]) {
             new_config.validate();
             
-            debug!("Config update: query_mode={:?}, log_level={:?}", 
-                   new_config.test.query_mode, new_config.log_level);
+            debug!("Config update: log_level={:?}", 
+                   new_config.log_level);
             
             let needs_restart = {
                 let cfg_guard = state_clone.config.lock().unwrap();
@@ -342,11 +341,34 @@ fn register_test_routes(
 ) -> Result<()> {
     // POST test/start endpoint
     let state_clone = state.clone();
-    server.fn_handler("/api/test/start", Method::Post, move |req| -> Result<(), esp_idf_svc::io::EspIOError> {
+    server.fn_handler("/api/test/start", Method::Post, move |mut req| -> Result<(), esp_idf_svc::io::EspIOError> {
         info!("HTTP: POST /api/test/start");
-        
+
+        // Parse query mode from request body
+        let mut buf = [0u8; 256];
+        let bytes_read = req.read(&mut buf)?;
+        let query_mode = if bytes_read > 0 {
+            #[derive(serde::Deserialize)]
+            struct StartRequest {
+                query_mode: crate::config::QueryMode,
+            }
+            match serde_json::from_slice::<StartRequest>(&buf[..bytes_read]) {
+                Ok(parsed) => {
+                    info!("Start request with mode: {:?}", parsed.query_mode);
+                    parsed.query_mode
+                }
+                Err(e) => {
+                    warn!("Failed to parse start request body: {e}, using NoCount");
+                    crate::config::QueryMode::default()
+                }
+            }
+        } else {
+            warn!("No body in start request, using NoCount");
+            crate::config::QueryMode::default()
+        };
+
         if let Some(tx) = state_clone.test_control_tx.lock().unwrap().as_ref() {
-            if tx.send(TestControlMessage::Start).is_err() {
+            if tx.send(TestControlMessage::Start(query_mode)).is_err() {
                 warn!("Failed to send start command");
             }
         }
@@ -375,15 +397,9 @@ fn register_test_routes(
     server.fn_handler("/api/test/status", Method::Get, move |req| -> Result<(), esp_idf_svc::io::EspIOError> {
         debug!("HTTP: GET /api/test/status");
         
-        let query_mode = {
-            let cfg_guard = state_clone.config.lock().unwrap();
-            cfg_guard.test.query_mode as u8
-        };
-        
         let metrics = &state_clone.metrics;
         let status = TestStatus {
             test_running: metrics.test_running.load(Ordering::Relaxed),
-            query_mode,
             requests_per_sec: metrics.requests_per_sec.load(Ordering::Relaxed),
             total_requests: metrics.total_requests.load(Ordering::Relaxed),
             total_errors: metrics.total_errors.load(Ordering::Relaxed),

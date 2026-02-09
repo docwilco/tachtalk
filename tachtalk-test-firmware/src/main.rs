@@ -104,7 +104,7 @@ pub struct State {
 
 /// Messages to control the test task
 pub enum TestControlMessage {
-    Start,
+    Start(crate::config::QueryMode),
     Stop,
 }
 

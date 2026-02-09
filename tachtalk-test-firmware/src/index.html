@@ -197,11 +197,11 @@
             <div class="form-group">
                 <label>Query Mode:</label>
                 <select id="queryMode">
-                    <option value="0">1. NoCount (baseline)</option>
-                    <option value="1">2. AlwaysOne (append " 1")</option>
-                    <option value="2">3. AdaptiveCount (detect count)</option>
-                    <option value="3">4. Pipelined (multi-request)</option>
-                    <option value="4">5. RawCapture (TCP proxy)</option>
+                    <option value="no_count">1. NoCount (baseline)</option>
+                    <option value="always_one">2. AlwaysOne (append " 1")</option>
+                    <option value="adaptive_count">3. AdaptiveCount (detect count)</option>
+                    <option value="pipelined">4. Pipelined (multi-request)</option>
+                    <option value="raw_capture">5. RawCapture (TCP proxy)</option>
                 </select>
             </div>
             
@@ -326,15 +326,15 @@
                 <div class="form-group">
                     <label>On Overflow:</label>
                     <select id="captureOverflow">
-                        <option value="0">Stop capture</option>
-                        <option value="1">Wrap (lose oldest)</option>
+                        <option value="stop">Stop capture</option>
+                        <option value="wrap">Wrap (lose oldest)</option>
                     </select>
                 </div>
                 <div class="form-group">
                     <label>Response Count:</label>
                     <select id="responseCountMethod">
-                        <option value="0">Count "41" headers</option>
-                        <option value="1">Count lines</option>
+                        <option value="count_response_headers">Count "41" headers</option>
+                        <option value="count_lines">Count lines</option>
                     </select>
                 </div>
             </div>
@@ -391,10 +391,10 @@
             <div class="form-group">
                 <label>Log Level:</label>
                 <select id="logLevel">
-                    <option value="Error">Error</option>
-                    <option value="Warn">Warn</option>
-                    <option value="Info">Info</option>
-                    <option value="Debug">Debug</option>
+                    <option value="error">Error</option>
+                    <option value="warn">Warn</option>
+                    <option value="info">Info</option>
+                    <option value="debug">Debug</option>
                 </select>
             </div>
             <button onclick="rebootDevice()" class="danger">Reboot Device</button>
@@ -405,11 +405,11 @@
         let config = {};
         let eventSource = null;
         const modeDescriptions = {
-            0: "Send PIDs as-is without response count. Baseline for comparison - dongle uses adaptive timing (~200ms wait).",
-            1: "Append ' 1' to all requests to tell dongle to return after 1 ECU response. Should be faster than NoCount.",
-            2: "First request detects how many responses the ECU sends, then uses that count for subsequent requests.",
-            3: "Send multiple requests before waiting for responses. Configurable bytes on wire.",
-            4: "Pure TCP proxy mode. Records all traffic to PSRAM buffer for later download and analysis."
+            'no_count': "Send PIDs as-is without response count. Baseline for comparison - dongle uses adaptive timing (~200ms wait).",
+            'always_one': "Append ' 1' to all requests to tell dongle to return after 1 ECU response. Should be faster than NoCount.",
+            'adaptive_count': "First request detects how many responses the ECU sends, then uses that count for subsequent requests.",
+            'pipelined': "Send multiple requests before waiting for responses. Configurable bytes on wire.",
+            'raw_capture': "Pure TCP proxy mode. Records all traffic to PSRAM buffer for later download and analysis."
         };
 
         async function loadConfig() {
@@ -424,7 +424,7 @@
 
         function populateForm() {
             // Test config
-            document.getElementById('queryMode').value = config.test?.query_mode || 0;
+            document.getElementById('queryMode').value = config.test?.query_mode || 'no_count';
             document.getElementById('dongleIp').value = config.test?.dongle_ip || '192.168.0.10';
             document.getElementById('donglePort').value = config.test?.dongle_port || 35000;
             document.getElementById('obd2Timeout').value = config.test?.obd2_timeout_ms || 1000;
@@ -433,8 +433,8 @@
             document.getElementById('pipelineBytes').value = config.test?.pipeline_bytes || 32;
             document.getElementById('listenPort').value = config.test?.listen_port || 35000;
             document.getElementById('captureBuffer').value = (config.test?.capture_buffer_size || 4194304) / 1048576;
-            document.getElementById('captureOverflow').value = config.test?.capture_overflow || 0;
-            document.getElementById('responseCountMethod').value = config.test?.response_count_method || 0;
+            document.getElementById('captureOverflow').value = config.test?.capture_overflow || 'stop';
+            document.getElementById('responseCountMethod').value = config.test?.response_count_method || 'count_response_headers';
             
             // WiFi config
             document.getElementById('wifiSsid').value = config.wifi?.ssid || '';
@@ -444,20 +444,20 @@
             document.getElementById('prefixLen').value = config.ip?.prefix_len || 24;
             document.getElementById('apSsid').value = config.ap_ssid || 'TachTalk-Test';
             document.getElementById('apPassword').value = config.ap_password || '';
-            document.getElementById('logLevel').value = config.log_level || 'Info';
+            document.getElementById('logLevel').value = config.log_level || 'info';
             
             updateModeUI();
             updateDhcpUI();
         }
 
         function updateModeUI() {
-            const mode = parseInt(document.getElementById('queryMode').value);
+            const mode = document.getElementById('queryMode').value;
             document.getElementById('modeDescription').textContent = modeDescriptions[mode];
             
             // Show/hide mode-specific config
-            document.getElementById('pipelineConfig').classList.toggle('visible', mode === 3);
-            document.getElementById('captureConfig').classList.toggle('visible', mode === 4);
-            document.getElementById('captureMetrics').classList.toggle('visible', mode === 4);
+            document.getElementById('pipelineConfig').classList.toggle('visible', mode === 'pipelined');
+            document.getElementById('captureConfig').classList.toggle('visible', mode === 'raw_capture');
+            document.getElementById('captureMetrics').classList.toggle('visible', mode === 'raw_capture');
         }
 
         function updateDhcpUI() {
@@ -469,7 +469,6 @@
             const newConfig = {
                 ...config,
                 test: {
-                    query_mode: parseInt(document.getElementById('queryMode').value),
                     dongle_ip: document.getElementById('dongleIp').value,
                     dongle_port: parseInt(document.getElementById('donglePort').value),
                     obd2_timeout_ms: parseInt(document.getElementById('obd2Timeout').value),
@@ -478,8 +477,8 @@
                     pipeline_bytes: parseInt(document.getElementById('pipelineBytes').value),
                     listen_port: parseInt(document.getElementById('listenPort').value),
                     capture_buffer_size: parseInt(document.getElementById('captureBuffer').value) * 1048576,
-                    capture_overflow: parseInt(document.getElementById('captureOverflow').value),
-                    response_count_method: parseInt(document.getElementById('responseCountMethod').value)
+                    capture_overflow: document.getElementById('captureOverflow').value,
+                    response_count_method: document.getElementById('responseCountMethod').value
                 },
                 wifi: {
                     ssid: document.getElementById('wifiSsid').value,
@@ -531,7 +530,12 @@
 
         async function startTest() {
             try {
-                await fetch('/api/test/start', { method: 'POST' });
+                const queryMode = document.getElementById('queryMode').value;
+                await fetch('/api/test/start', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ query_mode: queryMode })
+                });
                 document.getElementById('startBtn').disabled = true;
                 document.getElementById('stopBtn').disabled = false;
             } catch (e) {
@@ -664,7 +668,7 @@
                 `${testRunning ? 'Running' : 'Stopped'}`;
             
             // Update capture metrics (Mode 5)
-            if (parseInt(document.getElementById('queryMode').value) === 4) {
+            if (document.getElementById('queryMode').value === 'raw_capture') {
                 document.getElementById('clientStatus').innerHTML = 
                     `<span class="status-indicator ${data.client_connected ? 'status-connected' : 'status-disconnected'}"></span>` +
                     `Client: ${data.client_connected ? 'Connected' : 'Disconnected'}`;
