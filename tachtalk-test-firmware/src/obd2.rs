@@ -28,30 +28,174 @@ const FAST_SLOW_RATIO: u32 = 6;
 /// Firmware version string for capture header
 const FIRMWARE_VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// Snapshot of test configuration taken at test start.
+struct TestConfig {
+    query_mode: QueryMode,
+    dongle_ip: String,
+    dongle_port: u16,
+    timeout: Duration,
+    fast_pids: Vec<String>,
+    slow_pids: Vec<String>,
+    pipeline_bytes: u16,
+    response_count_method: ResponseCountMethod,
+    listen_port: u16,
+    capture: CaptureConfig,
+}
+
+impl TestConfig {
+    /// Take a snapshot of the current test configuration.
+    fn snapshot(state: &State) -> Self {
+        let cfg_guard = state.config.lock().unwrap();
+        Self {
+            query_mode: cfg_guard.test.query_mode,
+            dongle_ip: cfg_guard.test.dongle_ip.clone(),
+            dongle_port: cfg_guard.test.dongle_port,
+            timeout: Duration::from_millis(cfg_guard.test.obd2_timeout_ms),
+            fast_pids: cfg_guard.test.get_fast_pids(),
+            slow_pids: cfg_guard.test.get_slow_pids(),
+            pipeline_bytes: cfg_guard.test.pipeline_bytes,
+            response_count_method: cfg_guard.test.response_count_method,
+            listen_port: cfg_guard.test.listen_port,
+            capture: CaptureConfig {
+                buffer_size: cfg_guard.test.capture_buffer_size,
+                overflow: cfg_guard.test.capture_overflow,
+            },
+        }
+    }
+
+    /// Format the dongle address as `ip:port`.
+    fn dongle_addr(&self) -> String {
+        format!("{}:{}", self.dongle_ip, self.dongle_port)
+    }
+}
+
+/// Capture buffer configuration.
+#[derive(Clone, Copy)]
+struct CaptureConfig {
+    buffer_size: u32,
+    overflow: CaptureOverflow,
+}
+
+/// Round-robin PID selector with configurable fast:slow ratio.
+struct PidSelector {
+    fast_index: usize,
+    slow_index: usize,
+    fast_count: u32,
+}
+
+/// Result of selecting the next PID.
+struct SelectedPid {
+    pid: String,
+    is_fast: bool,
+}
+
+impl PidSelector {
+    fn new() -> Self {
+        Self {
+            fast_index: 0,
+            slow_index: 0,
+            fast_count: 0,
+        }
+    }
+
+    /// Select the next PID using the fast:slow ratio.
+    ///
+    /// Returns `None` when both PID lists are empty.
+    fn next(&mut self, fast_pids: &[String], slow_pids: &[String]) -> Option<SelectedPid> {
+        if self.fast_count < FAST_SLOW_RATIO && !fast_pids.is_empty() {
+            self.fast_count += 1;
+            let pid = fast_pids[self.fast_index % fast_pids.len()].clone();
+            self.fast_index += 1;
+            Some(SelectedPid { pid, is_fast: true })
+        } else if !slow_pids.is_empty() {
+            self.fast_count = 0;
+            let pid = slow_pids[self.slow_index % slow_pids.len()].clone();
+            self.slow_index += 1;
+            Some(SelectedPid { pid, is_fast: false })
+        } else if !fast_pids.is_empty() {
+            self.fast_count = 0;
+            let pid = fast_pids[self.fast_index % fast_pids.len()].clone();
+            self.fast_index += 1;
+            Some(SelectedPid { pid, is_fast: true })
+        } else {
+            None
+        }
+    }
+}
+
+/// Runtime context passed to all test functions.
+struct TestContext<'a> {
+    state: &'a Arc<State>,
+    control_rx: &'a std::sync::mpsc::Receiver<TestControlMessage>,
+    watchdog: &'a WatchdogHandle,
+}
+
+impl TestContext<'_> {
+    /// Check the control channel for a stop command.
+    ///
+    /// Returns `Ok(true)` if stop was received, `Ok(false)` if no message or
+    /// start (ignored while running), and `Err` if the channel disconnected.
+    fn check_stop(&self) -> Result<bool, String> {
+        match self.control_rx.try_recv() {
+            Ok(TestControlMessage::Stop) => {
+                info!("Stop command received");
+                Ok(true)
+            }
+            Ok(TestControlMessage::Start) => {
+                debug!("Ignoring start command while running");
+                Ok(false)
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => Ok(false),
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                Err("Control channel disconnected".to_string())
+            }
+        }
+    }
+}
+
+/// Connect to the dongle, configure socket options, and run AT init commands.
+fn connect_dongle(config: &TestConfig) -> Result<TcpStream, String> {
+    let addr = config.dongle_addr();
+    info!("Connecting to dongle at {addr}...");
+
+    let mut stream = TcpStream::connect(&addr).map_err(|e| format!("Connect failed: {e}"))?;
+    stream.set_read_timeout(Some(config.timeout)).ok();
+    stream.set_nodelay(true).ok();
+
+    init_dongle(&mut stream, config.timeout)?;
+    info!("Dongle initialized");
+    Ok(stream)
+}
+
 /// Build a [`CaptureHeader`] from the current device state.
-#[allow(clippy::cast_possible_truncation)]
 pub fn build_capture_header(state: &State) -> [u8; HEADER_SIZE] {
-    let mut header = CaptureHeader::new();
+    let record_count = state.metrics.records_captured.load(Ordering::Relaxed);
+    let data_length = state.metrics.bytes_captured.load(Ordering::Relaxed);
 
-    header.record_count = state.metrics.records_captured.load(Ordering::Relaxed);
-    header.data_length = state.metrics.bytes_captured.load(Ordering::Relaxed);
-    header.uptime_ms = state.capture_start_uptime_ms.load(Ordering::Relaxed);
-
-    // Dongle IP and port from config
-    {
+    let (dongle_ip, dongle_port) = {
         let cfg_guard = state.config.lock().unwrap();
         let ip: std::net::Ipv4Addr = cfg_guard
             .test
             .dongle_ip
             .parse()
             .unwrap_or(std::net::Ipv4Addr::UNSPECIFIED);
-        header.dongle_ip = ip.octets();
-        header.dongle_port = cfg_guard.test.dongle_port;
-    }
+        (ip.octets(), cfg_guard.test.dongle_port)
+    };
 
-    if state.metrics.capture_overflow.load(Ordering::Relaxed) {
-        header.flags |= FLAG_OVERFLOW;
-    }
+    let flags = if state.metrics.capture_overflow.load(Ordering::Relaxed) {
+        FLAG_OVERFLOW
+    } else {
+        0
+    };
+
+    let mut header = CaptureHeader {
+        record_count,
+        data_length,
+        dongle_ip,
+        dongle_port,
+        flags,
+        ..CaptureHeader::default()
+    };
 
     header.set_firmware_version(FIRMWARE_VERSION);
 
@@ -129,14 +273,13 @@ fn init_dongle(stream: &mut TcpStream, timeout: Duration) -> Result<(), String> 
 }
 
 /// Count responses in a dongle response using the configured method
-#[allow(clippy::cast_possible_truncation)]
 fn count_responses(response: &[u8], method: ResponseCountMethod) -> u8 {
     let response_str = String::from_utf8_lossy(response);
 
-    match method {
+    let count = match method {
         ResponseCountMethod::CountResponseHeaders => {
             // Count occurrences of "41" (Mode 01 response header)
-            response_str.matches("41").count() as u8
+            response_str.matches("41").count()
         }
         ResponseCountMethod::CountLines => {
             // Count non-empty lines before ">"
@@ -146,14 +289,16 @@ fn count_responses(response: &[u8], method: ResponseCountMethod) -> u8 {
                     let trimmed = line.trim();
                     !trimmed.is_empty() && !trimmed.contains('>')
                 })
-                .count() as u8
+                .count()
         }
-    }
+    };
+    u8::try_from(count).expect("response count fits in u8")
 }
 
 /// Main test task — handles all query modes
 pub fn test_task(state: &Arc<State>, control_rx: &std::sync::mpsc::Receiver<TestControlMessage>) {
-    let watchdog = WatchdogHandle::register("test_task");
+    let watchdog = WatchdogHandle::register(c"test_task");
+    let ctx = TestContext { state, control_rx, watchdog: &watchdog };
 
     info!("Test task started, waiting for commands...");
 
@@ -164,7 +309,7 @@ pub fn test_task(state: &Arc<State>, control_rx: &std::sync::mpsc::Receiver<Test
         match control_rx.recv_timeout(Duration::from_secs(1)) {
             Ok(TestControlMessage::Start) => {
                 info!("Test start command received");
-                run_test(state, control_rx, &watchdog);
+                run_test(&ctx);
             }
             Ok(TestControlMessage::Stop) => {
                 debug!("Stop command received while idle");
@@ -181,84 +326,30 @@ pub fn test_task(state: &Arc<State>, control_rx: &std::sync::mpsc::Receiver<Test
 }
 
 /// Run a test with the current configuration
-fn run_test(
-    state: &Arc<State>,
-    control_rx: &std::sync::mpsc::Receiver<TestControlMessage>,
-    watchdog: &WatchdogHandle,
-) {
-    // Get config snapshot
-    let (query_mode, dongle_ip, dongle_port, timeout, fast_pids, slow_pids, pipeline_bytes, response_count_method, listen_port, capture_buffer_size, capture_overflow) = {
-        let cfg_guard = state.config.lock().unwrap();
-        (
-            cfg_guard.test.query_mode,
-            cfg_guard.test.dongle_ip.clone(),
-            cfg_guard.test.dongle_port,
-            Duration::from_millis(cfg_guard.test.obd2_timeout_ms),
-            cfg_guard.test.get_fast_pids(),
-            cfg_guard.test.get_slow_pids(),
-            cfg_guard.test.pipeline_bytes,
-            cfg_guard.test.response_count_method,
-            cfg_guard.test.listen_port,
-            cfg_guard.test.capture_buffer_size,
-            cfg_guard.test.capture_overflow,
-        )
-    };
+fn run_test(ctx: &TestContext) {
+    let config = TestConfig::snapshot(ctx.state);
 
     // Reset metrics
-    state.metrics.reset();
-    state.metrics.test_running.store(true, Ordering::Relaxed);
+    ctx.state.metrics.reset();
+    ctx.state.metrics.test_running.store(true, Ordering::Relaxed);
 
-    // Record uptime at start (ms since boot)
-    // Use esp_timer_get_time for absolute uptime since boot
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let uptime_ms = unsafe { esp_idf_svc::sys::esp_timer_get_time() / 1000 } as u32;
-    state
-        .capture_start_uptime_ms
-        .store(uptime_ms, Ordering::Relaxed);
+    info!("Starting test with mode {:?}", config.query_mode);
+    info!("Fast PIDs: {:?}, Slow PIDs: {:?}", config.fast_pids, config.slow_pids);
 
-    info!("Starting test with mode {query_mode:?}");
-    info!("Fast PIDs: {fast_pids:?}, Slow PIDs: {slow_pids:?}");
-
-    let result = match query_mode {
+    let result = match config.query_mode {
         QueryMode::NoCount | QueryMode::AlwaysOne | QueryMode::AdaptiveCount => {
-            run_polling_test(
-                state,
-                control_rx,
-                watchdog,
-                query_mode,
-                &dongle_ip,
-                dongle_port,
-                timeout,
-                &fast_pids,
-                &slow_pids,
-                response_count_method,
-            )
+            run_polling_test(ctx, &config)
         }
-        QueryMode::Pipelined => run_pipelined_test(
-            state,
-            control_rx,
-            watchdog,
-            &dongle_ip,
-            dongle_port,
-            timeout,
-            &fast_pids,
-            &slow_pids,
-            pipeline_bytes,
-        ),
-        QueryMode::RawCapture => run_capture_test(
-            state,
-            control_rx,
-            watchdog,
-            &dongle_ip,
-            dongle_port,
-            listen_port,
-            capture_buffer_size,
-            capture_overflow,
-        ),
+        QueryMode::Pipelined => {
+            run_pipelined_test(ctx, &config)
+        }
+        QueryMode::RawCapture => {
+            run_capture_test(ctx, &config)
+        }
     };
 
-    state.metrics.test_running.store(false, Ordering::Relaxed);
-    state.dongle_connected.store(false, Ordering::Relaxed);
+    ctx.state.metrics.test_running.store(false, Ordering::Relaxed);
+    ctx.state.dongle_connected.store(false, Ordering::Relaxed);
 
     match result {
         Ok(()) => info!("Test completed normally"),
@@ -267,66 +358,31 @@ fn run_test(
 }
 
 /// Run polling test (modes 1-3)
-#[allow(clippy::too_many_arguments)]
 fn run_polling_test(
-    state: &Arc<State>,
-    control_rx: &std::sync::mpsc::Receiver<TestControlMessage>,
-    watchdog: &WatchdogHandle,
-    query_mode: QueryMode,
-    dongle_ip: &str,
-    dongle_port: u16,
-    timeout: Duration,
-    fast_pids: &[String],
-    slow_pids: &[String],
-    response_count_method: ResponseCountMethod,
+    ctx: &TestContext,
+    config: &TestConfig,
 ) -> Result<(), String> {
-    // Connect to dongle
-    let addr = format!("{dongle_ip}:{dongle_port}");
-    info!("Connecting to dongle at {addr}...");
-
-    let mut stream = TcpStream::connect(&addr).map_err(|e| format!("Connect failed: {e}"))?;
-    stream.set_read_timeout(Some(timeout)).ok();
-    stream.set_nodelay(true).ok();
-
-    state.dongle_connected.store(true, Ordering::Relaxed);
-    info!("Connected to dongle");
-
-    // Initialize dongle
-    init_dongle(&mut stream, timeout)?;
-    info!("Dongle initialized");
+    let mut stream = connect_dongle(config)?;
+    ctx.state.dongle_connected.store(true, Ordering::Relaxed);
 
     // For `AdaptiveCount` mode, track response counts per PID
     let mut pid_response_counts: std::collections::HashMap<String, u8> =
         std::collections::HashMap::new();
 
-    let mut fast_index = 0usize;
-    let mut slow_index = 0usize;
-    let mut fast_count = 0u32;
-
+    let mut pid_selector = PidSelector::new();
     let mut last_second = Instant::now();
     let mut requests_this_second = 0u32;
 
     loop {
-        watchdog.feed();
+        ctx.watchdog.feed();
 
-        // Check for stop command (non-blocking)
-        match control_rx.try_recv() {
-            Ok(TestControlMessage::Stop) => {
-                info!("Stop command received");
-                return Ok(());
-            }
-            Ok(TestControlMessage::Start) => {
-                debug!("Ignoring start command while running");
-            }
-            Err(std::sync::mpsc::TryRecvError::Empty) => {}
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                return Err("Control channel disconnected".to_string());
-            }
+        if ctx.check_stop()? {
+            return Ok(());
         }
 
         // Update requests/sec metric
         if last_second.elapsed() >= Duration::from_secs(1) {
-            state
+            ctx.state
                 .metrics
                 .requests_per_sec
                 .store(requests_this_second, Ordering::Relaxed);
@@ -335,73 +391,58 @@ fn run_polling_test(
         }
 
         // Select PID to poll (6:1 fast:slow ratio)
-        let (pid, is_fast) = if fast_count < FAST_SLOW_RATIO && !fast_pids.is_empty() {
-            fast_count += 1;
-            let pid = &fast_pids[fast_index % fast_pids.len()];
-            fast_index += 1;
-            (pid.clone(), true)
-        } else if !slow_pids.is_empty() {
-            fast_count = 0;
-            let pid = &slow_pids[slow_index % slow_pids.len()];
-            slow_index += 1;
-            (pid.clone(), false)
-        } else if !fast_pids.is_empty() {
-            fast_count = 0;
-            let pid = &fast_pids[fast_index % fast_pids.len()];
-            fast_index += 1;
-            (pid.clone(), true)
-        } else {
+        let Some(selected) = pid_selector.next(&config.fast_pids, &config.slow_pids) else {
             // No PIDs configured, sleep and continue
             std::thread::sleep(Duration::from_millis(100));
             continue;
         };
 
         // Build command based on mode
-        let command = match query_mode {
-            QueryMode::NoCount => pid.clone(),
-            QueryMode::AlwaysOne => format!("{pid} 1"),
+        let command = match config.query_mode {
+            QueryMode::NoCount => selected.pid.clone(),
+            QueryMode::AlwaysOne => format!("{} 1", selected.pid),
             QueryMode::AdaptiveCount => {
-                if let Some(&count) = pid_response_counts.get(&pid) {
-                    format!("{pid} {count}")
+                if let Some(&count) = pid_response_counts.get(&selected.pid) {
+                    format!("{} {count}", selected.pid)
                 } else {
                     // First request for this PID — send without count to detect
-                    pid.clone()
+                    selected.pid.clone()
                 }
             }
             _ => unreachable!(),
         };
 
         // Execute command
-        let result = execute_command(&mut stream, command.as_bytes(), timeout);
+        let result = execute_command(&mut stream, command.as_bytes(), config.timeout);
 
         match result {
             Ok(response) => {
                 // For `AdaptiveCount`, learn the response count on first request
-                if query_mode == QueryMode::AdaptiveCount
-                    && !pid_response_counts.contains_key(&pid)
+                if config.query_mode == QueryMode::AdaptiveCount
+                    && !pid_response_counts.contains_key(&selected.pid)
                 {
-                    let count = count_responses(&response, response_count_method);
+                    let count = count_responses(&response, config.response_count_method);
                     if count > 0 {
-                        info!("Learned response count for {pid}: {count}");
-                        pid_response_counts.insert(pid.clone(), count);
+                        info!("Learned response count for {}: {count}", selected.pid);
+                        pid_response_counts.insert(selected.pid.clone(), count);
                     }
                 }
 
-                state
+                ctx.state
                     .metrics
                     .total_requests
                     .fetch_add(1, Ordering::Relaxed);
                 requests_this_second += 1;
 
-                debug!("Got response for {pid} (fast={is_fast})");
+                debug!("Got response for {} (fast={})", selected.pid, selected.is_fast);
             }
             Err(e) => {
-                warn!("Request failed for {pid}: {e}");
-                state.metrics.total_errors.fetch_add(1, Ordering::Relaxed);
+                warn!("Request failed for {}: {e}", selected.pid);
+                ctx.state.metrics.total_errors.fetch_add(1, Ordering::Relaxed);
 
                 // On disconnect, try to reconnect
                 if e.contains("Disconnect") {
-                    state.dongle_connected.store(false, Ordering::Relaxed);
+                    ctx.state.dongle_connected.store(false, Ordering::Relaxed);
                     return Err(e);
                 }
             }
@@ -410,38 +451,14 @@ fn run_polling_test(
 }
 
 /// Run pipelined test (mode 4)
-#[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_lines)]
 fn run_pipelined_test(
-    state: &Arc<State>,
-    control_rx: &std::sync::mpsc::Receiver<TestControlMessage>,
-    watchdog: &WatchdogHandle,
-    dongle_ip: &str,
-    dongle_port: u16,
-    timeout: Duration,
-    fast_pids: &[String],
-    slow_pids: &[String],
-    pipeline_bytes: u16,
+    ctx: &TestContext,
+    config: &TestConfig,
 ) -> Result<(), String> {
-    // Connect to dongle
-    let addr = format!("{dongle_ip}:{dongle_port}");
-    info!("Connecting to dongle at {addr}...");
+    let mut stream = connect_dongle(config)?;
+    ctx.state.dongle_connected.store(true, Ordering::Relaxed);
 
-    let mut stream = TcpStream::connect(&addr).map_err(|e| format!("Connect failed: {e}"))?;
-    stream.set_read_timeout(Some(timeout)).ok();
-    stream.set_nodelay(true).ok();
-
-    state.dongle_connected.store(true, Ordering::Relaxed);
-    info!("Connected to dongle");
-
-    // Initialize dongle
-    init_dongle(&mut stream, timeout)?;
-    info!("Dongle initialized");
-
-    let mut fast_index = 0usize;
-    let mut slow_index = 0usize;
-    let mut fast_count = 0u32;
-
+    let mut pid_selector = PidSelector::new();
     let mut last_second = Instant::now();
     let mut requests_this_second = 0u32;
 
@@ -450,23 +467,15 @@ fn run_pipelined_test(
     let mut bytes_on_wire = 0u16;
 
     loop {
-        watchdog.feed();
+        ctx.watchdog.feed();
 
-        // Check for stop command
-        match control_rx.try_recv() {
-            Ok(TestControlMessage::Stop) => {
-                info!("Stop command received");
-                return Ok(());
-            }
-            Ok(TestControlMessage::Start) | Err(std::sync::mpsc::TryRecvError::Empty) => {}
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                return Err("Control channel disconnected".to_string());
-            }
+        if ctx.check_stop()? {
+            return Ok(());
         }
 
         // Update requests/sec
         if last_second.elapsed() >= Duration::from_secs(1) {
-            state
+            ctx.state
                 .metrics
                 .requests_per_sec
                 .store(requests_this_second, Ordering::Relaxed);
@@ -475,83 +484,35 @@ fn run_pipelined_test(
         }
 
         // Send commands until we hit the pipeline limit
-        while bytes_on_wire < pipeline_bytes {
-            // Select next PID
-            let pid = if fast_count < FAST_SLOW_RATIO && !fast_pids.is_empty() {
-                fast_count += 1;
-                let pid = &fast_pids[fast_index % fast_pids.len()];
-                fast_index += 1;
-                pid.clone()
-            } else if !slow_pids.is_empty() {
-                fast_count = 0;
-                let pid = &slow_pids[slow_index % slow_pids.len()];
-                slow_index += 1;
-                pid.clone()
-            } else if !fast_pids.is_empty() {
-                fast_count = 0;
-                let pid = &fast_pids[fast_index % fast_pids.len()];
-                fast_index += 1;
-                pid.clone()
-            } else {
+        while bytes_on_wire < config.pipeline_bytes {
+            let Some(selected) = pid_selector.next(&config.fast_pids, &config.slow_pids) else {
                 break;
             };
 
             // Send command with ` 1` for fast response
-            let command = format!("{pid} 1\r");
+            let command = format!("{} 1\r", selected.pid);
+            // Hot path: OBD2 commands are short strings, always fits u16
             #[allow(clippy::cast_possible_truncation)]
             let cmd_len = command.len() as u16;
 
             if let Err(e) = stream.write_all(command.as_bytes()) {
-                state.dongle_connected.store(false, Ordering::Relaxed);
+                ctx.state.dongle_connected.store(false, Ordering::Relaxed);
                 return Err(format!("Write error: {e}"));
             }
 
-            pending_commands.push(pid);
+            pending_commands.push(selected.pid);
             bytes_on_wire += cmd_len;
         }
 
         // Read responses for pending commands
         if !pending_commands.is_empty() {
-            let mut buffer = [0u8; 256];
-            let mut response_buf = Vec::new();
-
-            // Read until we have responses for all pending commands
-            let start = Instant::now();
-            #[allow(clippy::naive_bytecount)]
-            while response_buf.iter().filter(|&&b| b == b'>').count() < pending_commands.len() {
-                if start.elapsed() > timeout {
-                    #[allow(clippy::cast_possible_truncation)]
-                    let pending = pending_commands.len() as u32;
-                    state.metrics.total_errors.fetch_add(
-                        pending,
-                        Ordering::Relaxed,
-                    );
-                    pending_commands.clear();
-                    break;
-                }
-
-                match stream.read(&mut buffer) {
-                    Ok(0) => {
-                        state.dongle_connected.store(false, Ordering::Relaxed);
-                        return Err("Disconnected".to_string());
-                    }
-                    Ok(n) => {
-                        response_buf.extend_from_slice(&buffer[..n]);
-                    }
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        std::thread::sleep(Duration::from_millis(1));
-                    }
-                    Err(e) => {
-                        state.dongle_connected.store(false, Ordering::Relaxed);
-                        return Err(format!("Read error: {e}"));
-                    }
-                }
-            }
-
-            // Count successful responses
-            #[allow(clippy::naive_bytecount, clippy::cast_possible_truncation)]
-            let response_count = response_buf.iter().filter(|&&b| b == b'>').count() as u32;
-            state
+            let response_count = read_pipelined_responses(
+                &mut stream,
+                ctx.state,
+                &pending_commands,
+                config.timeout,
+            )?;
+            ctx.state
                 .metrics
                 .total_requests
                 .fetch_add(response_count, Ordering::Relaxed);
@@ -563,61 +524,98 @@ fn run_pipelined_test(
     }
 }
 
+/// Read responses for a batch of pipelined commands.
+///
+/// Returns the number of successful responses (prompt characters received).
+fn read_pipelined_responses(
+    stream: &mut TcpStream,
+    state: &State,
+    pending_commands: &[String],
+    timeout: Duration,
+) -> Result<u32, String> {
+    let mut buffer = [0u8; 256];
+    let mut response_buf = Vec::new();
+
+    let start = Instant::now();
+    // bytecount crate has no Xtensa support, would fall back to same loop
+    #[allow(clippy::naive_bytecount)]
+    while response_buf.iter().filter(|&&b| b == b'>').count() < pending_commands.len() {
+        if start.elapsed() > timeout {
+            // Hot path: pending_commands is small, always fits u32
+            #[allow(clippy::cast_possible_truncation)]
+            let pending = pending_commands.len() as u32;
+            state
+                .metrics
+                .total_errors
+                .fetch_add(pending, Ordering::Relaxed);
+            return Ok(0);
+        }
+
+        match stream.read(&mut buffer) {
+            Ok(0) => {
+                state.dongle_connected.store(false, Ordering::Relaxed);
+                return Err("Disconnected".to_string());
+            }
+            Ok(n) => {
+                response_buf.extend_from_slice(&buffer[..n]);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Err(e) => {
+                state.dongle_connected.store(false, Ordering::Relaxed);
+                return Err(format!("Read error: {e}"));
+            }
+        }
+    }
+
+    // bytecount crate has no Xtensa support, would fall back to same loop
+    // Hot path: response count per batch, always fits u32
+    #[allow(clippy::naive_bytecount, clippy::cast_possible_truncation)]
+    let response_count = response_buf.iter().filter(|&&b| b == b'>').count() as u32;
+    Ok(response_count)
+}
+
 /// Run capture test (mode 5) — pure TCP proxy with PSRAM recording.
 ///
 /// The capture buffer lives in `state.capture_buffer` so the web server
 /// can read it for download and clear it.
-#[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_lines)]
 fn run_capture_test(
-    state: &Arc<State>,
-    control_rx: &std::sync::mpsc::Receiver<TestControlMessage>,
-    watchdog: &WatchdogHandle,
-    dongle_ip: &str,
-    dongle_port: u16,
-    listen_port: u16,
-    capture_buffer_size: u32,
-    capture_overflow: CaptureOverflow,
+    ctx: &TestContext,
+    config: &TestConfig,
 ) -> Result<(), String> {
-    info!("Starting capture mode, listening on port {listen_port}...");
+    let capture = config.capture;
+    info!("Starting capture mode, listening on port {}...", config.listen_port);
 
     // Pre-allocate the shared capture buffer (large alloc → PSRAM via CONFIG_SPIRAM_USE_MALLOC)
     {
-        let mut buf_guard = state.capture_buffer.lock().unwrap();
+        let mut buf_guard = ctx.state.capture_buffer.lock().unwrap();
         buf_guard.clear();
-        buf_guard.reserve(capture_buffer_size as usize);
+        buf_guard.reserve(capture.buffer_size as usize);
     }
 
     let capture_start = Instant::now();
 
     // Start listening for client connections
-    let listener = TcpListener::bind(format!("0.0.0.0:{listen_port}"))
+    let listener = TcpListener::bind(format!("0.0.0.0:{}", config.listen_port))
         .map_err(|e| format!("Failed to bind listener: {e}"))?;
     listener.set_nonblocking(true).ok();
 
-    info!("Listening for proxy clients on port {listen_port}");
+    info!("Listening for proxy clients on port {}", config.listen_port);
 
     let mut last_second = Instant::now();
     let mut bytes_this_second = 0u32;
 
     loop {
-        watchdog.feed();
+        ctx.watchdog.feed();
 
-        // Check for stop command
-        match control_rx.try_recv() {
-            Ok(TestControlMessage::Stop) => {
-                info!("Stop command received");
-                return Ok(());
-            }
-            Ok(TestControlMessage::Start) | Err(std::sync::mpsc::TryRecvError::Empty) => {}
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                return Err("Control channel disconnected".to_string());
-            }
+        if ctx.check_stop()? {
+            return Ok(());
         }
 
         // Update bytes/sec
         if last_second.elapsed() >= Duration::from_secs(1) {
-            state
+            ctx.state
                 .metrics
                 .requests_per_sec
                 .store(bytes_this_second, Ordering::Relaxed);
@@ -625,86 +623,25 @@ fn run_capture_test(
             last_second = Instant::now();
 
             // Update buffer usage
-            let buf_len = state.capture_buffer.lock().unwrap().len() as u64;
-            #[allow(clippy::cast_possible_truncation)]
-            let usage_pct = (buf_len * 100 / u64::from(capture_buffer_size)) as u32;
-            state
+            let buf_len = ctx.state.capture_buffer.lock().unwrap().len() as u64;
+            let usage_pct = u32::try_from(buf_len * 100 / u64::from(capture.buffer_size))
+                .expect("percentage fits in u32");
+            ctx.state
                 .metrics
                 .buffer_usage_pct
                 .store(usage_pct, Ordering::Relaxed);
         }
 
-        // Accept client connection
         match listener.accept() {
             Ok((client_stream, client_addr)) => {
-                if state.metrics.client_connected.load(Ordering::Relaxed) {
-                    // Already have a client, reject
-                    warn!("Rejecting connection from {client_addr}: already have a client");
-                    drop(client_stream);
-                    continue;
-                }
-
-                info!("Client connected from {client_addr}");
-                state
-                    .metrics
-                    .client_connected
-                    .store(true, Ordering::Relaxed);
-
-                // Record connect event
-                record_event(
-                    state,
-                    capture_start.elapsed(),
-                    RecordType::Connect,
-                    &[],
-                    capture_buffer_size,
-                    capture_overflow,
+                handle_capture_client(
+                    ctx,
+                    config,
+                    client_stream,
+                    client_addr,
+                    capture_start,
+                    &mut bytes_this_second,
                 );
-
-                // Connect to dongle
-                let dongle_addr = format!("{dongle_ip}:{dongle_port}");
-                match TcpStream::connect(&dongle_addr) {
-                    Ok(dongle_stream) => {
-                        state.dongle_connected.store(true, Ordering::Relaxed);
-                        info!("Connected to dongle at {dongle_addr}");
-
-                        // Run proxy loop
-                        let result = proxy_loop(
-                            state,
-                            control_rx,
-                            watchdog,
-                            client_stream,
-                            dongle_stream,
-                            capture_start,
-                            capture_buffer_size,
-                            capture_overflow,
-                            &mut bytes_this_second,
-                        );
-
-                        state.dongle_connected.store(false, Ordering::Relaxed);
-
-                        if let Err(e) = result {
-                            warn!("Proxy loop ended: {e}");
-                        }
-                    }
-                    Err(e) => {
-                        warn!("Failed to connect to dongle: {e}");
-                    }
-                }
-
-                // Record disconnect event
-                record_event(
-                    state,
-                    capture_start.elapsed(),
-                    RecordType::Disconnect,
-                    &[],
-                    capture_buffer_size,
-                    capture_overflow,
-                );
-                state
-                    .metrics
-                    .client_connected
-                    .store(false, Ordering::Relaxed);
-                info!("Client disconnected");
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 std::thread::sleep(Duration::from_millis(10));
@@ -716,6 +653,68 @@ fn run_capture_test(
     }
 }
 
+/// Handle a single client connection in capture mode.
+fn handle_capture_client(
+    ctx: &TestContext,
+    config: &TestConfig,
+    client_stream: TcpStream,
+    client_addr: std::net::SocketAddr,
+    capture_start: Instant,
+    bytes_this_second: &mut u32,
+) {
+    let capture = config.capture;
+
+    if ctx.state.metrics.client_connected.load(Ordering::Relaxed) {
+        warn!("Rejecting connection from {client_addr}: already have a client");
+        drop(client_stream);
+        return;
+    }
+
+    info!("Client connected from {client_addr}");
+    ctx.state
+        .metrics
+        .client_connected
+        .store(true, Ordering::Relaxed);
+
+    // Record connect event
+    record_event(ctx.state, capture_start.elapsed(), RecordType::Connect, &[], capture);
+
+    // Connect to dongle
+    let dongle_addr = config.dongle_addr();
+    match TcpStream::connect(&dongle_addr) {
+        Ok(dongle_stream) => {
+            ctx.state.dongle_connected.store(true, Ordering::Relaxed);
+            info!("Connected to dongle at {dongle_addr}");
+
+            let result = proxy_loop(
+                ctx,
+                client_stream,
+                dongle_stream,
+                capture_start,
+                capture,
+                bytes_this_second,
+            );
+
+            ctx.state.dongle_connected.store(false, Ordering::Relaxed);
+
+            if let Err(e) = result {
+                warn!("Proxy loop ended: {e}");
+            }
+        }
+        Err(e) => {
+            warn!("Failed to connect to dongle: {e}");
+        }
+    }
+
+    // Record disconnect event
+    record_event(ctx.state, capture_start.elapsed(), RecordType::Disconnect, &[], capture);
+    ctx.state
+        .metrics
+        .client_connected
+        .store(false, Ordering::Relaxed);
+    info!("Client disconnected");
+}
+
 /// Record an event to the shared capture buffer in `State`.
 ///
 /// Acquires the capture buffer lock briefly to append a single record.
@@ -724,16 +723,15 @@ fn record_event(
     elapsed: Duration,
     record_type: RecordType,
     data: &[u8],
-    max_size: u32,
-    overflow: CaptureOverflow,
+    capture: CaptureConfig,
 ) {
     let record_size = RECORD_HEADER_SIZE + data.len();
 
     let mut buf_guard = state.capture_buffer.lock().unwrap();
 
     // Check for overflow
-    if buf_guard.len() + record_size > max_size as usize {
-        match overflow {
+    if buf_guard.len() + record_size > capture.buffer_size as usize {
+        match capture.overflow {
             CaptureOverflow::Stop => {
                 if !state.metrics.capture_overflow.load(Ordering::Relaxed) {
                     warn!("Capture buffer full, stopping capture");
@@ -754,10 +752,12 @@ fn record_event(
     }
 
     // Write record
+    // Hot path: wraps after ~49 days, acceptable for relative timestamps
     #[allow(clippy::cast_possible_truncation)]
     let timestamp_ms = elapsed.as_millis() as u32;
     buf_guard.extend_from_slice(&timestamp_ms.to_le_bytes());
     buf_guard.push(record_type as u8);
+    // Hot path: data comes from 1024-byte TCP read buffers, always fits u16
     #[allow(clippy::cast_possible_truncation)]
     let len = data.len() as u16;
     buf_guard.extend_from_slice(&len.to_le_bytes());
@@ -767,22 +767,19 @@ fn record_event(
         .metrics
         .records_captured
         .fetch_add(1, Ordering::Relaxed);
+    // Hot path: capture buffer capped at 6 MB by config validation, fits u32
     #[allow(clippy::cast_possible_truncation)]
     let buf_len = buf_guard.len() as u32;
     state.metrics.bytes_captured.store(buf_len, Ordering::Relaxed);
 }
 
 /// Proxy loop between client and dongle
-#[allow(clippy::too_many_arguments)]
 fn proxy_loop(
-    state: &State,
-    control_rx: &std::sync::mpsc::Receiver<TestControlMessage>,
-    watchdog: &WatchdogHandle,
+    ctx: &TestContext,
     mut client: TcpStream,
     mut dongle: TcpStream,
     capture_start: Instant,
-    capture_buffer_size: u32,
-    capture_overflow: CaptureOverflow,
+    capture: CaptureConfig,
     bytes_this_second: &mut u32,
 ) -> Result<(), String> {
     client.set_nonblocking(true).ok();
@@ -792,17 +789,10 @@ fn proxy_loop(
     let mut dongle_buf = [0u8; 1024];
 
     loop {
-        watchdog.feed();
+        ctx.watchdog.feed();
 
-        // Check for stop command
-        match control_rx.try_recv() {
-            Ok(TestControlMessage::Stop) => {
-                return Ok(());
-            }
-            Ok(TestControlMessage::Start) | Err(std::sync::mpsc::TryRecvError::Empty) => {}
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                return Err("Control channel disconnected".to_string());
-            }
+        if ctx.check_stop()? {
+            return Ok(());
         }
 
         let mut activity = false;
@@ -815,23 +805,17 @@ fn proxy_loop(
                 let data = &client_buf[..n];
 
                 // Record to capture buffer
-                record_event(
-                    state,
-                    capture_start.elapsed(),
-                    RecordType::ClientToDongle,
-                    data,
-                    capture_buffer_size,
-                    capture_overflow,
-                );
+                record_event(ctx.state, capture_start.elapsed(), RecordType::ClientToDongle, data, capture);
 
                 // Forward to dongle
                 if let Err(e) = dongle.write_all(data) {
                     return Err(format!("Dongle write error: {e}"));
                 }
 
+                // Hot path: n ≤ 1024 (read buffer size), always fits u32
                 #[allow(clippy::cast_possible_truncation)]
                 { *bytes_this_second += n as u32; }
-                state
+                ctx.state
                     .metrics
                     .total_requests
                     .fetch_add(1, Ordering::Relaxed);
@@ -848,20 +832,14 @@ fn proxy_loop(
                 let data = &dongle_buf[..n];
 
                 // Record to capture buffer
-                record_event(
-                    state,
-                    capture_start.elapsed(),
-                    RecordType::DongleToClient,
-                    data,
-                    capture_buffer_size,
-                    capture_overflow,
-                );
+                record_event(ctx.state, capture_start.elapsed(), RecordType::DongleToClient, data, capture);
 
                 // Forward to client
                 if let Err(e) = client.write_all(data) {
                     return Err(format!("Client write error: {e}"));
                 }
 
+                // Hot path: n ≤ 1024 (read buffer size), always fits u32
                 #[allow(clippy::cast_possible_truncation)]
                 { *bytes_this_second += n as u32; }
             }

@@ -17,6 +17,7 @@ embedded-svc.workspace = true
 esp-idf-hal.workspace = true
 esp-idf-svc.workspace = true
 esp-idf-sys.workspace = true
+indexmap.workspace = true
 log.workspace = true
 oneshot.workspace = true
 serde.workspace = true

@@ -126,7 +126,6 @@ fn print_header(header: &CaptureHeader, file_size: Option<u64>) {
     println!("Data length:      {} bytes", header.data_length);
     println!("Firmware:         {}", header.firmware_version_str());
     println!("Dongle:           {ip}:{}", header.dongle_port);
-    println!("Uptime at start:  {} ms", header.uptime_ms);
 
     if header.capture_start_ms > 0 {
         println!("Capture start:    {} (epoch ms)", header.capture_start_ms);

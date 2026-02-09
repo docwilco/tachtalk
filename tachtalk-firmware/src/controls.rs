@@ -147,7 +147,7 @@ fn init_button(
 /// - Debounces NVS writes (waits for controls to settle before saving)
 #[allow(clippy::needless_pass_by_value)] // driver is intentionally moved into this task
 pub fn controls_task(state: &Arc<State>, driver: PcntDriver<'static>) {
-    let watchdog = WatchdogHandle::register("controls");
+    let watchdog = WatchdogHandle::register(c"controls");
     info!("Controls task started");
 
     // Load initial brightness from config

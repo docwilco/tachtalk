@@ -100,8 +100,6 @@ pub struct State {
     pub test_control_tx: Mutex<Option<std::sync::mpsc::Sender<TestControlMessage>>>,
     /// Mode 5 capture buffer (shared so web server can read/clear it)
     pub capture_buffer: Mutex<Vec<u8>>,
-    /// Uptime in ms when capture started (0 if not started)
-    pub capture_start_uptime_ms: AtomicU32,
 }
 
 /// Messages to control the test task
@@ -284,7 +282,7 @@ fn spawn_background_tasks(
     {
         let state = state.clone();
         thread_util::spawn_named(c"web_srv", move || {
-            if let Err(e) = web_server::start_server(&state, Some(ap_hostname), ap_ip) {
+            if let Err(e) = web_server::start_server(&state, Some(&ap_hostname), ap_ip) {
                 error!("Web server error: {e:?}");
             }
         });
@@ -329,7 +327,6 @@ fn main() -> Result<()> {
         dongle_connected: AtomicBool::new(false),
         test_control_tx: Mutex::new(Some(test_control_tx)),
         capture_buffer: Mutex::new(Vec::new()),
-        capture_start_uptime_ms: AtomicU32::new(0),
     });
 
     spawn_background_tasks(
@@ -388,7 +385,7 @@ enum StaConnectionState {
 
 /// Background task to manage WiFi STA connection
 fn wifi_connection_manager(state: &Arc<State>) {
-    let watchdog = WatchdogHandle::register("wifi_manager");
+    let watchdog = WatchdogHandle::register(c"wifi_manager");
 
     let sta_ssid = {
         let cfg_guard = state.config.lock().unwrap();

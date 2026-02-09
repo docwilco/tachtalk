@@ -8,13 +8,37 @@ use std::collections::HashMap;
 use std::net::Ipv4Addr;
 use std::sync::Arc;
 
-use esp_idf_svc::sys::{esp_get_free_heap_size, esp_get_minimum_free_heap_size};
+use esp_idf_svc::sys::{
+    esp_get_free_heap_size, esp_get_minimum_free_heap_size, lwip_getpeername, lwip_getsockname,
+    lwip_getsockopt, sockaddr, sockaddr_in, AF_INET,
+};
+use std::mem::MaybeUninit;
 
 use crate::rpm_leds::RpmTaskMessage;
 use crate::sse_server::SSE_PORT;
 use crate::State;
 use crate::config::Config;
 use smallvec::SmallVec;
+
+// Redefine bindgen u32 constants as i32 to match C socket API function signatures
+#[allow(clippy::cast_possible_wrap)]
+const SOL_SOCKET: i32 = esp_idf_svc::sys::SOL_SOCKET as i32;
+#[allow(clippy::cast_possible_wrap)]
+const SO_TYPE: i32 = esp_idf_svc::sys::SO_TYPE as i32;
+#[allow(clippy::cast_possible_wrap)]
+const SOCK_STREAM: i32 = esp_idf_svc::sys::SOCK_STREAM as i32;
+#[allow(clippy::cast_possible_wrap)]
+const SOCK_DGRAM: i32 = esp_idf_svc::sys::SOCK_DGRAM as i32;
+#[allow(clippy::cast_possible_wrap)]
+const LWIP_SOCKET_OFFSET: i32 = esp_idf_svc::sys::LWIP_SOCKET_OFFSET as i32;
+#[allow(clippy::cast_possible_wrap)]
+const CONFIG_LWIP_MAX_SOCKETS: i32 = esp_idf_svc::sys::CONFIG_LWIP_MAX_SOCKETS as i32;
+
+// Size constants for socket API calls (usize → u32 for C API compatibility)
+#[allow(clippy::cast_possible_truncation)]
+const SIZE_OF_I32: u32 = std::mem::size_of::<i32>() as u32;
+#[allow(clippy::cast_possible_truncation)]
+const SIZE_OF_SOCKADDR_IN: u32 = std::mem::size_of::<sockaddr_in>() as u32;
 
 /// Check if a config change would require a device restart
 /// Returns (GPIOs to reset before restart, `needs_restart`)
@@ -127,25 +151,19 @@ struct SocketInfo {
 ///
 /// LWIP sockets use FDs starting at `LWIP_SOCKET_OFFSET` (48 on ESP32).
 /// We probe each potential FD with `getsockopt` to see if it's a valid socket.
-#[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
 fn enumerate_sockets() -> Vec<SocketInfo> {
-    use esp_idf_svc::sys::{lwip_getsockopt, SOL_SOCKET, SO_TYPE, SOCK_STREAM, SOCK_DGRAM, 
-                           LWIP_SOCKET_OFFSET, CONFIG_LWIP_MAX_SOCKETS};
-
-    let socket_offset = LWIP_SOCKET_OFFSET as i32;
-    let max_sockets = CONFIG_LWIP_MAX_SOCKETS as i32;
     let mut sockets = Vec::new();
 
-    for fd in socket_offset..(socket_offset + max_sockets) {
+    for fd in LWIP_SOCKET_OFFSET..(LWIP_SOCKET_OFFSET + CONFIG_LWIP_MAX_SOCKETS) {
         // Try to get socket type - if this fails, FD is not a valid socket
         let mut sock_type: i32 = 0;
-        let mut optlen: u32 = std::mem::size_of::<i32>() as u32;
+        let mut optlen = SIZE_OF_I32;
 
         let result = unsafe {
             lwip_getsockopt(
                 fd,
-                SOL_SOCKET as i32,
-                SO_TYPE as i32,
+                SOL_SOCKET,
+                SO_TYPE,
                 std::ptr::addr_of_mut!(sock_type).cast(),
                 &mut optlen,
             )
@@ -156,8 +174,8 @@ fn enumerate_sockets() -> Vec<SocketInfo> {
         }
 
         let socket_type = match sock_type {
-            x if x == SOCK_STREAM as i32 => SocketType::Tcp,
-            x if x == SOCK_DGRAM as i32 => SocketType::Udp,
+            x if x == SOCK_STREAM => SocketType::Tcp,
+            x if x == SOCK_DGRAM => SocketType::Udp,
             x => SocketType::Unknown(x),
         };
 
@@ -178,13 +196,9 @@ fn enumerate_sockets() -> Vec<SocketInfo> {
 }
 
 /// Get local or remote address of a socket
-#[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
 fn get_socket_addr(fd: i32, peer: bool) -> Option<String> {
-    use esp_idf_svc::sys::{lwip_getpeername, lwip_getsockname, sockaddr_in, sockaddr, AF_INET};
-    use std::mem::MaybeUninit;
-
     let mut addr: MaybeUninit<sockaddr_in> = MaybeUninit::uninit();
-    let mut addrlen: u32 = std::mem::size_of::<sockaddr_in>() as u32;
+    let mut addrlen = SIZE_OF_SOCKADDR_IN;
 
     let result = unsafe {
         if peer {
@@ -201,8 +215,7 @@ fn get_socket_addr(fd: i32, peer: bool) -> Option<String> {
     let addr = unsafe { addr.assume_init() };
 
     // Check if it's an IPv4 address
-    #[allow(clippy::unnecessary_cast)]
-    if i32::from(addr.sin_family) != AF_INET as i32 {
+    if u32::from(addr.sin_family) != AF_INET {
         return None;
     }
 
@@ -221,7 +234,7 @@ pub fn log_sockets() {
         return;
     }
     
-    warn!("Open sockets ({}/{}):", sockets.len(), esp_idf_svc::sys::CONFIG_LWIP_MAX_SOCKETS);
+    warn!("Open sockets ({}/{}):", sockets.len(), CONFIG_LWIP_MAX_SOCKETS);
     for s in &sockets {
         let type_str = match &s.socket_type {
             SocketType::Tcp => "TCP",
@@ -263,23 +276,18 @@ struct PollingMetricsResponse {
 const HTML_INDEX_START: &str = include_str!(concat!(env!("OUT_DIR"), "/index_start.html"));
 const HTML_INDEX_END: &str = include_str!(concat!(env!("OUT_DIR"), "/index_end.html"));
 
-#[allow(clippy::too_many_lines)] // Route registration function - length is proportional to endpoints
-pub fn start_server(state: &Arc<State>, ap_hostname: Option<String>, ap_ip: Ipv4Addr) -> Result<()> {
-    info!("Web server starting...");
-    
-    // Enable wildcard URI matching for captive portal fallback handler
-    // Enable LRU purge to handle abrupt disconnections from captive portal browsers
-    // LWIP max is 16 sockets; leave room for DNS, SSE, mDNS, OBD2 proxy, dongle, httpd control
-    let server_config = Configuration {
-        uri_match_wildcard: true,
-        max_open_sockets: 6,
-        session_timeout: core::time::Duration::from_secs(2),
-        lru_purge_enable: true,
-        ..Default::default()
-    };
-    let mut server = EspHttpServer::new(&server_config)?;
+/// Register configuration-related routes (GET/POST config, brightness)
+fn register_config_routes(server: &mut EspHttpServer<'static>, state: &Arc<State>) -> Result<()> {
+    register_index_page(server)?;
+    register_get_config(server, state)?;
+    register_get_default_config(server)?;
+    register_post_config_check(server, state)?;
+    register_post_config(server, state)?;
+    register_post_brightness(server, state)?;
+    Ok(())
+}
 
-    // Serve the main HTML page (inject SSE port between two static parts)
+fn register_index_page(server: &mut EspHttpServer<'static>) -> Result<()> {
     server.fn_handler("/", Method::Get, |req| -> Result<(), esp_idf_svc::io::EspIOError> {
         let mut response = req.into_ok_response()?;
         response.write_all(HTML_INDEX_START.as_bytes())?;
@@ -287,8 +295,10 @@ pub fn start_server(state: &Arc<State>, ap_hostname: Option<String>, ap_ip: Ipv4
         response.write_all(HTML_INDEX_END.as_bytes())?;
         Ok(())
     })?;
+    Ok(())
+}
 
-    // GET config endpoint
+fn register_get_config(server: &mut EspHttpServer<'static>, state: &Arc<State>) -> Result<()> {
     let state_clone = state.clone();
     server.fn_handler("/api/config", Method::Get, move |req| -> Result<(), esp_idf_svc::io::EspIOError> {
         info!("HTTP: GET /api/config");
@@ -299,8 +309,10 @@ pub fn start_server(state: &Arc<State>, ap_hostname: Option<String>, ap_ip: Ipv4
         response.write_all(json.as_bytes())?;
         Ok(())
     })?;
+    Ok(())
+}
 
-    // GET default config endpoint
+fn register_get_default_config(server: &mut EspHttpServer<'static>) -> Result<()> {
     server.fn_handler("/api/config/default", Method::Get, |req| -> Result<(), esp_idf_svc::io::EspIOError> {
         info!("HTTP: GET /api/config/default");
         let default_config = crate::config::Config::default();
@@ -310,8 +322,10 @@ pub fn start_server(state: &Arc<State>, ap_hostname: Option<String>, ap_ip: Ipv4
         response.write_all(json.as_bytes())?;
         Ok(())
     })?;
+    Ok(())
+}
 
-    // POST config check endpoint - returns whether the config change would require a restart
+fn register_post_config_check(server: &mut EspHttpServer<'static>, state: &Arc<State>) -> Result<()> {
     let state_clone = state.clone();
     server.fn_handler("/api/config/check", Method::Post, move |mut req| -> Result<(), esp_idf_svc::io::EspIOError> {
         debug!("HTTP: POST /api/config/check");
@@ -337,8 +351,10 @@ pub fn start_server(state: &Arc<State>, ap_hostname: Option<String>, ap_ip: Ipv4
         
         Ok(())
     })?;
+    Ok(())
+}
 
-    // POST config endpoint
+fn register_post_config(server: &mut EspHttpServer<'static>, state: &Arc<State>) -> Result<()> {
     let state_clone = state.clone();
     server.fn_handler("/api/config", Method::Post, move |mut req| -> Result<(), esp_idf_svc::io::EspIOError> {
         info!("HTTP: POST /api/config");
@@ -391,8 +407,10 @@ pub fn start_server(state: &Arc<State>, ap_hostname: Option<String>, ap_ip: Ipv4
         
         Ok(())
     })?;
+    Ok(())
+}
 
-    // POST brightness endpoint - immediate brightness change without saving
+fn register_post_brightness(server: &mut EspHttpServer<'static>, state: &Arc<State>) -> Result<()> {
     let state_clone = state.clone();
     server.fn_handler("/api/brightness", Method::Post, move |mut req| -> Result<(), esp_idf_svc::io::EspIOError> {
         debug!("HTTP: POST /api/brightness");
@@ -422,7 +440,11 @@ pub fn start_server(state: &Arc<State>, ap_hostname: Option<String>, ap_ip: Ipv4
         
         Ok(())
     })?;
+    Ok(())
+}
 
+/// Register network-related routes (WiFi scan, network status)
+fn register_network_routes(server: &mut EspHttpServer<'static>, state: &Arc<State>) -> Result<()> {
     // GET wifi scan endpoint
     let state_clone = state.clone();
     server.fn_handler("/api/wifi/scan", Method::Get, move |req| -> Result<(), esp_idf_svc::io::EspIOError> {
@@ -511,11 +533,14 @@ pub fn start_server(state: &Arc<State>, ap_hostname: Option<String>, ap_ip: Ipv4
         Ok(())
     })?;
 
+    Ok(())
+}
+
+/// Register status and metrics routes (connection status, TCP info, RPM, polling metrics)
+fn register_status_routes(server: &mut EspHttpServer<'static>, state: &Arc<State>) -> Result<()> {
     // GET connection status endpoint for diagram
     let state_clone = state.clone();
     server.fn_handler("/api/status", Method::Get, move |req| -> Result<(), esp_idf_svc::io::EspIOError> {
-        use std::sync::atomic::Ordering;
-        
         debug!("HTTP: GET /api/status");
         
         let wifi_connected = state_clone.wifi.lock().unwrap().is_connected().unwrap_or(false);
@@ -562,18 +587,6 @@ pub fn start_server(state: &Arc<State>, ap_hostname: Option<String>, ap_ip: Ipv4
         Ok(())
     })?;
 
-    // GET all open sockets endpoint (for debugging FD exhaustion)
-    server.fn_handler("/api/sockets", Method::Get, move |req| -> Result<(), esp_idf_svc::io::EspIOError> {
-        debug!("HTTP: GET /api/sockets");
-        
-        let sockets = enumerate_sockets();
-        let json = serde_json::to_string(&sockets).unwrap_or_else(|_| "[]".to_string());
-        
-        let mut response = req.into_ok_response()?;
-        response.write_all(json.as_bytes())?;
-        Ok(())
-    })?;
-
     // GET RPM endpoint (fallback for non-SSE clients)
     let state_clone = state.clone();
     server.fn_handler("/api/rpm", Method::Get, move |req| -> Result<(), esp_idf_svc::io::EspIOError> {
@@ -583,6 +596,45 @@ pub fn start_server(state: &Arc<State>, ap_hostname: Option<String>, ap_ip: Ipv4
             Some(r) => format!(r#"{{"rpm":{r}}}"#),
             None => r#"{"rpm":null}"#.to_string(),
         };
+        let mut response = req.into_ok_response()?;
+        response.write_all(json.as_bytes())?;
+        Ok(())
+    })?;
+
+    // GET polling metrics endpoint
+    let state_clone = state.clone();
+    server.fn_handler("/api/metrics", Method::Get, move |req| -> Result<(), esp_idf_svc::io::EspIOError> {
+        debug!("HTTP: GET /api/metrics");
+        
+        let metrics = &state_clone.polling_metrics;
+        let response_data = PollingMetricsResponse {
+            fast_pid_count: metrics.fast_pid_count.load(Ordering::Relaxed),
+            slow_pid_count: metrics.slow_pid_count.load(Ordering::Relaxed),
+            promotions: metrics.promotions.load(Ordering::Relaxed),
+            demotions: metrics.demotions.load(Ordering::Relaxed),
+            removals: metrics.removals.load(Ordering::Relaxed),
+            dongle_requests_total: metrics.dongle_requests_total.load(Ordering::Relaxed),
+            dongle_requests_per_sec: metrics.dongle_requests_per_sec.load(Ordering::Relaxed),
+        };
+        
+        let json = serde_json::to_string(&response_data).unwrap_or_else(|_| r#"{"error":"serialization failed"}"#.to_string());
+        let mut response = req.into_ok_response()?;
+        response.write_all(json.as_bytes())?;
+        Ok(())
+    })?;
+
+    Ok(())
+}
+
+/// Register debug and system routes (sockets, debug info, reboot)
+fn register_debug_routes(server: &mut EspHttpServer<'static>, state: &Arc<State>) -> Result<()> {
+    // GET all open sockets endpoint (for debugging FD exhaustion)
+    server.fn_handler("/api/sockets", Method::Get, move |req| -> Result<(), esp_idf_svc::io::EspIOError> {
+        debug!("HTTP: GET /api/sockets");
+        
+        let sockets = enumerate_sockets();
+        let json = serde_json::to_string(&sockets).unwrap_or_else(|_| "[]".to_string());
+        
         let mut response = req.into_ok_response()?;
         response.write_all(json.as_bytes())?;
         Ok(())
@@ -629,28 +681,6 @@ pub fn start_server(state: &Arc<State>, ap_hostname: Option<String>, ap_ip: Ipv4
         Ok(())
     })?;
 
-    // GET polling metrics endpoint
-    let state_clone = state.clone();
-    server.fn_handler("/api/metrics", Method::Get, move |req| -> Result<(), esp_idf_svc::io::EspIOError> {
-        debug!("HTTP: GET /api/metrics");
-        
-        let metrics = &state_clone.polling_metrics;
-        let response_data = PollingMetricsResponse {
-            fast_pid_count: metrics.fast_pid_count.load(Ordering::Relaxed),
-            slow_pid_count: metrics.slow_pid_count.load(Ordering::Relaxed),
-            promotions: metrics.promotions.load(Ordering::Relaxed),
-            demotions: metrics.demotions.load(Ordering::Relaxed),
-            removals: metrics.removals.load(Ordering::Relaxed),
-            dongle_requests_total: metrics.dongle_requests_total.load(Ordering::Relaxed),
-            dongle_requests_per_sec: metrics.dongle_requests_per_sec.load(Ordering::Relaxed),
-        };
-        
-        let json = serde_json::to_string(&response_data).unwrap_or_else(|_| r#"{"error":"serialization failed"}"#.to_string());
-        let mut response = req.into_ok_response()?;
-        response.write_all(json.as_bytes())?;
-        Ok(())
-    })?;
-
     // POST reboot endpoint
     let state_clone = state.clone();
     server.fn_handler("/api/reboot", Method::Post, move |req| -> Result<(), esp_idf_svc::io::EspIOError> {
@@ -680,18 +710,21 @@ pub fn start_server(state: &Arc<State>, ap_hostname: Option<String>, ap_ip: Ipv4
         Ok(())
     })?;
 
-    // Captive portal fallback handler - redirect requests with wrong Host header
-    // Must be registered last as it's a wildcard that matches everything
-    if let Some(hostname) = ap_hostname {
-        let ap_ip_str = ap_ip.to_string();
-        let valid_hosts: Vec<String> = vec![
-            hostname.clone(),
-            format!("{hostname}.local"),
-            ap_ip_str.clone(),
-        ];
-        let redirect_url = format!("http://{ap_ip_str}/");
-        let captive_portal_html = format!(
-            r#"<!DOCTYPE html>
+    Ok(())
+}
+
+/// Register captive portal wildcard handler (must be registered last)
+fn register_captive_portal(server: &mut EspHttpServer<'static>, hostname: &str, ap_ip: Ipv4Addr) -> Result<()> {
+    let hostname = hostname.to_owned();
+    let ap_ip_str = ap_ip.to_string();
+    let valid_hosts: Vec<String> = vec![
+        hostname.clone(),
+        format!("{hostname}.local"),
+        ap_ip_str.clone(),
+    ];
+    let redirect_url = format!("http://{ap_ip_str}/");
+    let captive_portal_html = format!(
+        r#"<!DOCTYPE html>
 <html>
 <head>
     <meta charset="UTF-8">
@@ -703,35 +736,62 @@ pub fn start_server(state: &Arc<State>, ap_hostname: Option<String>, ap_ip: Ipv4
 </body>
 </html>
 "#
-        );
+    );
+    
+    info!("Captive portal enabled for hostname: {hostname}");
+    
+    server.fn_handler("/*", Method::Get, move |req| -> Result<(), esp_idf_svc::io::EspIOError> {
+        // Check Host header
+        let host = req.header("Host").unwrap_or("");
+        let host_lower = host.to_lowercase();
+        // Strip port if present
+        let host_without_port = host_lower.split(':').next().unwrap_or("");
         
-        info!("Captive portal enabled for hostname: {hostname}");
+        let is_valid_host = valid_hosts.iter().any(|h| h == host_without_port);
         
-        server.fn_handler("/*", Method::Get, move |req| -> Result<(), esp_idf_svc::io::EspIOError> {
-            // Check Host header
-            let host = req.header("Host").unwrap_or("");
-            let host_lower = host.to_lowercase();
-            // Strip port if present
-            let host_without_port = host_lower.split(':').next().unwrap_or("");
-            
-            let is_valid_host = valid_hosts.iter().any(|h| h == host_without_port);
-            
-            if is_valid_host {
-                // Valid host but unknown path - return 404
-                info!("HTTP: GET {} -> 404 (host: {})", req.uri(), host);
-                req.into_status_response(404)?;
-            } else {
-                // Wrong host - redirect to captive portal
-                info!("HTTP: GET {} -> 302 captive (host: {})", req.uri(), host);
-                let mut response = req.into_response(302, Some("Found"), &[
-                    ("Location", &redirect_url),
-                    ("Cache-Control", "no-cache"),
-                    ("Connection", "close"),
-                ])?;
-                response.write_all(captive_portal_html.as_bytes())?;
-            }
-            Ok(())
-        })?;
+        if is_valid_host {
+            // Valid host but unknown path - return 404
+            info!("HTTP: GET {} -> 404 (host: {})", req.uri(), host);
+            req.into_status_response(404)?;
+        } else {
+            // Wrong host - redirect to captive portal
+            info!("HTTP: GET {} -> 302 captive (host: {})", req.uri(), host);
+            let mut response = req.into_response(302, Some("Found"), &[
+                ("Location", &redirect_url),
+                ("Cache-Control", "no-cache"),
+                ("Connection", "close"),
+            ])?;
+            response.write_all(captive_portal_html.as_bytes())?;
+        }
+        Ok(())
+    })?;
+
+    Ok(())
+}
+
+pub fn start_server(state: &Arc<State>, ap_hostname: Option<String>, ap_ip: Ipv4Addr) -> Result<()> {
+    info!("Web server starting...");
+    
+    // Enable wildcard URI matching for captive portal fallback handler
+    // Enable LRU purge to handle abrupt disconnections from captive portal browsers
+    // LWIP max is 16 sockets; leave room for DNS, SSE, mDNS, OBD2 proxy, dongle, httpd control
+    let server_config = Configuration {
+        uri_match_wildcard: true,
+        max_open_sockets: 6,
+        session_timeout: core::time::Duration::from_secs(2),
+        lru_purge_enable: true,
+        ..Default::default()
+    };
+    let mut server = EspHttpServer::new(&server_config)?;
+
+    register_config_routes(&mut server, state)?;
+    register_network_routes(&mut server, state)?;
+    register_status_routes(&mut server, state)?;
+    register_debug_routes(&mut server, state)?;
+
+    // Captive portal wildcard must be registered last
+    if let Some(hostname) = ap_hostname {
+        register_captive_portal(&mut server, &hostname, ap_ip)?;
     }
 
     info!("Web server started on http://0.0.0.0:80");

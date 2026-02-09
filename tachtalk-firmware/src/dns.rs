@@ -31,7 +31,7 @@ fn run_dns_server() -> std::io::Result<()> {
     // Set timeout to ~3s so we feed watchdog well within 5s default timeout
     socket.set_read_timeout(Some(Duration::from_secs(3)))?;
     
-    let watchdog = WatchdogHandle::register("dns_server");
+    let watchdog = WatchdogHandle::register(c"dns_server");
     
     info!("DNS server started");
 

@@ -15,6 +15,7 @@
 - [ ] Upgrade to ESP-IDF 5.4
 - [ ] Switch PCNT encoder to event-based using `add_watch_step()` (requires ESP-IDF 5.4)
 - [ ] Investigate moving more allocations to PSRAM (N16R8 has 8MB). Currently only the capture buffer in test firmware is large enough to auto-place in PSRAM (`CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=4096`). Consider web server request buffers, JSON serialization buffers, WiFi scan results, etc.
+- [ ] Use deku crate (or similar) for binary capture file encoding/decoding
 
 ## Test Firmware (`tachtalk-test-firmware`)
 

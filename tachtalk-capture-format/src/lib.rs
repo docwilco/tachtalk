@@ -42,7 +42,7 @@ pub const RECORD_HEADER_SIZE: usize = 7;
 pub const FIRMWARE_VERSION_MAX_LEN: usize = 16;
 
 /// Reserved field size in bytes.
-pub const RESERVED_SIZE: usize = 8;
+pub const RESERVED_SIZE: usize = 12;
 
 /// Header flag: capture buffer overflowed.
 pub const FLAG_OVERFLOW: u16 = 1 << 0;
@@ -102,12 +102,11 @@ impl RecordType {
 /// | 12 | 4  | Record count (u32 LE) |
 /// | 16 | 4  | Total data length (u32 LE) |
 /// | 20 | 8  | Capture start (u64 LE, Unix epoch ms or 0) |
-/// | 28 | 4  | Uptime at start (u32 LE, ms) |
-/// | 32 | 4  | Dongle IP (u32, network order) |
-/// | 36 | 2  | Dongle port (u16 LE) |
-/// | 38 | 2  | Flags (u16 LE) |
-/// | 40 | 16 | Firmware version (null-terminated UTF-8) |
-/// | 56 | 8  | Reserved (zero) |
+/// | 28 | 4  | Dongle IP (u32, network order) |
+/// | 32 | 2  | Dongle port (u16 LE) |
+/// | 34 | 2  | Flags (u16 LE) |
+/// | 36 | 16 | Firmware version (null-terminated UTF-8) |
+/// | 52 | 12 | Reserved (zero) |
 #[derive(Debug, Clone)]
 pub struct CaptureHeader {
     /// Format version.
@@ -120,8 +119,6 @@ pub struct CaptureHeader {
     pub data_length: u32,
     /// Capture start time as Unix epoch milliseconds, or 0 if unavailable.
     pub capture_start_ms: u64,
-    /// Device uptime at capture start, in milliseconds.
-    pub uptime_ms: u32,
     /// Dongle `IPv4` address octets (network order).
     pub dongle_ip: [u8; 4],
     /// Dongle TCP port.
@@ -132,25 +129,24 @@ pub struct CaptureHeader {
     pub firmware_version: [u8; FIRMWARE_VERSION_MAX_LEN],
 }
 
-impl CaptureHeader {
-    /// Create a new header with default/zero values.
-    #[must_use]
-    pub fn new() -> Self {
+impl Default for CaptureHeader {
+    #[allow(clippy::cast_possible_truncation)] // HEADER_SIZE is 64, fits in u16
+    fn default() -> Self {
         Self {
             version: VERSION,
-            #[allow(clippy::cast_possible_truncation)]
             header_size: HEADER_SIZE as u16,
             record_count: 0,
             data_length: 0,
             capture_start_ms: 0,
-            uptime_ms: 0,
             dongle_ip: [0; 4],
             dongle_port: 0,
             flags: 0,
             firmware_version: [0; FIRMWARE_VERSION_MAX_LEN],
         }
     }
+}
 
+impl CaptureHeader {
     /// Set the firmware version string (truncated to 15 chars).
     pub fn set_firmware_version(&mut self, version: &str) {
         self.firmware_version = [0; FIRMWARE_VERSION_MAX_LEN];
@@ -185,7 +181,6 @@ impl CaptureHeader {
 
     /// Serialize the header to a 64-byte array.
     #[must_use]
-    #[allow(clippy::cast_possible_truncation)]
     pub fn to_bytes(&self) -> [u8; HEADER_SIZE] {
         let mut buf = [0u8; HEADER_SIZE];
 
@@ -195,12 +190,11 @@ impl CaptureHeader {
         buf[12..16].copy_from_slice(&self.record_count.to_le_bytes());
         buf[16..20].copy_from_slice(&self.data_length.to_le_bytes());
         buf[20..28].copy_from_slice(&self.capture_start_ms.to_le_bytes());
-        buf[28..32].copy_from_slice(&self.uptime_ms.to_le_bytes());
-        buf[32..36].copy_from_slice(&self.dongle_ip);
-        buf[36..38].copy_from_slice(&self.dongle_port.to_le_bytes());
-        buf[38..40].copy_from_slice(&self.flags.to_le_bytes());
-        buf[40..40 + FIRMWARE_VERSION_MAX_LEN].copy_from_slice(&self.firmware_version);
-        // buf[56..64] reserved, already zero
+        buf[28..32].copy_from_slice(&self.dongle_ip);
+        buf[32..34].copy_from_slice(&self.dongle_port.to_le_bytes());
+        buf[34..36].copy_from_slice(&self.flags.to_le_bytes());
+        buf[36..36 + FIRMWARE_VERSION_MAX_LEN].copy_from_slice(&self.firmware_version);
+        // buf[52..64] reserved, already zero
 
         buf
     }
@@ -238,16 +232,15 @@ impl CaptureHeader {
         let capture_start_ms = u64::from_le_bytes([
             buf[20], buf[21], buf[22], buf[23], buf[24], buf[25], buf[26], buf[27],
         ]);
-        let uptime_ms = u32::from_le_bytes([buf[28], buf[29], buf[30], buf[31]]);
 
         let mut dongle_ip = [0u8; 4];
-        dongle_ip.copy_from_slice(&buf[32..36]);
+        dongle_ip.copy_from_slice(&buf[28..32]);
 
-        let dongle_port = u16::from_le_bytes([buf[36], buf[37]]);
-        let flags = u16::from_le_bytes([buf[38], buf[39]]);
+        let dongle_port = u16::from_le_bytes([buf[32], buf[33]]);
+        let flags = u16::from_le_bytes([buf[34], buf[35]]);
 
         let mut firmware_version = [0u8; FIRMWARE_VERSION_MAX_LEN];
-        firmware_version.copy_from_slice(&buf[40..40 + FIRMWARE_VERSION_MAX_LEN]);
+        firmware_version.copy_from_slice(&buf[36..36 + FIRMWARE_VERSION_MAX_LEN]);
 
         Ok(Some(Self {
             version,
@@ -255,7 +248,6 @@ impl CaptureHeader {
             record_count,
             data_length,
             capture_start_ms,
-            uptime_ms,
             dongle_ip,
             dongle_port,
             flags,
@@ -264,11 +256,7 @@ impl CaptureHeader {
     }
 }
 
-impl Default for CaptureHeader {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+
 
 /// A parsed capture record.
 #[derive(Debug, Clone)]
@@ -402,13 +390,14 @@ mod tests {
 
     #[test]
     fn header_roundtrip() {
-        let mut header = CaptureHeader::new();
-        header.record_count = 42;
-        header.data_length = 1234;
-        header.uptime_ms = 5000;
-        header.dongle_ip = [192, 168, 1, 100];
-        header.dongle_port = 35000;
-        header.flags = FLAG_OVERFLOW;
+        let mut header = CaptureHeader {
+            record_count: 42,
+            data_length: 1234,
+            dongle_ip: [192, 168, 1, 100],
+            dongle_port: 35000,
+            flags: FLAG_OVERFLOW,
+            ..CaptureHeader::default()
+        };
         header.set_firmware_version("0.1.0");
 
         let bytes = header.to_bytes();
@@ -417,12 +406,10 @@ mod tests {
             .expect("should parse");
 
         assert_eq!(parsed.version, VERSION);
-        #[allow(clippy::cast_possible_truncation)]
-        let expected_header_size = HEADER_SIZE as u16;
+        let expected_header_size = u16::try_from(HEADER_SIZE).expect("HEADER_SIZE fits in u16");
         assert_eq!(parsed.header_size, expected_header_size);
         assert_eq!(parsed.record_count, 42);
         assert_eq!(parsed.data_length, 1234);
-        assert_eq!(parsed.uptime_ms, 5000);
         assert_eq!(parsed.dongle_ip, [192, 168, 1, 100]);
         assert_eq!(parsed.dongle_port, 35000);
         assert!(parsed.overflow());

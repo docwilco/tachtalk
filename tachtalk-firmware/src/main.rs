@@ -88,6 +88,8 @@ pub struct State {
     pub ap_ssid: String,
     pub sse_tx: SseSender,
     pub rpm_tx: RpmTaskSender,
+    pub dongle_control_tx: DongleSender,
+    pub cache_manager_tx: CacheManagerSender,
     pub shared_rpm: Mutex<Option<u32>>,
     pub at_command_log: Mutex<HashSet<String>>,
     pub pid_log: Mutex<HashSet<String>>,
@@ -320,21 +322,43 @@ fn init_wifi(
     Ok((wifi, ap_ssid))
 }
 
-/// Spawn all background tasks (DNS, SSE, OBD2, web server, etc.)
-#[allow(clippy::too_many_arguments)]
+/// Create shared state, channels, and spawn all background tasks.
 fn spawn_background_tasks(
-    state: &Arc<State>,
+    config: Config,
+    wifi: EspWifi<'static>,
+    ap_ssid: String,
     led_controller: LedController,
     encoder_driver: Option<esp_idf_hal::pcnt::PcntDriver<'static>>,
-    sse_rx: std::sync::mpsc::Receiver<sse_server::SseMessage>,
-    dongle_control_rx: obd2::DongleReceiver,
-    dongle_control_tx: DongleSender,
-    cache_manager_rx: std::sync::mpsc::Receiver<obd2::CacheManagerMessage>,
-    cache_manager_tx: CacheManagerSender,
-    rpm_rx: std::sync::mpsc::Receiver<rpm_leds::RpmTaskMessage>,
-    ap_hostname: String,
-    ap_ip: Ipv4Addr,
-) {
+) -> Arc<State> {
+    let ap_hostname = ap_ssid.to_lowercase();
+    let ap_ip = config.ap_ip;
+
+    // Create all channels
+    let (sse_tx, sse_rx) = std::sync::mpsc::channel();
+    let (dongle_control_tx, dongle_control_rx) = std::sync::mpsc::channel();
+    let (cache_manager_tx, cache_manager_rx) = std::sync::mpsc::channel();
+    let (rpm_tx, rpm_rx) = std::sync::mpsc::channel();
+
+    let state = Arc::new(State {
+        config: Mutex::new(config),
+        wifi: Mutex::new(wifi),
+        ap_ssid,
+        sse_tx,
+        rpm_tx,
+        dongle_control_tx,
+        cache_manager_tx,
+        shared_rpm: Mutex::new(None),
+        at_command_log: Mutex::new(HashSet::new()),
+        pid_log: Mutex::new(HashSet::new()),
+        dongle_connected: AtomicBool::new(false),
+        dongle_tcp_info: Mutex::new(None),
+        obd2_client_count: AtomicU32::new(0),
+        client_tcp_info: Mutex::new(Vec::new()),
+        polling_metrics: PollingMetrics::default(),
+        supported_pids: Mutex::new([None, None, None, None, None, None, None, None]),
+        supports_multi_pid: AtomicBool::new(false),
+    });
+
     // Start DNS server for captive portal
     dns::start_dns_server(ap_ip);
 
@@ -349,9 +373,8 @@ fn spawn_background_tasks(
     // Start OBD2 dongle task
     {
         let state = state.clone();
-        let cache_manager_tx = cache_manager_tx.clone();
         thread_util::spawn_named(c"dongle", move || {
-            dongle_task(&state, &cache_manager_tx, &dongle_control_rx);
+            dongle_task(&state, &dongle_control_rx);
         });
     }
 
@@ -359,7 +382,7 @@ fn spawn_background_tasks(
     {
         let state = state.clone();
         thread_util::spawn_named(c"cache_mgr", move || {
-            cache_manager_task(&state, &cache_manager_rx, &dongle_control_tx);
+            cache_manager_task(&state, &cache_manager_rx);
         });
     }
 
@@ -386,7 +409,7 @@ fn spawn_background_tasks(
     {
         let state = state.clone();
         thread_util::spawn_named(c"obd2_proxy", move || {
-            let proxy = Obd2Proxy::new(state, cache_manager_tx);
+            let proxy = Obd2Proxy::new(state);
             if let Err(e) = proxy.run() {
                 error!("OBD2 proxy error: {e:?}");
             }
@@ -409,6 +432,8 @@ fn spawn_background_tasks(
             controls::controls_task(&state, driver);
         });
     }
+
+    state
 }
 
 fn main() -> Result<()> {
@@ -431,47 +456,7 @@ fn main() -> Result<()> {
 
     let (wifi, ap_ssid) = init_wifi(&config, peripherals.modem, sys_loop, nvs)?;
 
-    let ap_hostname = ap_ssid.to_lowercase();
-    let ap_ip = config.ap_ip;
-
-    // Create all channels upfront
-    let (sse_tx, sse_rx) = std::sync::mpsc::channel();
-    let (dongle_control_tx, dongle_control_rx) = std::sync::mpsc::channel();  // Control messages to dongle from cache manager
-    let (cache_manager_tx, cache_manager_rx) = std::sync::mpsc::channel();  // Messages to cache manager from dongle and clients
-    let (rpm_tx, rpm_rx) = std::sync::mpsc::channel();
-
-    // Create central State struct
-    let state = Arc::new(State {
-        config: Mutex::new(config),
-        wifi: Mutex::new(wifi),
-        ap_ssid,
-        sse_tx,
-        rpm_tx,
-        shared_rpm: Mutex::new(None),
-        at_command_log: Mutex::new(HashSet::new()),
-        pid_log: Mutex::new(HashSet::new()),
-        dongle_connected: AtomicBool::new(false),
-        dongle_tcp_info: Mutex::new(None),
-        obd2_client_count: AtomicU32::new(0),
-        client_tcp_info: Mutex::new(Vec::new()),
-        polling_metrics: PollingMetrics::default(),
-        supported_pids: Mutex::new([None, None, None, None, None, None, None, None]),
-        supports_multi_pid: AtomicBool::new(false),
-    });
-
-    spawn_background_tasks(
-        &state,
-        led_controller,
-        encoder_driver,
-        sse_rx,
-        dongle_control_rx,
-        dongle_control_tx,
-        cache_manager_rx,
-        cache_manager_tx,
-        rpm_rx,
-        ap_hostname,
-        ap_ip,
-    );
+    let state = spawn_background_tasks(config, wifi, ap_ssid, led_controller, encoder_driver);
 
     // Start mDNS for local discovery (tachtalk.local)
     let _mdns = setup_mdns();
@@ -537,7 +522,7 @@ enum StaConnectionState {
 /// Background task to manage WiFi STA connection
 /// Always runs in Mixed mode (AP + STA) - AP is never disabled
 fn wifi_connection_manager(state: &Arc<State>) {
-    let watchdog = WatchdogHandle::register("wifi_manager");
+    let watchdog = WatchdogHandle::register(c"wifi_manager");
     
     // Read STA SSID from config (cached at task start - changes require reboot)
     let sta_ssid = {

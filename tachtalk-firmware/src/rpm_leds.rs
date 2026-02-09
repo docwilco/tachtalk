@@ -171,7 +171,7 @@ pub fn rpm_led_task(
         }
     }
 
-    let watchdog = WatchdogHandle::register("rpm_led_task");
+    let watchdog = WatchdogHandle::register(c"rpm_led_task");
     let led_gpio = state.config.lock().unwrap().led_gpio;
     info!("RPM/LED task started (GPIO {led_gpio})");
 

@@ -24,6 +24,7 @@ embedded-svc = "0.28.1"
 esp-idf-hal = "0.45.2"
 esp-idf-svc = "0.51.0"
 esp-idf-sys = "0.36.1"
+indexmap = "2"
 log = { version = "0.4.29", default-features = false }
 num-integer = "0.1"
 oneshot = "0.1"

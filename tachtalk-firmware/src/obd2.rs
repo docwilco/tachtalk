@@ -7,6 +7,7 @@
 //! - AT commands (ATE0, ATZ, etc.) are handled locally per connection using `tachtalk_elm327`
 
 use anyhow::{Context, Result};
+use indexmap::IndexSet;
 use log::{debug, error, info, warn};
 use smallvec::SmallVec;
 use std::collections::HashMap;
@@ -324,61 +325,59 @@ impl DongleState {
 
 /// Polling state for the dongle task
 struct PollingState {
-    fast_pids: Vec<Obd2Buffer>,
-    slow_pids: Vec<Obd2Buffer>,
+    fast_pids: IndexSet<Obd2Buffer>,
+    slow_pids: IndexSet<Obd2Buffer>,
     fast_index: usize,
     slow_index: usize,
     last_slow_poll: Instant,
+    fast_requests_since_slow: u32,
 }
 
-impl PollingState {
-    fn new() -> Self {
+impl Default for PollingState {
+    fn default() -> Self {
         // Always start with RPM in fast queue
         Self {
-            fast_pids: vec![RPM_PID.into()],
-            slow_pids: Vec::new(),
+            fast_pids: IndexSet::from([RPM_PID.into()]),
+            slow_pids: IndexSet::new(),
             fast_index: 0,
             slow_index: 0,
             last_slow_poll: Instant::now(),
+            fast_requests_since_slow: 0,
         }
     }
+}
 
+impl PollingState {
     fn next_fast_pid(&mut self) -> Option<Obd2Buffer> {
-        if self.fast_pids.is_empty() {
-            return None;
-        }
-        let pid = self.fast_pids[self.fast_index].clone();
+        let pid = self.fast_pids.get_index(self.fast_index)?.clone();
         self.fast_index = (self.fast_index + 1) % self.fast_pids.len();
         Some(pid)
     }
 
     fn next_slow_pid(&mut self) -> Option<Obd2Buffer> {
-        if self.slow_pids.is_empty() {
-            return None;
-        }
-        let pid = self.slow_pids[self.slow_index].clone();
+        let pid = self.slow_pids.get_index(self.slow_index)?.clone();
         self.slow_index = (self.slow_index + 1) % self.slow_pids.len();
         Some(pid)
     }
 
     fn set_pid_priority(&mut self, pid: Obd2Buffer, is_fast: bool) {
-        // Remove from both lists first
-        self.fast_pids.retain(|p| p != &pid);
-        self.slow_pids.retain(|p| p != &pid);
+        // Remove from both sets first
+        self.fast_pids.swap_remove(&pid);
+        self.slow_pids.swap_remove(&pid);
 
-        // Add to appropriate list
+        // Add to appropriate set
         if is_fast {
-            self.fast_pids.push(pid);
+            self.fast_pids.insert(pid);
         } else {
-            self.slow_pids.push(pid);
+            self.slow_pids.insert(pid);
         }
 
         self.fix_indices();
     }
 
     fn remove_pid(&mut self, pid: &Obd2Buffer) {
-        self.fast_pids.retain(|p| p != pid);
-        self.slow_pids.retain(|p| p != pid);
+        self.fast_pids.swap_remove(pid);
+        self.slow_pids.swap_remove(pid);
         self.fix_indices();
     }
 
@@ -394,29 +393,127 @@ impl PollingState {
             self.slow_index %= self.slow_pids.len();
         }
     }
+
+    /// Sync PID counts and lists to the shared polling metrics in `State`.
+    fn sync_metrics(&self, state: &Arc<State>) {
+        state.polling_metrics.fast_pid_count.store(
+            self.fast_pids.len().try_into().unwrap_or(u32::MAX),
+            Ordering::Relaxed,
+        );
+        state.polling_metrics.slow_pid_count.store(
+            self.slow_pids.len().try_into().unwrap_or(u32::MAX),
+            Ordering::Relaxed,
+        );
+        if let Ok(mut fast) = state.polling_metrics.fast_pids.lock() {
+            *fast = self
+                .fast_pids
+                .iter()
+                .map(|p| String::from_utf8_lossy(p).into_owned())
+                .collect();
+        }
+        if let Ok(mut slow) = state.polling_metrics.slow_pids.lock() {
+            *slow = self
+                .slow_pids
+                .iter()
+                .map(|p| String::from_utf8_lossy(p).into_owned())
+                .collect();
+        }
+    }
+
+    /// Poll one fast PID and optionally one slow PID, sending results to the cache manager.
+    ///
+    /// Returns the number of requests made this iteration.
+    fn poll_pids(
+        &mut self,
+        connection: &mut Option<DongleState>,
+        state: &Arc<State>,
+        timeout: Duration,
+    ) -> u32 {
+        let Some(dongle_state) = connection.as_mut() else {
+            return 0;
+        };
+
+        let (slow_poll_mode, slow_poll_interval, slow_poll_ratio) = {
+            let cfg = state.config.lock().unwrap();
+            (
+                cfg.obd2.slow_poll_mode,
+                Duration::from_millis(cfg.obd2.slow_poll_interval_ms),
+                cfg.obd2.slow_poll_ratio,
+            )
+        };
+
+        let mut requests = 0;
+
+        // Always try to poll a fast PID
+        if let Some(pid) = self.next_fast_pid() {
+            let result = dongle_state.execute_with_repeat(&pid, timeout);
+            handle_connection_error(&result, connection, state);
+
+            let _ = state.cache_manager_tx.send(CacheManagerMessage::DongleResponse {
+                pid: pid.clone(),
+                response: result,
+            });
+
+            requests += 1;
+            self.fast_requests_since_slow += 1;
+            state
+                .polling_metrics
+                .dongle_requests_total
+                .fetch_add(1, Ordering::Relaxed);
+        } else {
+            // RPM is always in fast queue, so we should always poll something
+            debug_assert!(false, "Expected to poll at least RPM, but fast_pids is empty");
+        }
+
+        // Poll slow PID based on mode (interval or ratio)
+        let should_poll_slow = match slow_poll_mode {
+            SlowPollMode::Interval => self.last_slow_poll.elapsed() >= slow_poll_interval,
+            SlowPollMode::Ratio => self.fast_requests_since_slow >= slow_poll_ratio,
+        };
+
+        if should_poll_slow {
+            if let Some(pid) = self.next_slow_pid() {
+                // Re-check connection after potential fast poll failure
+                if let Some(ref mut dongle_state) = connection {
+                    let result = dongle_state.execute_with_repeat(&pid, timeout);
+                    handle_connection_error(&result, connection, state);
+
+                    let _ = state.cache_manager_tx.send(CacheManagerMessage::DongleResponse {
+                        pid: pid.clone(),
+                        response: result,
+                    });
+
+                    requests += 1;
+                    state
+                        .polling_metrics
+                        .dongle_requests_total
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            self.last_slow_poll = Instant::now();
+            self.fast_requests_since_slow = 0;
+        }
+
+        requests
+    }
 }
 
 /// Run the dongle task - owns the connection and polls PIDs
-#[allow(clippy::too_many_lines)]
 pub fn dongle_task(
     state: &Arc<State>,
-    cache_manager_tx: &CacheManagerSender,
     control_rx: &DongleReceiver,
 ) {
     info!("OBD2 dongle task starting...");
 
     let mut connection: Option<DongleState> = None;
     let mut last_connect_attempt: Option<Instant> = None;
-    let mut polling = PollingState::new();
+    let mut polling = PollingState::default();
 
     // For requests/sec calculation
     let mut requests_this_second: u32 = 0;
     let mut last_rate_update = Instant::now();
-    
-    // For ratio-based slow polling
-    let mut fast_requests_since_slow: u32 = 0;
 
-    let watchdog = WatchdogHandle::register("obd2_dongle");
+    let watchdog = WatchdogHandle::register(c"obd2_dongle");
 
     info!("OBD2 dongle task started");
 
@@ -424,15 +521,12 @@ pub fn dongle_task(
         watchdog.feed();
 
         // Get config values
-        let (timeout, dongle_ip, dongle_port, slow_poll_mode, slow_poll_interval, slow_poll_ratio) = {
+        let (timeout, dongle_ip, dongle_port) = {
             let cfg = state.config.lock().unwrap();
             (
                 Duration::from_millis(cfg.obd2_timeout_ms),
                 cfg.obd2.dongle_ip.clone(),
                 cfg.obd2.dongle_port,
-                cfg.obd2.slow_poll_mode,
-                Duration::from_millis(cfg.obd2.slow_poll_interval_ms),
-                cfg.obd2.slow_poll_ratio,
             )
         };
 
@@ -450,81 +544,23 @@ pub fn dongle_task(
 
         // Try to ensure we have a connection (with reconnect delay)
         if connection.is_none() {
-            let should_try = match last_connect_attempt {
-                Some(t) => t.elapsed() >= RECONNECT_DELAY,
-                None => true,
-            };
-            if should_try {
-                last_connect_attempt = Some(Instant::now());
-                if let Some((dongle_state, local_addr, remote_addr)) =
-                    try_connect(&dongle_ip, dongle_port, timeout, &watchdog, state)
-                {
-                    connection = Some(dongle_state);
-                    state.dongle_connected.store(true, Ordering::Relaxed);
-                    *state.dongle_tcp_info.lock().unwrap() = Some((local_addr, remote_addr));
-                } else {
-                    state.dongle_connected.store(false, Ordering::Relaxed);
-                    *state.dongle_tcp_info.lock().unwrap() = None;
-                }
-            }
+            try_reconnect(
+                &mut connection,
+                &mut last_connect_attempt,
+                &dongle_ip,
+                dongle_port,
+                timeout,
+                &watchdog,
+                state,
+            );
         }
 
         // Poll PIDs if connected
-        if let Some(ref mut dongle_state) = connection {
-            let mut polled = false;
-
-            // Always try to poll a fast PID
-            if let Some(pid) = polling.next_fast_pid() {
-                let result = dongle_state.execute_with_repeat(&pid, timeout);
-                handle_connection_error(&result, &mut connection, state);
-
-                let _ = cache_manager_tx.send(CacheManagerMessage::DongleResponse {
-                    pid: pid.clone(),
-                    response: result,
-                });
-
-                requests_this_second += 1;
-                fast_requests_since_slow += 1;
-                state
-                    .polling_metrics
-                    .dongle_requests_total
-                    .fetch_add(1, Ordering::Relaxed);
-                polled = true;
-            }
-
-            // Poll slow PID based on mode (interval or ratio)
-            let should_poll_slow = match slow_poll_mode {
-                SlowPollMode::Interval => polling.last_slow_poll.elapsed() >= slow_poll_interval,
-                SlowPollMode::Ratio => fast_requests_since_slow >= slow_poll_ratio,
-            };
-            
-            if should_poll_slow {
-                if let Some(pid) = polling.next_slow_pid() {
-                    // Re-check connection after potential fast poll failure
-                    if let Some(ref mut dongle_state) = connection {
-                        let result = dongle_state.execute_with_repeat(&pid, timeout);
-                        handle_connection_error(&result, &mut connection, state);
-
-                        let _ = cache_manager_tx.send(CacheManagerMessage::DongleResponse {
-                            pid: pid.clone(),
-                            response: result,
-                        });
-
-                        requests_this_second += 1;
-                        state
-                            .polling_metrics
-                            .dongle_requests_total
-                            .fetch_add(1, Ordering::Relaxed);
-                    }
-                }
-                polling.last_slow_poll = Instant::now();
-                fast_requests_since_slow = 0;
-            }
-
-            // RPM is always in fast queue, so we should always poll something
-            debug_assert!(
-                polled,
-                "Expected to poll at least RPM, but fast_pids is empty"
+        if connection.is_some() {
+            requests_this_second += polling.poll_pids(
+                &mut connection,
+                state,
+                timeout,
             );
         } else {
             // Not connected, sleep before retry
@@ -542,27 +578,35 @@ pub fn dongle_task(
         }
 
         // Update PID counts and lists
-        state.polling_metrics.fast_pid_count.store(
-            polling.fast_pids.len().try_into().unwrap_or(u32::MAX),
-            Ordering::Relaxed,
-        );
-        state.polling_metrics.slow_pid_count.store(
-            polling.slow_pids.len().try_into().unwrap_or(u32::MAX),
-            Ordering::Relaxed,
-        );
-        if let Ok(mut fast) = state.polling_metrics.fast_pids.lock() {
-            *fast = polling
-                .fast_pids
-                .iter()
-                .map(|p| String::from_utf8_lossy(p).into_owned())
-                .collect();
-        }
-        if let Ok(mut slow) = state.polling_metrics.slow_pids.lock() {
-            *slow = polling
-                .slow_pids
-                .iter()
-                .map(|p| String::from_utf8_lossy(p).into_owned())
-                .collect();
+        polling.sync_metrics(state);
+    }
+}
+
+/// Attempt to reconnect to the dongle if the reconnect delay has elapsed.
+fn try_reconnect(
+    connection: &mut Option<DongleState>,
+    last_connect_attempt: &mut Option<Instant>,
+    dongle_ip: &str,
+    dongle_port: u16,
+    timeout: Duration,
+    watchdog: &WatchdogHandle,
+    state: &Arc<State>,
+) {
+    let should_try = match *last_connect_attempt {
+        Some(t) => t.elapsed() >= RECONNECT_DELAY,
+        None => true,
+    };
+    if should_try {
+        *last_connect_attempt = Some(Instant::now());
+        if let Some((dongle_state, local_addr, remote_addr)) =
+            try_connect(dongle_ip, dongle_port, timeout, watchdog, state)
+        {
+            *connection = Some(dongle_state);
+            state.dongle_connected.store(true, Ordering::Relaxed);
+            *state.dongle_tcp_info.lock().unwrap() = Some((local_addr, remote_addr));
+        } else {
+            state.dongle_connected.store(false, Ordering::Relaxed);
+            *state.dongle_tcp_info.lock().unwrap() = None;
         }
     }
 }
@@ -587,26 +631,263 @@ fn handle_connection_error(
 // Cache Manager Task
 // ============================================================================
 
+/// Cache hit/miss metrics, reset each maintenance interval.
+struct CacheMetrics {
+    hits: u32,
+    misses: u32,
+    total_wait_time: Duration,
+}
+
+/// Run periodic maintenance: demote/remove inactive PIDs, log metrics.
+fn run_maintenance(
+    pid_info: &mut HashMap<Obd2Buffer, PidInfo>,
+    state: &Arc<State>,
+    cache_metrics: &mut CacheMetrics,
+    elapsed: Duration,
+) {
+    let (fast_demotion_ms, pid_inactive_removal_ms) = {
+        let cfg = state.config.lock().unwrap();
+        (
+            Duration::from_millis(cfg.obd2.fast_demotion_ms),
+            Duration::from_millis(cfg.obd2.pid_inactive_removal_ms),
+        )
+    };
+
+    let mut pids_to_remove = Vec::new();
+    let mut pids_to_demote = Vec::new();
+
+    for (pid, info) in &mut *pid_info {
+        // Skip RPM - always fast, never removed
+        if pid.as_slice() == RPM_PID {
+            continue;
+        }
+
+        // Check removal: no recent consumption AND no recent waiters
+        // (need both conditions to handle newly added PIDs that haven't been polled yet)
+        let no_recent_consumption = info
+            .last_consumed_time
+            .map_or(true, |t| t.elapsed() > pid_inactive_removal_ms);
+        let no_recent_waiters = info
+            .last_waiter_time
+            .map_or(true, |t| t.elapsed() > pid_inactive_removal_ms);
+        if no_recent_consumption && no_recent_waiters {
+            pids_to_remove.push(pid.clone());
+            continue;
+        }
+
+        // Check demotion (no waiters recently)
+        if info.priority == PidPriority::Fast {
+            let should_demote = info
+                .last_waiter_time
+                .map_or(true, |t| t.elapsed() > fast_demotion_ms);
+            if should_demote {
+                pids_to_demote.push(pid.clone());
+            }
+        }
+    }
+
+    // Demote PIDs
+    for pid in pids_to_demote {
+        if let Some(info) = pid_info.get_mut(&pid) {
+            info.priority = PidPriority::Slow;
+        }
+        state
+            .polling_metrics
+            .demotions
+            .fetch_add(1, Ordering::Relaxed);
+        info!("PID {:?}: demoted to slow", String::from_utf8_lossy(&pid));
+        let _ = state.dongle_control_tx.send(DongleMessage::SetPidPriority(pid, false));
+    }
+
+    // Remove inactive PIDs
+    for pid in pids_to_remove {
+        pid_info.remove(&pid);
+        state
+            .polling_metrics
+            .removals
+            .fetch_add(1, Ordering::Relaxed);
+        info!("PID {:?}: removed (inactive)", String::from_utf8_lossy(&pid));
+        let _ = state.dongle_control_tx.send(DongleMessage::RemovePid(pid));
+    }
+
+    // Log client request rates and reset counters
+    // Values reset every MAINTENANCE_INTERVAL (500ms), so they stay small enough
+    // that u32 -> f32 precision loss is irrelevant
+    #[allow(clippy::cast_precision_loss)]
+    let elapsed_secs = elapsed.as_secs_f32();
+    let mut rates: Vec<_> = pid_info
+        .iter_mut()
+        .filter(|(_, info)| info.request_count > 0)
+        .map(|(pid, info)| {
+            #[allow(clippy::cast_precision_loss)]
+            let rate = info.request_count as f32 / elapsed_secs;
+            let pid_str = String::from_utf8_lossy(pid).to_string();
+            info.request_count = 0;
+            (pid_str, rate)
+        })
+        .collect();
+    rates.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    if !rates.is_empty() {
+        let rate_strs: Vec<_> = rates.iter().map(|(p, r)| format!("{p}:{r:.1}")).collect();
+        info!("Client req/s: {}", rate_strs.join(", "));
+    }
+
+    // Log cache hit/miss metrics
+    let total_requests = cache_metrics.hits + cache_metrics.misses;
+    if total_requests > 0 {
+        #[allow(clippy::cast_precision_loss)]
+        let hit_rate = 100.0 * cache_metrics.hits as f32 / total_requests as f32;
+        #[allow(clippy::cast_precision_loss)]
+        let avg_wait_ms = if cache_metrics.misses > 0 {
+            cache_metrics.total_wait_time.as_secs_f32() * 1000.0 / cache_metrics.misses as f32
+        } else {
+            0.0
+        };
+        info!(
+            "Cache: {} hits, {} misses ({hit_rate:.1}% hit rate), avg wait {avg_wait_ms:.1}ms",
+            cache_metrics.hits, cache_metrics.misses,
+        );
+    }
+    *cache_metrics = CacheMetrics {
+        hits: 0,
+        misses: 0,
+        total_wait_time: Duration::ZERO,
+    };
+}
+
+/// Push fresh data to all client caches, waking any that were waiting on this PID.
+fn update_client_caches(
+    clients: &HashMap<ClientId, Arc<Mutex<ClientCache>>>,
+    pid: &Obd2Buffer,
+    data: &Obd2Buffer,
+) {
+    for client_cache in clients.values() {
+        let mut cache_guard = client_cache.lock().unwrap();
+        match cache_guard.entries.get_mut(pid) {
+            Some(CacheEntry::Waiting(_)) => {
+                // Take the sender, replace with Fresh, then send wake
+                let old = std::mem::replace(
+                    cache_guard.entries.get_mut(pid).unwrap(),
+                    CacheEntry::Fresh(data.clone()),
+                );
+                if let CacheEntry::Waiting(tx) = old {
+                    let _ = tx.send(());
+                }
+            }
+            Some(entry) => {
+                *entry = CacheEntry::Fresh(data.clone());
+            }
+            None => {
+                cache_guard
+                    .entries
+                    .insert(pid.clone(), CacheEntry::Fresh(data.clone()));
+            }
+        }
+    }
+}
+
+/// Handle a PID entering the Waiting state: create or promote PID info as appropriate.
+fn handle_waiting_pid(
+    pid: &Obd2Buffer,
+    pid_info: &mut HashMap<Obd2Buffer, PidInfo>,
+    state: &Arc<State>,
+) {
+    let slow_poll_mode = {
+        let cfg = state.config.lock().unwrap();
+        cfg.obd2.slow_poll_mode
+    };
+
+    let is_new = !pid_info.contains_key(pid);
+    let info = pid_info.entry(pid.clone()).or_insert_with(|| PidInfo {
+        last_waiter_time: None,
+        last_consumed_time: None,
+        priority: PidPriority::Fast,
+        request_count: 0,
+    });
+    info.last_waiter_time = Some(Instant::now());
+
+    // Promote to fast if it was slow (in interval mode, promote immediately)
+    // In ratio mode, we don't auto-promote here — we check wait time on Consumed
+    if info.priority == PidPriority::Slow && slow_poll_mode == SlowPollMode::Interval {
+        info.priority = PidPriority::Fast;
+        state
+            .polling_metrics
+            .promotions
+            .fetch_add(1, Ordering::Relaxed);
+        log::info!("PID {:?}: promoted to fast", String::from_utf8_lossy(pid));
+        let _ = state.dongle_control_tx.send(DongleMessage::SetPidPriority(pid.clone(), true));
+    } else if is_new {
+        log::info!("PID {:?}: added to fast queue", String::from_utf8_lossy(pid));
+        let _ = state.dongle_control_tx.send(DongleMessage::SetPidPriority(pid.clone(), true));
+    }
+}
+
+/// Handle a PID being consumed by a client: track metrics and promote slow PIDs if wait time
+/// exceeds the configured threshold (in ratio mode).
+fn handle_consumed_pid(
+    pid: &Obd2Buffer,
+    wait_duration: Option<Duration>,
+    pid_info: &mut HashMap<Obd2Buffer, PidInfo>,
+    state: &Arc<State>,
+    cache_metrics: &mut CacheMetrics,
+) {
+    let (slow_poll_mode, promotion_threshold) = {
+        let cfg = state.config.lock().unwrap();
+        (
+            cfg.obd2.slow_poll_mode,
+            Duration::from_millis(cfg.obd2.promotion_wait_threshold_ms),
+        )
+    };
+
+    if let Some(info) = pid_info.get_mut(pid) {
+        info.last_consumed_time = Some(Instant::now());
+        info.request_count += 1;
+
+        if slow_poll_mode == SlowPollMode::Ratio
+            && info.priority == PidPriority::Slow
+            && wait_duration.is_some_and(|d| d >= promotion_threshold)
+        {
+            info.priority = PidPriority::Fast;
+            state
+                .polling_metrics
+                .promotions
+                .fetch_add(1, Ordering::Relaxed);
+            log::info!(
+                "PID {:?}: promoted to fast (wait {}ms >= {}ms threshold)",
+                String::from_utf8_lossy(pid),
+                wait_duration.unwrap().as_millis(),
+                promotion_threshold.as_millis()
+            );
+            let _ = state.dongle_control_tx.send(DongleMessage::SetPidPriority(pid.clone(), true));
+        }
+    }
+    if let Some(duration) = wait_duration {
+        cache_metrics.misses += 1;
+        cache_metrics.total_wait_time += duration;
+    } else {
+        cache_metrics.hits += 1;
+    }
+}
+
 /// Run the cache manager task
-#[allow(clippy::too_many_lines)]
 pub fn cache_manager_task(
     state: &Arc<State>,
     manager_rx: &Receiver<CacheManagerMessage>,
-    dongle_tx: &DongleSender,
 ) {
     info!("Cache manager task starting...");
 
-    let watchdog = WatchdogHandle::register("cache_manager");
+    let watchdog = WatchdogHandle::register(c"cache_manager");
 
     let mut clients: HashMap<ClientId, Arc<Mutex<ClientCache>>> = HashMap::new();
     let mut pid_info: HashMap<Obd2Buffer, PidInfo> = HashMap::new();
     let mut next_client_id: ClientId = 1;
     let mut last_maintenance = Instant::now();
 
-    // Cache hit/miss stats
-    let mut cache_hits: u32 = 0;
-    let mut cache_misses: u32 = 0;
-    let mut total_wait_time = Duration::ZERO;
+    let mut cache_metrics = CacheMetrics {
+        hits: 0,
+        misses: 0,
+        total_wait_time: Duration::ZERO,
+    };
 
     // Initialize RPM PID info
     pid_info.insert(
@@ -628,30 +909,7 @@ pub fn cache_manager_task(
         match manager_rx.recv_timeout(MAINTENANCE_INTERVAL) {
             Ok(CacheManagerMessage::DongleResponse { pid, response }) => {
                 if let Ok(ref data) = response {
-                    // Update all client caches
-                    for client_cache in clients.values() {
-                        let mut cache_guard = client_cache.lock().unwrap();
-                        match cache_guard.entries.get_mut(&pid) {
-                            Some(CacheEntry::Waiting(_)) => {
-                                // Take the sender, replace with Fresh, then send wake
-                                let old = std::mem::replace(
-                                    cache_guard.entries.get_mut(&pid).unwrap(),
-                                    CacheEntry::Fresh(data.clone()),
-                                );
-                                if let CacheEntry::Waiting(tx) = old {
-                                    let _ = tx.send(());
-                                }
-                            }
-                            Some(entry) => {
-                                *entry = CacheEntry::Fresh(data.clone());
-                            }
-                            None => {
-                                cache_guard
-                                    .entries
-                                    .insert(pid.clone(), CacheEntry::Fresh(data.clone()));
-                            }
-                        }
-                    }
+                    update_client_caches(&clients, &pid, data);
 
                     // Extract RPM and send to LED task
                     if pid.as_slice() == RPM_PID {
@@ -664,72 +922,10 @@ pub fn cache_manager_task(
                 }
             }
             Ok(CacheManagerMessage::Waiting(pid)) => {
-                // Get config for promotion behavior
-                let slow_poll_mode = {
-                    let cfg = state.config.lock().unwrap();
-                    cfg.obd2.slow_poll_mode
-                };
-                
-                // Update or create PID info
-                let is_new = !pid_info.contains_key(&pid);
-                let info = pid_info.entry(pid.clone()).or_insert_with(|| PidInfo {
-                    last_waiter_time: None,
-                    last_consumed_time: None,
-                    priority: PidPriority::Fast,
-                    request_count: 0,
-                });
-                info.last_waiter_time = Some(Instant::now());
-
-                // Promote to fast if it was slow (in interval mode, promote immediately)
-                // In ratio mode, we don't auto-promote here - we check wait time on Consumed
-                if info.priority == PidPriority::Slow && slow_poll_mode == SlowPollMode::Interval {
-                    info.priority = PidPriority::Fast;
-                    state
-                        .polling_metrics
-                        .promotions
-                        .fetch_add(1, Ordering::Relaxed);
-                    info!("PID {:?}: promoted to fast", String::from_utf8_lossy(&pid));
-                    let _ = dongle_tx.send(DongleMessage::SetPidPriority(pid.clone(), true));
-                } else if is_new {
-                    // New PID
-                    info!("PID {:?}: added to fast queue", String::from_utf8_lossy(&pid));
-                    let _ = dongle_tx.send(DongleMessage::SetPidPriority(pid.clone(), true));
-                }
+                handle_waiting_pid(&pid, &mut pid_info, state);
             }
             Ok(CacheManagerMessage::Consumed { pid, wait_duration }) => {
-                // Get config for promotion behavior  
-                let (slow_poll_mode, promotion_threshold) = {
-                    let cfg = state.config.lock().unwrap();
-                    (cfg.obd2.slow_poll_mode, Duration::from_millis(cfg.obd2.promotion_wait_threshold_ms))
-                };
-                
-                if let Some(info) = pid_info.get_mut(&pid) {
-                    info.last_consumed_time = Some(Instant::now());
-                    info.request_count += 1;
-                    
-                    // In ratio mode, promote slow PIDs if wait time exceeds threshold
-                    if slow_poll_mode == SlowPollMode::Ratio 
-                        && info.priority == PidPriority::Slow 
-                        && wait_duration.is_some_and(|d| d >= promotion_threshold) 
-                    {
-                        info.priority = PidPriority::Fast;
-                        state
-                            .polling_metrics
-                            .promotions
-                            .fetch_add(1, Ordering::Relaxed);
-                        info!("PID {:?}: promoted to fast (wait {}ms >= {}ms threshold)", 
-                            String::from_utf8_lossy(&pid),
-                            wait_duration.unwrap().as_millis(),
-                            promotion_threshold.as_millis());
-                        let _ = dongle_tx.send(DongleMessage::SetPidPriority(pid.clone(), true));
-                    }
-                }
-                if let Some(duration) = wait_duration {
-                    cache_misses += 1;
-                    total_wait_time += duration;
-                } else {
-                    cache_hits += 1;
-                }
+                handle_consumed_pid(&pid, wait_duration, &mut pid_info, state, &mut cache_metrics);
             }
             Ok(CacheManagerMessage::RegisterClient(reply_tx)) => {
                 let id = next_client_id;
@@ -754,112 +950,7 @@ pub fn cache_manager_task(
 
         // Periodic maintenance: check promotion/demotion/removal
         if last_maintenance.elapsed() >= MAINTENANCE_INTERVAL {
-            let (fast_demotion_ms, pid_inactive_removal_ms) = {
-                let cfg = state.config.lock().unwrap();
-                (
-                    Duration::from_millis(cfg.obd2.fast_demotion_ms),
-                    Duration::from_millis(cfg.obd2.pid_inactive_removal_ms),
-                )
-            };
-
-            let mut pids_to_remove = Vec::new();
-            let mut pids_to_demote = Vec::new();
-
-            for (pid, info) in &mut pid_info {
-                // Skip RPM - always fast, never removed
-                if pid.as_slice() == RPM_PID {
-                    continue;
-                }
-
-                // Check removal: no recent consumption AND no recent waiters
-                // (need both conditions to handle newly added PIDs that haven't been polled yet)
-                let no_recent_consumption = info
-                    .last_consumed_time
-                    .map_or(true, |t| t.elapsed() > pid_inactive_removal_ms);
-                let no_recent_waiters = info
-                    .last_waiter_time
-                    .map_or(true, |t| t.elapsed() > pid_inactive_removal_ms);
-                if no_recent_consumption && no_recent_waiters {
-                    pids_to_remove.push(pid.clone());
-                    continue;
-                }
-
-                // Check demotion (no waiters recently)
-                if info.priority == PidPriority::Fast {
-                    let should_demote = info
-                        .last_waiter_time
-                        .map_or(true, |t| t.elapsed() > fast_demotion_ms);
-                    if should_demote {
-                        pids_to_demote.push(pid.clone());
-                    }
-                }
-            }
-
-            // Demote PIDs
-            for pid in pids_to_demote {
-                if let Some(info) = pid_info.get_mut(&pid) {
-                    info.priority = PidPriority::Slow;
-                }
-                state
-                    .polling_metrics
-                    .demotions
-                    .fetch_add(1, Ordering::Relaxed);
-                info!("PID {:?}: demoted to slow", String::from_utf8_lossy(&pid));
-                let _ = dongle_tx.send(DongleMessage::SetPidPriority(pid, false));
-            }
-
-            // Remove inactive PIDs
-            for pid in pids_to_remove {
-                pid_info.remove(&pid);
-                state
-                    .polling_metrics
-                    .removals
-                    .fetch_add(1, Ordering::Relaxed);
-                info!("PID {:?}: removed (inactive)", String::from_utf8_lossy(&pid));
-                let _ = dongle_tx.send(DongleMessage::RemovePid(pid));
-            }
-
-            // Log client request rates and reset counters
-            // Values reset every MAINTENANCE_INTERVAL (500ms), so they stay small enough
-            // that u32 -> f32 precision loss is irrelevant
-            #[allow(clippy::cast_precision_loss)]
-            let elapsed_secs = last_maintenance.elapsed().as_secs_f32();
-            let mut rates: Vec<_> = pid_info
-                .iter_mut()
-                .filter(|(_, info)| info.request_count > 0)
-                .map(|(pid, info)| {
-                    #[allow(clippy::cast_precision_loss)]
-                    let rate = info.request_count as f32 / elapsed_secs;
-                    let pid_str = String::from_utf8_lossy(pid).to_string();
-                    info.request_count = 0;
-                    (pid_str, rate)
-                })
-                .collect();
-            rates.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-            if !rates.is_empty() {
-                let rate_strs: Vec<_> = rates.iter().map(|(p, r)| format!("{p}:{r:.1}")).collect();
-                info!("Client req/s: {}", rate_strs.join(", "));
-            }
-
-            // Log cache hit/miss stats
-            let total_requests = cache_hits + cache_misses;
-            if total_requests > 0 {
-                #[allow(clippy::cast_precision_loss)]
-                let hit_rate = 100.0 * cache_hits as f32 / total_requests as f32;
-                #[allow(clippy::cast_precision_loss)]
-                let avg_wait_ms = if cache_misses > 0 {
-                    total_wait_time.as_secs_f32() * 1000.0 / cache_misses as f32
-                } else {
-                    0.0
-                };
-                info!(
-                    "Cache: {cache_hits} hits, {cache_misses} misses ({hit_rate:.1}% hit rate), avg wait {avg_wait_ms:.1}ms"
-                );
-            }
-            cache_hits = 0;
-            cache_misses = 0;
-            total_wait_time = Duration::ZERO;
-
+            run_maintenance(&mut pid_info, state, &mut cache_metrics, last_maintenance.elapsed());
             last_maintenance = Instant::now();
         }
     }
@@ -869,9 +960,97 @@ pub fn cache_manager_task(
 // Helper Functions
 // ============================================================================
 
+/// Check if a multi-PID response contains both RPM (0C) and speed (0D) data.
+///
+/// Multi-PID responses can be:
+/// 1. Separate headers: `"410CXXXX410DYY"` (each PID has its own 41 prefix)
+/// 2. Concatenated: `"410CXXXX0DYY"` (only first PID has header)
+///
+/// Either way, a successful response will have `410C` followed by RPM data
+/// (2 bytes = 4 hex chars), then `0D` data somewhere after.
+fn is_valid_multi_pid_response(response_str: &str) -> bool {
+    let has_rpm = response_str.contains("410C");
+    let has_speed = if let Some(pos) = response_str.find("410C") {
+        let after_rpm = &response_str[pos + 4..]; // skip "410C"
+        // RPM is 2 bytes = 4 hex chars, then look for 0D or 410D
+        after_rpm.len() >= 4 && {
+            let after_rpm_data = &after_rpm[4..]; // skip RPM data
+            after_rpm_data.starts_with("410D") || after_rpm_data.starts_with("0D")
+        }
+    } else {
+        false
+    };
+    has_rpm && has_speed
+}
+
+/// Test whether the ECU supports multi-PID queries by requesting RPM (0C) and speed (0D) together.
+///
+/// Only tests if enabled in config and both PIDs are supported according to the 0100 response.
+fn test_multi_pid_support(
+    stream: &mut TcpStream,
+    timeout: Duration,
+    watchdog: &WatchdogHandle,
+    state: &Arc<State>,
+) -> bool {
+    if !state.config.lock().unwrap().obd2.test_multi_pid {
+        return false;
+    }
+
+    info!("Testing multi-PID query support...");
+    watchdog.feed();
+
+    let supported_0100 = if let Some(response) = &state.supported_pids.lock().unwrap()[0] {
+        response.clone()
+    } else {
+        info!("No 0100 response available, skipping multi-PID test");
+        return false;
+    };
+
+    // Check if PIDs 0C and 0D are supported in the 0100 bitmask
+    if !is_pid_supported_in_response(&supported_0100, 0x0C)
+        || !is_pid_supported_in_response(&supported_0100, 0x0D)
+    {
+        info!("PIDs 0C and/or 0D not supported, skipping multi-PID test");
+        return false;
+    }
+
+    let response = match execute_command(stream, b"010C0D", timeout) {
+        Ok(r) => r,
+        Err(e) => {
+            info!("Multi-PID query test failed: {e}, assuming not supported");
+            return false;
+        }
+    };
+
+    let response_str = String::from_utf8_lossy(&response).to_ascii_uppercase();
+    if !is_valid_multi_pid_response(&response_str) {
+        info!("ECU does not support multi-PID queries (response: {response_str:?})");
+        return false;
+    }
+
+    info!("ECU supports multi-PID queries");
+
+    // Test if repeat command works with multi-PID queries
+    match execute_command(stream, b"1", timeout) {
+        Ok(repeat_response) => {
+            let repeat_str = String::from_utf8_lossy(&repeat_response).to_ascii_uppercase();
+            if is_valid_multi_pid_response(&repeat_str) {
+                info!("Repeat command works with multi-PID queries");
+            } else if repeat_str.contains('?') {
+                info!("Repeat command not supported");
+            } else {
+                info!("Repeat command gave unexpected response for multi-PID: {repeat_str:?}");
+            }
+        }
+        Err(e) => {
+            info!("Repeat command test failed: {e}");
+        }
+    }
+
+    true
+}
+
 /// Try to connect to the dongle and initialize it
-/// Attempt to connect to the OBD2 dongle and initialize it
-#[allow(clippy::too_many_lines)]
 fn try_connect(
     dongle_ip: &str,
     dongle_port: u16,
@@ -955,104 +1134,11 @@ fn try_connect(
     }
     drop(supported_pids_guard);
 
-    // Test multi-PID query support by requesting RPM (0C) and vehicle speed (0D) together
-    // Only test if enabled in config and both PIDs are supported according to the 0100 response
-    if state.config.lock().unwrap().obd2.test_multi_pid {
-        info!("Testing multi-PID query support...");
-        watchdog.feed();
-        let supports_multi_pid =
-            if let Some(supported_0100) = &state.supported_pids.lock().unwrap()[0] {
-                // Check if PIDs 0C and 0D are supported in the 0100 bitmask
-                // Response format: "41 00 XX XX XX XX" - we need to parse the 4 data bytes
-                let pids_0c_0d_supported = is_pid_supported_in_response(supported_0100, 0x0C)
-                    && is_pid_supported_in_response(supported_0100, 0x0D);
-
-                if pids_0c_0d_supported {
-                    match execute_command(&mut stream, b"010C0D", timeout) {
-                        Ok(response) => {
-                            // Multi-PID responses can be:
-                            // 1. Separate headers: "410CXXXX410DYY" (each PID has its own 41 prefix)
-                            // 2. Concatenated: "410CXXXX0DYY" (only first PID has header)
-                            // Either way, a successful multi-PID response will have 410C followed
-                            // by RPM data (2 bytes = 4 hex chars), then 0D data somewhere after
-                            let response_str =
-                                String::from_utf8_lossy(&response).to_ascii_uppercase();
-                            let has_rpm = response_str.contains("410C");
-
-                            // After 410C there should be 4 hex chars of RPM data, then either
-                            // "410D" (separate) or "0D" (concatenated) followed by speed data
-                            let has_speed = if let Some(pos) = response_str.find("410C") {
-                                let after_rpm = &response_str[pos + 4..]; // skip "410C"
-                                // RPM is 2 bytes = 4 hex chars, then look for 0D or 410D
-                                after_rpm.len() >= 4 && {
-                                    let after_rpm_data = &after_rpm[4..]; // skip RPM data
-                                    after_rpm_data.starts_with("410D")
-                                        || after_rpm_data.starts_with("0D")
-                                }
-                            } else {
-                                false
-                            };
-
-                            let supported = has_rpm && has_speed;
-                            if supported {
-                                info!("ECU supports multi-PID queries");
-
-                                // Test if repeat command works with multi-PID queries
-                                match execute_command(&mut stream, b"1", timeout) {
-                                    Ok(repeat_response) => {
-                                        let repeat_str =
-                                            String::from_utf8_lossy(&repeat_response)
-                                                .to_ascii_uppercase();
-                                        // Same detection logic for repeat response
-                                        let repeat_valid =
-                                            if let Some(pos) = repeat_str.find("410C") {
-                                                let after_rpm = &repeat_str[pos + 4..];
-                                                after_rpm.len() >= 4 && {
-                                                    let after_rpm_data = &after_rpm[4..];
-                                                    after_rpm_data.starts_with("410D")
-                                                        || after_rpm_data.starts_with("0D")
-                                                }
-                                            } else {
-                                                false
-                                            };
-                                        if repeat_valid {
-                                            info!("Repeat command works with multi-PID queries");
-                                        } else if repeat_str.contains('?') {
-                                            info!("Repeat command not supported");
-                                        } else {
-                                            info!(
-                                            "Repeat command gave unexpected response for multi-PID: {repeat_str:?}"
-                                        );
-                                        }
-                                    }
-                                    Err(e) => {
-                                        info!("Repeat command test failed: {e}");
-                                    }
-                                }
-                            } else {
-                                info!(
-                                    "ECU does not support multi-PID queries (response: {response_str:?})"
-                                );
-                            }
-                            supported
-                        }
-                        Err(e) => {
-                            info!("Multi-PID query test failed: {e}, assuming not supported");
-                            false
-                        }
-                    }
-                } else {
-                    info!("PIDs 0C and/or 0D not supported, skipping multi-PID test");
-                    false
-                }
-            } else {
-                info!("No 0100 response available, skipping multi-PID test");
-                false
-            };
-        state
-            .supports_multi_pid
-            .store(supports_multi_pid, Ordering::Relaxed);
-    }
+    // Test multi-PID query support
+    let supports_multi_pid = test_multi_pid_support(&mut stream, timeout, watchdog, state);
+    state
+        .supports_multi_pid
+        .store(supports_multi_pid, Ordering::Relaxed);
 
     info!("Connected to OBD2 dongle");
 
@@ -1128,14 +1214,12 @@ fn execute_command(
 
 pub struct Obd2Proxy {
     state: Arc<State>,
-    cache_manager_tx: CacheManagerSender,
 }
 
 /// RAII guard to decrement client count and remove TCP info on drop
 struct ClientCountGuard<'a> {
     state: &'a State,
     tcp_info: (SocketAddr, SocketAddr),
-    cache_manager_tx: CacheManagerSender,
     client_id: ClientId,
 }
 
@@ -1148,16 +1232,16 @@ impl Drop for ClientCountGuard<'_> {
             .unwrap()
             .retain(|&x| x != self.tcp_info);
         let _ = self
+            .state
             .cache_manager_tx
             .send(CacheManagerMessage::UnregisterClient(self.client_id));
     }
 }
 
 impl Obd2Proxy {
-    pub fn new(state: Arc<State>, cache_manager_tx: CacheManagerSender) -> Self {
+    pub fn new(state: Arc<State>) -> Self {
         Self {
             state,
-            cache_manager_tx,
         }
     }
 
@@ -1166,7 +1250,7 @@ impl Obd2Proxy {
 
         let listen_port = self.state.config.lock().unwrap().obd2.listen_port;
         let listener = TcpListener::bind(format!("0.0.0.0:{listen_port}"))?;
-        let watchdog = WatchdogHandle::register("obd2_proxy");
+        let watchdog = WatchdogHandle::register(c"obd2_proxy");
 
         listener.set_nonblocking(true)?;
 
@@ -1178,10 +1262,9 @@ impl Obd2Proxy {
             match listener.accept() {
                 Ok((stream, _)) => {
                     let state = self.state.clone();
-                    let cache_manager_tx = self.cache_manager_tx.clone();
 
                     crate::thread_util::spawn_named(c"obd2_client", move || {
-                        if let Err(e) = Self::handle_client(stream, &state, cache_manager_tx) {
+                        if let Err(e) = Self::handle_client(stream, &state) {
                             error!("Error handling client: {e:?}");
                         }
                     });
@@ -1196,11 +1279,11 @@ impl Obd2Proxy {
         }
     }
 
+    // TcpStream is moved into this function for exclusive ownership of the connection
     #[allow(clippy::needless_pass_by_value)]
     fn handle_client(
         client_stream: TcpStream,
         state: &Arc<State>,
-        cache_manager_tx: CacheManagerSender,
     ) -> Result<()> {
         let peer = client_stream.peer_addr()?;
         let local = client_stream.local_addr()?;
@@ -1208,7 +1291,7 @@ impl Obd2Proxy {
 
         // Register with cache manager
         let (reply_tx, reply_rx) = oneshot::channel();
-        cache_manager_tx
+        state.cache_manager_tx
             .send(CacheManagerMessage::RegisterClient(reply_tx))
             .map_err(|_| anyhow::anyhow!("Cache manager channel closed"))?;
         let (client_id, client_cache) = reply_rx
@@ -1223,7 +1306,6 @@ impl Obd2Proxy {
         let _guard = ClientCountGuard {
             state,
             tcp_info,
-            cache_manager_tx: cache_manager_tx.clone(),
             client_id,
         };
 
@@ -1231,7 +1313,7 @@ impl Obd2Proxy {
         client_stream.set_read_timeout(Some(timeout))?;
         client_stream.set_write_timeout(Some(timeout))?;
 
-        let watchdog = WatchdogHandle::register("obd2_client");
+        let watchdog = WatchdogHandle::register(c"obd2_client");
 
         let mut reader = BufReader::new(&client_stream);
         let mut writer = &client_stream;
@@ -1266,7 +1348,6 @@ impl Obd2Proxy {
                                 &mut writer,
                                 &mut client_state,
                                 state,
-                                &cache_manager_tx,
                                 &client_cache,
                             )?;
                         }
@@ -1293,7 +1374,6 @@ impl Obd2Proxy {
         writer: &mut &TcpStream,
         client_state: &mut ClientState,
         state: &Arc<State>,
-        cache_manager_tx: &CacheManagerSender,
         client_cache: &Arc<Mutex<ClientCache>>,
     ) -> Result<()> {
         // Handle AT commands locally
@@ -1356,7 +1436,7 @@ impl Obd2Proxy {
 
         // Get value from cache
         let timeout = Duration::from_millis(state.config.lock().unwrap().obd2_timeout_ms);
-        match Self::get_cached_value(&cache_key, client_cache, cache_manager_tx, timeout) {
+        match Self::get_cached_value(&cache_key, client_cache, state, timeout) {
             Ok(response) => {
                 client_state.last_obd_command = Some(effective_command);
 
@@ -1380,7 +1460,7 @@ impl Obd2Proxy {
     fn get_cached_value(
         pid: &Obd2Buffer,
         client_cache: &Arc<Mutex<ClientCache>>,
-        cache_manager_tx: &CacheManagerSender,
+        state: &Arc<State>,
         timeout: Duration,
     ) -> Result<Obd2Buffer, DongleError> {
         let mut cache_guard = client_cache.lock().unwrap();
@@ -1388,7 +1468,7 @@ impl Obd2Proxy {
         // Swap entry with Empty, check what was there
         match cache_guard.entries.insert(pid.clone(), CacheEntry::Empty) {
             Some(CacheEntry::Fresh(v)) => {
-                let _ = cache_manager_tx.send(CacheManagerMessage::Consumed {
+                let _ = state.cache_manager_tx.send(CacheManagerMessage::Consumed {
                     pid: pid.clone(),
                     wait_duration: None,
                 });
@@ -1396,7 +1476,7 @@ impl Obd2Proxy {
             }
             Some(CacheEntry::Empty) | None => {
                 // Cache miss - signal that we need this PID (may promote to fast)
-                let _ = cache_manager_tx.send(CacheManagerMessage::Waiting(pid.clone()));
+                let _ = state.cache_manager_tx.send(CacheManagerMessage::Waiting(pid.clone()));
 
                 // Register waiter
                 let (tx, rx) = oneshot::channel();
@@ -1422,7 +1502,7 @@ impl Obd2Proxy {
                     // Not Fresh after notification - logic error or race
                     return Err(DongleError::NotConnected);
                 };
-                let _ = cache_manager_tx.send(CacheManagerMessage::Consumed {
+                let _ = state.cache_manager_tx.send(CacheManagerMessage::Consumed {
                     pid: pid.clone(),
                     wait_duration: Some(wait_duration),
                 });

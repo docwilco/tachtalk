@@ -45,7 +45,7 @@ fn run_sse_server(rx: &Receiver<SseMessage>, state: &Arc<State>) -> std::io::Res
     let listener = TcpListener::bind(("0.0.0.0", SSE_PORT))?;
     listener.set_nonblocking(true)?;
 
-    let watchdog = WatchdogHandle::register("sse_server");
+    let watchdog = WatchdogHandle::register(c"sse_server");
 
     info!("SSE server started on port {SSE_PORT}");
 
