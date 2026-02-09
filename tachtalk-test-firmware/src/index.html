@@ -472,7 +472,7 @@
             // Show/hide mode-specific config
             document.getElementById('pipelineConfig').classList.toggle('visible', mode === 'pipelined');
             document.getElementById('captureConfig').classList.toggle('visible', mode === 'raw_capture');
-            document.getElementById('captureMetrics').classList.toggle('visible', mode === 'raw_capture');
+            document.getElementById('captureMetrics').classList.toggle('visible', mode !== 'pipelined');
             
             // Show/hide polling toggles (only for polling modes)
             const isPolling = mode !== 'pipelined' && mode !== 'raw_capture';
@@ -700,11 +700,19 @@
                 `<span class="status-indicator ${testRunning ? 'status-running' : 'status-disconnected'}"></span>` +
                 `${testRunning ? 'Running' : 'Stopped'}`;
             
-            // Update capture metrics (Mode 5)
-            if (document.getElementById('queryMode').value === 'raw_capture') {
-                document.getElementById('clientStatus').innerHTML = 
-                    `<span class="status-indicator ${data.client_connected ? 'status-connected' : 'status-disconnected'}"></span>` +
-                    `Client: ${data.client_connected ? 'Connected' : 'Disconnected'}`;
+            // Update capture metrics
+            const mode = document.getElementById('queryMode').value;
+            if (mode !== 'pipelined') {
+                // Client status only relevant for raw_capture (TCP proxy)
+                const clientStatusEl = document.getElementById('clientStatus');
+                if (mode === 'raw_capture') {
+                    clientStatusEl.style.display = '';
+                    clientStatusEl.innerHTML = 
+                        `<span class="status-indicator ${data.client_connected ? 'status-connected' : 'status-disconnected'}"></span>` +
+                        `Client: ${data.client_connected ? 'Connected' : 'Disconnected'}`;
+                } else {
+                    clientStatusEl.style.display = 'none';
+                }
                 
                 const bufferPct = data.buffer_usage_pct || 0;
                 const progressBar = document.getElementById('bufferProgress');

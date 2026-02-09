@@ -125,19 +125,35 @@ impl PidSelector {
 // ============================================================================
 
 /// Lowest layer: sends bytes with `\r` suffix, reads until `>` prompt.
+///
+/// Every command and response is recorded to the shared capture buffer
+/// for later download.
 struct Base {
     stream: TcpStream,
     timeout: Duration,
+    /// Capture state for recording traffic.
+    capture_state: CaptureState,
+}
+
+/// State needed to record traffic to the shared capture buffer.
+struct CaptureState {
+    state: Arc<State>,
+    config: CaptureConfig,
+    start: Instant,
 }
 
 impl Base {
     /// Connect to dongle, configure socket, and run general AT init commands.
     ///
     /// Does **not** send `ATH` — that is the [`FramingLayer`]'s responsibility.
+    ///
+    /// All sent commands and received responses are recorded to the shared
+    /// capture buffer via `capture_state`.
     fn connect_and_init(
         dongle_ip: &str,
         dongle_port: u16,
         timeout: Duration,
+        capture_state: CaptureState,
     ) -> Result<Self, String> {
         let addr = format!("{dongle_ip}:{dongle_port}");
         info!("Connecting to dongle at {addr}...");
@@ -146,7 +162,11 @@ impl Base {
         stream.set_read_timeout(Some(timeout)).ok();
         stream.set_nodelay(true).ok();
 
-        let mut base = Self { stream, timeout };
+        let mut base = Self {
+            stream,
+            timeout,
+            capture_state,
+        };
 
         // General AT init (no ATH — that belongs to FramingLayer)
         base.execute(b"ATZ")?;
@@ -159,6 +179,9 @@ impl Base {
     }
 
     /// Send `command` + `\r`, read until `>` prompt, return raw response.
+    ///
+    /// When capture is enabled, records the sent command as `ClientToDongle`
+    /// and the raw response as `DongleToClient`.
     fn execute(&mut self, command: &[u8]) -> Result<Obd2Buffer, String> {
         let mut cmd_with_cr: Obd2Buffer = command.into();
         if !cmd_with_cr.ends_with(b"\r") {
@@ -168,6 +191,15 @@ impl Base {
         debug!(
             "Sending to dongle: {:?}",
             String::from_utf8_lossy(&cmd_with_cr)
+        );
+
+        // Record sent command
+        record_event(
+            &self.capture_state.state,
+            self.capture_state.start.elapsed(),
+            RecordType::ClientToDongle,
+            &cmd_with_cr,
+            self.capture_state.config,
         );
 
         self.stream
@@ -204,6 +236,15 @@ impl Base {
                 Err(e) => return Err(format!("Read error: {e}")),
             }
         }
+
+        // Record received response
+        record_event(
+            &self.capture_state.state,
+            self.capture_state.start.elapsed(),
+            RecordType::DongleToClient,
+            &response,
+            self.capture_state.config,
+        );
 
         Ok(response)
     }
@@ -610,7 +651,11 @@ impl QueryBuilder {
     }
 
     /// Run the polling loop with the configured layer stack.
-    fn run_polling_loop(&mut self, ctx: &TestContext) -> Result<(), String> {
+    fn run_polling_loop(
+        &mut self,
+        ctx: &TestContext,
+        capture_config: CaptureConfig,
+    ) -> Result<(), String> {
         let mut fast_index: usize = 0;
         let mut slow_index: usize = 0;
         let mut fast_count: u32 = 0;
@@ -624,7 +669,7 @@ impl QueryBuilder {
                 return Ok(());
             }
 
-            // Update requests/sec metric
+            // Update requests/sec and buffer usage metrics
             if last_second.elapsed() >= Duration::from_secs(1) {
                 ctx.state
                     .metrics
@@ -632,6 +677,15 @@ impl QueryBuilder {
                     .store(requests_this_second, Ordering::Relaxed);
                 requests_this_second = 0;
                 last_second = Instant::now();
+
+                let buf_len = ctx.state.capture_buffer.lock().unwrap().len() as u64;
+                let usage_pct =
+                    u32::try_from(buf_len * 100 / u64::from(capture_config.buffer_size))
+                        .expect("percentage fits in u32");
+                ctx.state
+                    .metrics
+                    .buffer_usage_pct
+                    .store(usage_pct, Ordering::Relaxed);
             }
 
             if self.fast_pids.is_empty() && self.slow_pids.is_empty() {
@@ -957,8 +1011,26 @@ fn run_test(ctx: &TestContext, start_options: StartOptions) {
 
 /// Run polling test (modes 1-3) using the layered architecture.
 fn run_polling_test(ctx: &TestContext, config: &TestConfig) -> Result<(), String> {
+    // Pre-allocate capture buffer for traffic recording
+    {
+        let mut buf_guard = ctx.state.capture_buffer.lock().unwrap();
+        buf_guard.clear();
+        buf_guard.reserve(config.capture.buffer_size as usize);
+    }
+
+    let capture_state = CaptureState {
+        state: Arc::clone(ctx.state),
+        config: config.capture,
+        start: Instant::now(),
+    };
+
     // Layer 1: Base — connect and general AT init
-    let base = Base::connect_and_init(&config.dongle_ip, config.dongle_port, config.timeout)?;
+    let base = Base::connect_and_init(
+        &config.dongle_ip,
+        config.dongle_port,
+        config.timeout,
+        capture_state,
+    )?;
     ctx.state.dongle_connected.store(true, Ordering::Relaxed);
 
     // Layer 2: Repeat
@@ -984,7 +1056,7 @@ fn run_polling_test(ctx: &TestContext, config: &TestConfig) -> Result<(), String
     )?;
 
     // Run the polling loop
-    query_builder.run_polling_loop(ctx)
+    query_builder.run_polling_loop(ctx, config.capture)
 }
 
 /// Run pipelined test (mode 4)
