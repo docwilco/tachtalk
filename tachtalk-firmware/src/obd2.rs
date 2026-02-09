@@ -34,6 +34,9 @@ const RPM_PID: &[u8] = b"010C";
 /// Type alias for small OBD2 command/response buffers
 pub type Obd2Buffer = SmallVec<[u8; 12]>;
 
+/// Cached OBD2 response: one entry per ECU response. Most PIDs get exactly 1.
+pub type CachedResponse = SmallVec<[Obd2Buffer; 1]>;
+
 /// Supported PID query commands (0100, 0120, 0140, 0160, 0180, 01A0, 01C0, 01E0)
 const SUPPORTED_PID_QUERIES: [&[u8]; 8] = [
     b"0100", b"0120", b"0140", b"0160", b"0180", b"01A0", b"01C0", b"01E0",
@@ -126,14 +129,52 @@ fn normalize_obd_command(cmd: &[u8]) -> Obd2Buffer {
     }
 }
 
+/// Count OBD2 response headers (`"41"`) in a raw dongle response to determine
+/// how many ECUs responded.
+fn count_response_headers(response: &[u8]) -> u8 {
+    let response_str = String::from_utf8_lossy(response);
+    let count = response_str.to_ascii_uppercase().matches("41").count();
+    // Response counts are small; truncate to u8 if something goes wrong
+    u8::try_from(count).unwrap_or(u8::MAX)
+}
+
+/// Parse a raw dongle response into individual ECU response lines.
+///
+/// The dongle returns responses like `b"410C1AF8\r410C1B00\r\r>"`.
+/// This splits on `\r`, filters out empty strings and the `>` prompt,
+/// and returns each ECU response as a separate [`Obd2Buffer`].
+fn parse_response_lines(raw: &Obd2Buffer) -> CachedResponse {
+    raw.split(|&b| b == b'\r')
+        .filter(|line| !line.is_empty() && line != b">")
+        .map(Obd2Buffer::from_slice)
+        .collect()
+}
+
+/// Reconstruct an ELM327 wire-format response from cached per-ECU response lines.
+///
+/// Produces the format clients expect: `{le}{line1}{le}{line2}...{le}>`
+/// where each line gets space-insertion via [`ClientState::format_response`].
+fn format_cached_for_client(values: &CachedResponse, client_state: &ClientState) -> Vec<u8> {
+    let le = client_state.line_ending();
+    let mut result = Vec::new();
+    for val in values {
+        let formatted = client_state.format_response(val);
+        result.extend_from_slice(le.as_bytes());
+        result.extend_from_slice(&formatted);
+    }
+    result.extend_from_slice(le.as_bytes());
+    result.push(b'>');
+    result
+}
+
 // ============================================================================
 // Cache Types
 // ============================================================================
 
 /// Entry in a per-client PID cache
 pub enum CacheEntry {
-    /// Fresh value ready to be consumed
-    Fresh(Obd2Buffer),
+    /// Fresh value ready to be consumed (one buffer per ECU response)
+    Fresh(CachedResponse),
     /// No value available (consumed or not yet received)
     Empty,
     /// Client is waiting for this PID
@@ -185,8 +226,8 @@ pub enum CacheManagerMessage {
     DongleResponse {
         /// The PID that was polled
         pid: Obd2Buffer,
-        /// The response (or error)
-        response: Result<Obd2Buffer, DongleError>,
+        /// The parsed response lines (one per ECU), or error
+        response: Result<CachedResponse, DongleError>,
     },
     /// Client registered a waiter for this PID (promote to fast)
     Waiting(Obd2Buffer),
@@ -262,12 +303,50 @@ struct DongleState {
     stream: TcpStream,
     /// Whether the dongle supports the "1" repeat command (None = untested)
     supports_repeat: Option<bool>,
-    /// Last OBD2 command sent (for repeat optimization)
+    /// Last OBD2 command sent (base PID, without response count suffix)
     last_command: Option<Obd2Buffer>,
+    /// Learned response counts per PID (how many ECUs respond).
+    /// On first request for a PID, we send without a count to learn it.
+    /// Subsequent requests append the count for faster dongle response.
+    response_counts: HashMap<Obd2Buffer, u8>,
 }
 
 impl DongleState {
+    /// Build the wire command for a PID, appending the learned response count if known.
+    fn build_wire_command(&self, base_command: &Obd2Buffer) -> Obd2Buffer {
+        if let Some(&count) = self.response_counts.get(base_command) {
+            let mut cmd = base_command.clone();
+            cmd.push(b' ');
+            // Response counts are small (1-9 in practice)
+            if count >= 10 {
+                cmd.push(b'0' + count / 10);
+            }
+            cmd.push(b'0' + count % 10);
+            cmd
+        } else {
+            base_command.clone()
+        }
+    }
+
+    /// Learn the response count from a dongle response by counting `"41"` headers.
+    fn learn_response_count(&mut self, command: &Obd2Buffer, response: &Obd2Buffer) {
+        if self.response_counts.contains_key(command) {
+            return;
+        }
+        let count = count_response_headers(response);
+        if count > 0 {
+            info!(
+                "Learned response count for {:?}: {count}",
+                String::from_utf8_lossy(command)
+            );
+            self.response_counts.insert(command.clone(), count);
+        }
+    }
+
     /// Execute a command, using the "1" repeat optimization when possible.
+    ///
+    /// On the first request for a PID, sends without a response count to learn
+    /// how many ECUs respond. Subsequent requests append the learned count.
     fn execute_with_repeat(
         &mut self,
         command: &Obd2Buffer,
@@ -290,8 +369,15 @@ impl DongleState {
                     // Repeat not supported, mark and resend full command
                     info!("Dongle does not support repeat command");
                     self.supports_repeat = Some(false);
+                    let wire_cmd = self.build_wire_command(command);
                     self.last_command = Some(command.clone());
-                    execute_command(&mut self.stream, command, timeout)
+                    let result = execute_command(&mut self.stream, &wire_cmd, timeout);
+                    if let Ok(ref resp) = result {
+                        self.learn_response_count(command, resp);
+                    } else {
+                        self.last_command = None;
+                    }
+                    result
                 } else {
                     // Repeat worked! last_command stays the same
                     if self.supports_repeat.is_none() {
@@ -306,13 +392,23 @@ impl DongleState {
                 repeat_result
             }
         } else {
+            // Build wire command with response count if known
+            let wire_cmd = if command.starts_with(b"AT") {
+                command.clone()
+            } else {
+                self.build_wire_command(command)
+            };
+
             // Update last_command before sending
             if !command.starts_with(b"AT") {
                 self.last_command = Some(command.clone());
             }
-            let result = execute_command(&mut self.stream, command, timeout);
-            if result.is_err() {
-                self.last_command = None;
+            let result = execute_command(&mut self.stream, &wire_cmd, timeout);
+            match &result {
+                Ok(resp) => self.learn_response_count(command, resp),
+                Err(_) => {
+                    self.last_command = None;
+                }
             }
             result
         }
@@ -451,7 +547,7 @@ impl PollingState {
 
             let _ = state.cache_manager_tx.send(CacheManagerMessage::DongleResponse {
                 pid: pid.clone(),
-                response: result,
+                response: result.map(|raw| parse_response_lines(&raw)),
             });
 
             requests += 1;
@@ -480,7 +576,7 @@ impl PollingState {
 
                     let _ = state.cache_manager_tx.send(CacheManagerMessage::DongleResponse {
                         pid: pid.clone(),
-                        response: result,
+                        response: result.map(|raw| parse_response_lines(&raw)),
                     });
 
                     requests += 1;
@@ -759,7 +855,7 @@ fn run_maintenance(
 fn update_client_caches(
     clients: &HashMap<ClientId, Arc<Mutex<ClientCache>>>,
     pid: &Obd2Buffer,
-    data: &Obd2Buffer,
+    data: &CachedResponse,
 ) {
     for client_cache in clients.values() {
         let mut cache_guard = client_cache.lock().unwrap();
@@ -911,12 +1007,16 @@ pub fn cache_manager_task(
                 if let Ok(ref data) = response {
                     update_client_caches(&clients, &pid, data);
 
-                    // Extract RPM and send to LED task
+                    // Extract RPM from the first ECU response line
                     if pid.as_slice() == RPM_PID {
-                        if let Some(rpm) = tachtalk_elm327_lib::extract_rpm_from_response(data) {
-                            debug!("Cache manager extracted RPM: {rpm}");
-                            let _ = state.rpm_tx.send(RpmTaskMessage::Rpm(rpm));
-                            *state.shared_rpm.lock().unwrap() = Some(rpm);
+                        if let Some(first) = data.first() {
+                            if let Some(rpm) =
+                                tachtalk_elm327_lib::extract_rpm_from_response(first)
+                            {
+                                debug!("Cache manager extracted RPM: {rpm}");
+                                let _ = state.rpm_tx.send(RpmTaskMessage::Rpm(rpm));
+                                *state.shared_rpm.lock().unwrap() = Some(rpm);
+                            }
                         }
                     }
                 }
@@ -1147,6 +1247,7 @@ fn try_connect(
             stream,
             supports_repeat: None,
             last_command: None,
+            response_counts: HashMap::new(),
         },
         local_addr,
         remote_addr,
@@ -1440,7 +1541,7 @@ impl Obd2Proxy {
             Ok(response) => {
                 client_state.last_obd_command = Some(effective_command);
 
-                let formatted = client_state.format_response(&response);
+                let formatted = format_cached_for_client(&response, client_state);
                 writer
                     .write_all(&formatted)
                     .context("Failed to write response")?;
@@ -1462,7 +1563,7 @@ impl Obd2Proxy {
         client_cache: &Arc<Mutex<ClientCache>>,
         state: &Arc<State>,
         timeout: Duration,
-    ) -> Result<Obd2Buffer, DongleError> {
+    ) -> Result<CachedResponse, DongleError> {
         let mut cache_guard = client_cache.lock().unwrap();
 
         // Swap entry with Empty, check what was there
