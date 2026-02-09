@@ -3,6 +3,7 @@ use esp_idf_svc::nvs::{EspNvs, EspNvsPartition, NvsDefault};
 use esp_idf_svc::sys::{esp_mac_type_t_ESP_MAC_WIFI_STA, esp_read_mac};
 use log::{debug, info, warn, LevelFilter};
 use serde::{Deserialize, Serialize};
+use smallvec::SmallVec;
 use std::net::Ipv4Addr;
 use std::sync::Mutex;
 
@@ -66,15 +67,148 @@ pub enum QueryMode {
     RawCapture,
 }
 
-/// Method for counting responses in `AdaptiveCount` mode
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum ResponseCountMethod {
-    /// Count occurrences of response header (e.g., `41`)
-    #[default]
-    CountResponseHeaders,
-    /// Count non-empty lines before `>`
-    CountLines,
+/// Options sent with the Start command (not persisted in NVS).
+#[derive(Debug, Default, Clone, Deserialize)]
+pub struct StartOptions {
+    #[serde(default)]
+    pub query_mode: QueryMode,
+    #[serde(default)]
+    pub use_multi_pid: bool,
+    #[serde(default)]
+    pub use_repeat: bool,
+    /// Repeat command string. Empty = bare CR (ELM327 spec), `"1"` = common WiFi dongle convention.
+    #[serde(default)]
+    pub repeat_string: String,
+    #[serde(default)]
+    pub use_framing: bool,
+}
+
+/// Response data byte count for each Mode 01 PID (excludes service byte and PID byte).
+/// Indexed by PID byte. `0` = unknown/unsupported PID.
+/// Source: SAE J1979 / ISO 15031-5.
+#[rustfmt::skip]
+const MODE01_PID_DATA_LENGTHS: [u8; 256] = {
+    let mut t = [0u8; 256];
+    // 0x00-0x20: PIDs supported bitmasks and basic engine data
+    t[0x00] = 4; // PIDs supported [01-20]
+    t[0x01] = 4; // Monitor status since DTCs cleared
+    t[0x02] = 2; // Freeze DTC
+    t[0x03] = 2; // Fuel system status
+    t[0x04] = 1; // Calculated engine load
+    t[0x05] = 1; // Engine coolant temperature
+    t[0x06] = 1; // Short term fuel trim — Bank 1
+    t[0x07] = 1; // Long term fuel trim — Bank 1
+    t[0x08] = 1; // Short term fuel trim — Bank 2
+    t[0x09] = 1; // Long term fuel trim — Bank 2
+    t[0x0A] = 1; // Fuel pressure
+    t[0x0B] = 1; // Intake manifold absolute pressure
+    t[0x0C] = 2; // Engine RPM
+    t[0x0D] = 1; // Vehicle speed
+    t[0x0E] = 1; // Timing advance
+    t[0x0F] = 1; // Intake air temperature
+    t[0x10] = 2; // MAF air flow rate
+    t[0x11] = 1; // Throttle position
+    t[0x12] = 1; // Commanded secondary air status
+    t[0x13] = 1; // O2 sensors present (2 banks)
+    t[0x14] = 2; // O2 sensor 1 — voltage & trim
+    t[0x15] = 2; // O2 sensor 2
+    t[0x16] = 2; // O2 sensor 3
+    t[0x17] = 2; // O2 sensor 4
+    t[0x18] = 2; // O2 sensor 5
+    t[0x19] = 2; // O2 sensor 6
+    t[0x1A] = 2; // O2 sensor 7
+    t[0x1B] = 2; // O2 sensor 8
+    t[0x1C] = 1; // OBD standards this vehicle conforms to
+    t[0x1D] = 1; // O2 sensors present (4 banks)
+    t[0x1E] = 1; // Auxiliary input status
+    t[0x1F] = 2; // Run time since engine start
+    // 0x20-0x40
+    t[0x20] = 4; // PIDs supported [21-40]
+    t[0x21] = 2; // Distance traveled with MIL on
+    t[0x22] = 2; // Fuel rail pressure (relative to manifold vacuum)
+    t[0x23] = 2; // Fuel rail gauge pressure (diesel/GDI)
+    t[0x24] = 4; // O2 sensor 1 — equiv ratio & voltage
+    t[0x25] = 4; // O2 sensor 2
+    t[0x26] = 4; // O2 sensor 3
+    t[0x27] = 4; // O2 sensor 4
+    t[0x28] = 4; // O2 sensor 5
+    t[0x29] = 4; // O2 sensor 6
+    t[0x2A] = 4; // O2 sensor 7
+    t[0x2B] = 4; // O2 sensor 8
+    t[0x2C] = 1; // Commanded EGR
+    t[0x2D] = 1; // EGR error
+    t[0x2E] = 1; // Commanded evaporative purge
+    t[0x2F] = 1; // Fuel tank level input
+    t[0x30] = 1; // Warm-ups since codes cleared
+    t[0x31] = 2; // Distance traveled since codes cleared
+    t[0x32] = 2; // Evap system vapor pressure
+    t[0x33] = 1; // Absolute barometric pressure
+    t[0x34] = 4; // O2 sensor 1 — equiv ratio & current
+    t[0x35] = 4; // O2 sensor 2
+    t[0x36] = 4; // O2 sensor 3
+    t[0x37] = 4; // O2 sensor 4
+    t[0x38] = 4; // O2 sensor 5
+    t[0x39] = 4; // O2 sensor 6
+    t[0x3A] = 4; // O2 sensor 7
+    t[0x3B] = 4; // O2 sensor 8
+    t[0x3C] = 2; // Catalyst temperature: Bank 1, Sensor 1
+    t[0x3D] = 2; // Catalyst temperature: Bank 2, Sensor 1
+    t[0x3E] = 2; // Catalyst temperature: Bank 1, Sensor 2
+    t[0x3F] = 2; // Catalyst temperature: Bank 2, Sensor 2
+    // 0x40-0x60
+    t[0x40] = 4; // PIDs supported [41-60]
+    t[0x41] = 4; // Monitor status this drive cycle
+    t[0x42] = 2; // Control module voltage
+    t[0x43] = 2; // Absolute load value
+    t[0x44] = 2; // Fuel-air commanded equivalence ratio
+    t[0x45] = 1; // Relative throttle position
+    t[0x46] = 1; // Ambient air temperature
+    t[0x47] = 1; // Absolute throttle position B
+    t[0x48] = 1; // Absolute throttle position C
+    t[0x49] = 1; // Accelerator pedal position D
+    t[0x4A] = 1; // Accelerator pedal position E
+    t[0x4B] = 1; // Accelerator pedal position F
+    t[0x4C] = 1; // Commanded throttle actuator
+    t[0x4D] = 2; // Time run with MIL on
+    t[0x4E] = 2; // Time since trouble codes cleared
+    t[0x4F] = 4; // Max values (equiv ratio, O2 voltage, O2 current, intake pressure)
+    t[0x50] = 4; // Max air flow rate from MAF sensor
+    t[0x51] = 1; // Fuel type
+    t[0x52] = 1; // Ethanol fuel %
+    t[0x53] = 2; // Absolute evap system vapor pressure
+    t[0x54] = 2; // Evap system vapor pressure
+    t[0x55] = 2; // Short term secondary O2 trim — Bank 1 & 3
+    t[0x56] = 2; // Long term secondary O2 trim — Bank 1 & 3
+    t[0x57] = 2; // Short term secondary O2 trim — Bank 2 & 4
+    t[0x58] = 2; // Long term secondary O2 trim — Bank 2 & 4
+    t[0x59] = 2; // Fuel rail absolute pressure
+    t[0x5A] = 1; // Relative accelerator pedal position
+    t[0x5B] = 1; // Hybrid battery pack remaining life
+    t[0x5C] = 1; // Engine oil temperature
+    t[0x5D] = 2; // Fuel injection timing
+    t[0x5E] = 2; // Engine fuel rate
+    t[0x5F] = 1; // Emission requirements
+    // 0x60-0x80
+    t[0x60] = 4; // PIDs supported [61-80]
+    t[0x61] = 1; // Driver's demand engine — percent torque
+    t[0x62] = 1; // Actual engine — percent torque
+    t[0x63] = 2; // Engine reference torque
+    t[0x64] = 5; // Engine percent torque data
+    t[0x65] = 2; // Auxiliary input / output supported
+    // 0x80-0xA0
+    t[0x80] = 4; // PIDs supported [81-A0]
+    // 0xA0-0xC0
+    t[0xA0] = 4; // PIDs supported [A1-C0]
+    // 0xC0-0xE0
+    t[0xC0] = 4; // PIDs supported [C1-E0]
+    t
+};
+
+/// Look up the response data byte count for a Mode 01 PID.
+/// Returns 0 for unknown/unsupported PIDs.
+#[must_use]
+pub const fn pid_data_length(pid: u8) -> u8 {
+    MODE01_PID_DATA_LENGTHS[pid as usize]
 }
 
 /// Overflow behavior for capture buffer
@@ -168,9 +302,6 @@ pub struct TestConfig {
     /// Pipeline bytes on wire (mode 4)
     #[serde(default = "default_pipeline_bytes")]
     pub pipeline_bytes: u16,
-    /// Response count method (mode 3)
-    #[serde(default)]
-    pub response_count_method: ResponseCountMethod,
     /// Capture buffer size in bytes (mode 5)
     #[serde(default = "default_capture_buffer_size")]
     pub capture_buffer_size: u32,
@@ -226,7 +357,6 @@ impl Default for TestConfig {
             fast_pids: default_fast_pids(),
             slow_pids: default_slow_pids(),
             pipeline_bytes: default_pipeline_bytes(),
-            response_count_method: ResponseCountMethod::default(),
             capture_buffer_size: default_capture_buffer_size(),
             capture_overflow: CaptureOverflow::default(),
             obd2_timeout_ms: default_obd2_timeout_ms(),
@@ -235,21 +365,33 @@ impl Default for TestConfig {
 }
 
 impl TestConfig {
-    /// Parse fast PIDs from comma-separated string
-    pub fn get_fast_pids(&self) -> Vec<String> {
-        self.fast_pids
-            .split(',')
-            .map(|s| s.trim().to_uppercase())
-            .filter(|s| !s.is_empty())
-            .collect()
+    /// Parse fast PIDs from comma-separated string (e.g. `"010C,0149"` → `[0x0C, 0x49]`).
+    ///
+    /// Assumes all PIDs are Mode 01. Strips the leading `01` service byte and parses
+    /// the remaining two hex digits as a `u8`. Silently skips entries that are too
+    /// short or contain invalid hex.
+    pub fn get_fast_pids(&self) -> SmallVec<[u8; 8]> {
+        Self::parse_pid_list(&self.fast_pids)
     }
 
-    /// Parse slow PIDs from comma-separated string
-    pub fn get_slow_pids(&self) -> Vec<String> {
-        self.slow_pids
-            .split(',')
-            .map(|s| s.trim().to_uppercase())
-            .filter(|s| !s.is_empty())
+    /// Parse slow PIDs from comma-separated string (e.g. `"0105"` → `[0x05]`).
+    ///
+    /// See [`Self::get_fast_pids`] for format details.
+    pub fn get_slow_pids(&self) -> SmallVec<[u8; 8]> {
+        Self::parse_pid_list(&self.slow_pids)
+    }
+
+    /// Parse a comma-separated PID string into a list of PID bytes.
+    fn parse_pid_list(s: &str) -> SmallVec<[u8; 8]> {
+        s.split(',')
+            .filter_map(|entry| {
+                let trimmed = entry.trim();
+                // Expect at least 4 chars: "01XX"
+                if trimmed.len() < 4 {
+                    return None;
+                }
+                u8::from_str_radix(&trimmed[2..4], 16).ok()
+            })
             .collect()
     }
 }

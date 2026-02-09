@@ -207,6 +207,29 @@
             
             <div id="modeDescription" class="mode-description"></div>
             
+            <div id="pollingToggles">
+                <div class="form-group">
+                    <label>Multi-PID:</label>
+                    <input type="checkbox" id="useMultiPid">
+                    <span class="help-text">Combine PIDs into single query</span>
+                </div>
+                <div class="form-group">
+                    <label>Repeat:</label>
+                    <input type="checkbox" id="useRepeat">
+                    <span class="help-text">Use repeat command for identical queries</span>
+                </div>
+                <div class="form-group" id="repeatStringGroup" style="display: none;">
+                    <label>Repeat String:</label>
+                    <input type="text" id="repeatString" value="" style="width: 80px;">
+                    <span class="help-text">Empty = bare CR (ELM327 spec), "1" = WiFi dongle</span>
+                </div>
+                <div class="form-group">
+                    <label>Framing (ATH1):</label>
+                    <input type="checkbox" id="useFraming">
+                    <span class="help-text">Enable CAN headers for reliable ECU counting</span>
+                </div>
+            </div>
+            
             <div style="margin: 15px 0;">
                 <button id="startBtn" onclick="startTest()">Start Test</button>
                 <button id="stopBtn" onclick="stopTest()" disabled>Stop Test</button>
@@ -330,13 +353,6 @@
                         <option value="wrap">Wrap (lose oldest)</option>
                     </select>
                 </div>
-                <div class="form-group">
-                    <label>Response Count:</label>
-                    <select id="responseCountMethod">
-                        <option value="count_response_headers">Count "41" headers</option>
-                        <option value="count_lines">Count lines</option>
-                    </select>
-                </div>
             </div>
             
             <button onclick="saveConfig()">Save Configuration</button>
@@ -434,7 +450,6 @@
             document.getElementById('listenPort').value = config.test?.listen_port || 35000;
             document.getElementById('captureBuffer').value = (config.test?.capture_buffer_size || 4194304) / 1048576;
             document.getElementById('captureOverflow').value = config.test?.capture_overflow || 'stop';
-            document.getElementById('responseCountMethod').value = config.test?.response_count_method || 'count_response_headers';
             
             // WiFi config
             document.getElementById('wifiSsid').value = config.wifi?.ssid || '';
@@ -458,6 +473,15 @@
             document.getElementById('pipelineConfig').classList.toggle('visible', mode === 'pipelined');
             document.getElementById('captureConfig').classList.toggle('visible', mode === 'raw_capture');
             document.getElementById('captureMetrics').classList.toggle('visible', mode === 'raw_capture');
+            
+            // Show/hide polling toggles (only for polling modes)
+            const isPolling = mode !== 'pipelined' && mode !== 'raw_capture';
+            document.getElementById('pollingToggles').style.display = isPolling ? 'block' : 'none';
+        }
+
+        function updateRepeatUI() {
+            document.getElementById('repeatStringGroup').style.display =
+                document.getElementById('useRepeat').checked ? 'block' : 'none';
         }
 
         function updateDhcpUI() {
@@ -477,8 +501,7 @@
                     pipeline_bytes: parseInt(document.getElementById('pipelineBytes').value),
                     listen_port: parseInt(document.getElementById('listenPort').value),
                     capture_buffer_size: parseInt(document.getElementById('captureBuffer').value) * 1048576,
-                    capture_overflow: document.getElementById('captureOverflow').value,
-                    response_count_method: document.getElementById('responseCountMethod').value
+                    capture_overflow: document.getElementById('captureOverflow').value
                 },
                 wifi: {
                     ssid: document.getElementById('wifiSsid').value,
@@ -531,10 +554,20 @@
         async function startTest() {
             try {
                 const queryMode = document.getElementById('queryMode').value;
+                const body = { query_mode: queryMode };
+                
+                // Add polling toggles for non-pipeline/capture modes
+                if (queryMode !== 'pipelined' && queryMode !== 'raw_capture') {
+                    body.use_multi_pid = document.getElementById('useMultiPid').checked;
+                    body.use_repeat = document.getElementById('useRepeat').checked;
+                    body.repeat_string = document.getElementById('repeatString').value;
+                    body.use_framing = document.getElementById('useFraming').checked;
+                }
+                
                 await fetch('/api/test/start', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ query_mode: queryMode })
+                    body: JSON.stringify(body)
                 });
                 document.getElementById('startBtn').disabled = true;
                 document.getElementById('stopBtn').disabled = false;
@@ -721,6 +754,7 @@
         // Event listeners
         document.getElementById('queryMode').addEventListener('change', updateModeUI);
         document.getElementById('useDhcp').addEventListener('change', updateDhcpUI);
+        document.getElementById('useRepeat').addEventListener('change', updateRepeatUI);
 
         // Initialize
         loadConfig();

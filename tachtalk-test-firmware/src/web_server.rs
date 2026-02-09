@@ -376,31 +376,33 @@ fn register_test_routes(server: &mut EspHttpServer<'static>, state: &Arc<State>)
         move |mut req| -> Result<(), esp_idf_svc::io::EspIOError> {
             info!("HTTP: POST /api/test/start");
 
-            // Parse query mode from request body
-            let mut buf = [0u8; 256];
+            // Parse start options from request body
+            let mut buf = [0u8; 512];
             let bytes_read = req.read(&mut buf)?;
-            let query_mode = if bytes_read > 0 {
-                #[derive(serde::Deserialize)]
-                struct StartRequest {
-                    query_mode: crate::config::QueryMode,
-                }
-                match serde_json::from_slice::<StartRequest>(&buf[..bytes_read]) {
+            let start_options = if bytes_read > 0 {
+                match serde_json::from_slice::<crate::config::StartOptions>(&buf[..bytes_read]) {
                     Ok(parsed) => {
-                        info!("Start request with mode: {:?}", parsed.query_mode);
-                        parsed.query_mode
+                        info!(
+                            "Start request: mode={:?}, multi_pid={}, repeat={}, framing={}",
+                            parsed.query_mode,
+                            parsed.use_multi_pid,
+                            parsed.use_repeat,
+                            parsed.use_framing
+                        );
+                        parsed
                     }
                     Err(e) => {
-                        warn!("Failed to parse start request body: {e}, using NoCount");
-                        crate::config::QueryMode::default()
+                        warn!("Failed to parse start request body: {e}, using defaults");
+                        crate::config::StartOptions::default()
                     }
                 }
             } else {
-                warn!("No body in start request, using NoCount");
-                crate::config::QueryMode::default()
+                warn!("No body in start request, using defaults");
+                crate::config::StartOptions::default()
             };
 
             if let Some(tx) = state_clone.test_control_tx.lock().unwrap().as_ref() {
-                if tx.send(TestControlMessage::Start(query_mode)).is_err() {
+                if tx.send(TestControlMessage::Start(start_options)).is_err() {
                     warn!("Failed to send start command");
                 }
             }

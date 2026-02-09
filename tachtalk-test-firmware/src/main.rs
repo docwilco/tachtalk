@@ -13,6 +13,7 @@ use esp_idf_svc::wifi::{
     AccessPointConfiguration, AuthMethod, ClientConfiguration, Configuration, EspWifi, WifiDriver,
 };
 use log::{debug, error, info, warn};
+use smallvec::SmallVec;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -103,7 +104,7 @@ pub struct State {
 
 /// Messages to control the test task
 pub enum TestControlMessage {
-    Start(crate::config::QueryMode),
+    Start(crate::config::StartOptions),
     Stop,
 }
 
@@ -316,6 +317,19 @@ fn main() -> Result<()> {
     esp_idf_svc::log::EspLogger::initialize_default();
 
     info!("Starting tachtalk-test firmware...");
+
+    // Log SmallVec<[u8; N]> sizes for various N to verify inline capacity on this platform
+    info!(
+        "SmallVec<[u8; N]> sizes: 4={}, 8={}, 12={}, 16={}, 20={}, 24={}, 28={}, 32={}",
+        std::mem::size_of::<SmallVec<[u8; 4]>>(),
+        std::mem::size_of::<SmallVec<[u8; 8]>>(),
+        std::mem::size_of::<SmallVec<[u8; 12]>>(),
+        std::mem::size_of::<SmallVec<[u8; 16]>>(),
+        std::mem::size_of::<SmallVec<[u8; 20]>>(),
+        std::mem::size_of::<SmallVec<[u8; 24]>>(),
+        std::mem::size_of::<SmallVec<[u8; 28]>>(),
+        std::mem::size_of::<SmallVec<[u8; 32]>>(),
+    );
 
     let peripherals = Peripherals::take()?;
     let sys_loop = EspSystemEventLoop::take()?;

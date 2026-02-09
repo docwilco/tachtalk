@@ -30,4 +30,4 @@ build/
 .embuild/
 
 # CoPilot
-copilot_build*.log
+copilot_*.log
