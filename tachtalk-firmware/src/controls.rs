@@ -299,11 +299,11 @@ fn handle_button_press(
         old_profile, cfg_guard.active_profile, new_profile_name
     );
 
-    // Send brightness message to trigger LED preview
-    // (the LED task will use current brightness and new profile)
+    // Re-bake LED rules for the new profile, then trigger LED preview
     let brightness = cfg_guard.brightness;
     drop(cfg_guard); // Release lock before sending
 
+    let _ = state.rpm_tx.send(RpmTaskMessage::ConfigChanged);
     let _ = state.rpm_tx.send(RpmTaskMessage::Brightness(brightness));
 
     // Mark for NVS save
