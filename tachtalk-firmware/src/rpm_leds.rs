@@ -16,7 +16,7 @@ use esp_idf_hal::rmt::config::TransmitConfig;
 use esp_idf_hal::rmt::{RmtChannel, TxRmtDriver};
 use log::{debug, info, warn};
 use smart_leds::{brightness, gamma, SmartLedsWrite, RGB8};
-use tachtalk_shift_lights_lib::compute_led_state;
+use tachtalk_shift_lights_lib::{bake_led_rules, compute_led_state, BakedLedRules};
 use ws2812_esp32_rmt_driver::Ws2812Esp32Rmt;
 
 use crate::config::Config;
@@ -95,9 +95,17 @@ impl LedController {
         self.brightness = brightness;
     }
 
-    pub fn update(&mut self, rpm: u32, config: &Config, timestamp_ms: u64) -> Result<()> {
-        // Compute LED state using the library
-        let led_state = compute_led_state(rpm, config.active_thresholds(), config.total_leds, timestamp_ms);
+    pub fn update(
+        &mut self,
+        rpm: u32,
+        baked: &BakedLedRules,
+        timestamp_ms: u64,
+    ) -> Result<()> {
+        let led_state = compute_led_state(
+            rpm,
+            baked,
+            timestamp_ms,
+        );
 
         self.write_leds(&led_state.leds)?;
         Ok(())
@@ -138,7 +146,7 @@ impl LedController {
 
 /// Compute blink render interval from config (None = no blinking, event-driven only)
 fn compute_blink_interval(cfg: &Config) -> Option<u64> {
-    if let Some(ms) = tachtalk_shift_lights_lib::compute_render_interval(cfg.active_thresholds()) {
+    if let Some(ms) = tachtalk_shift_lights_lib::compute_render_interval(cfg.active_rules()) {
         info!("LED render interval: {ms}ms (blinking active)");
         Some(u64::from(ms))
     } else {
@@ -181,7 +189,12 @@ pub fn rpm_led_task(
     // When set, use `preview_rpm` override until this timestamp (ms)
     let mut preview_override_until: Option<u64> = None;
 
-    let mut blink_interval_ms = compute_blink_interval(&state.config.lock().unwrap());
+    let (mut blink_interval_ms, mut baked_rules) = {
+        let cfg_guard = state.config.lock().unwrap();
+        let interval = compute_blink_interval(&cfg_guard);
+        let baked = bake_led_rules(cfg_guard.active_rules(), cfg_guard.total_leds);
+        (interval, baked)
+    };
 
     loop {
         watchdog.feed();
@@ -217,7 +230,10 @@ pub fn rpm_led_task(
                 debug!("Received RPM: {rpm}");
             }
             Ok(RpmTaskMessage::ConfigChanged) => {
-                blink_interval_ms = compute_blink_interval(&state.config.lock().unwrap());
+                let cfg_guard = state.config.lock().unwrap();
+                blink_interval_ms = compute_blink_interval(&cfg_guard);
+                baked_rules = bake_led_rules(cfg_guard.active_rules(), cfg_guard.total_leds);
+                drop(cfg_guard);
                 last_blink_on = None; // Reset phase tracking on config change
                 should_render = true; // Config changed, re-render
             }
@@ -268,9 +284,7 @@ pub fn rpm_led_task(
                     last_blink_on = Some(blink_phase_on(timestamp_ms, interval));
                 }
 
-                if let Ok(cfg) = state.config.lock() {
-                    let _ = led_controller.update(rpm, &cfg, timestamp_ms);
-                }
+                let _ = led_controller.update(rpm, &baked_rules, timestamp_ms);
             }
         }
     }

@@ -11,6 +11,9 @@
 - [ ] Data logging capability
 - [ ] Bluetooth configuration option
 
+## Performance
+- [x] Pre-compute LED color gradients per threshold once on config change, not every render cycle (`interpolate_color` is called per-LED per-frame in `compute_led_state`)
+
 ## Infrastructure
 - [ ] Upgrade to ESP-IDF 5.4
 - [ ] Switch PCNT encoder to event-based using `add_watch_step()` (requires ESP-IDF 5.4)

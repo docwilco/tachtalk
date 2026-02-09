@@ -59,20 +59,20 @@
             border: 1px solid #444;
             box-shadow: 0 0 5px rgba(0,0,0,0.5);
         }
-        .threshold {
+        .rule {
             background-color: #2a2a2a;
             padding: 10px 15px;
             margin: 10px 0;
             border-radius: 5px;
             border-left: 4px solid #00ff00;
         }
-        .threshold-header {
+        .rule-header {
             display: flex;
             align-items: center;
             gap: 8px;
             margin-bottom: 8px;
         }
-        .threshold-title {
+        .rule-title {
             font-size: 1.1em;
             font-weight: bold;
             color: #fff;
@@ -82,44 +82,44 @@
             padding: 2px 4px;
             min-width: 100px;
         }
-        .threshold-title:focus {
+        .rule-title:focus {
             outline: none;
             border-bottom-color: #00ff00;
         }
-        .threshold-grid {
+        .rule-grid {
             display: grid;
             grid-template-columns: 1fr 1fr;
             gap: 5px 15px;
         }
-        .threshold-grid .form-group {
+        .rule-grid .form-group {
             margin: 5px 0;
         }
-        .threshold-grid .colors-group {
+        .rule-grid .colors-group {
             grid-column: 1 / -1;
             display: flex;
             align-items: center;
             flex-wrap: wrap;
             gap: 5px;
         }
-        .threshold-grid .colors-group label {
+        .rule-grid .colors-group label {
             margin-right: 5px;
         }
-        .threshold-grid .colors-group input[type="color"] {
+        .rule-grid .colors-group input[type="color"] {
             margin: 0;
         }
-        .threshold-grid .colors-group button {
+        .rule-grid .colors-group button {
             padding: 3px 8px;
             margin: 0;
             min-width: 24px;
             font-size: 1em;
         }
-        .threshold-grid input[type="number"] {
+        .rule-grid input[type="number"] {
             width: 70px;
         }
-        .threshold-buttons {
+        .rule-buttons {
             margin-top: 8px;
         }
-        .threshold-buttons button {
+        .rule-buttons button {
             padding: 5px 10px;
             margin: 2px;
             font-size: 0.9em;
@@ -867,7 +867,7 @@
         <button id="btnReload2" onclick="loadConfig()">Discard Changes</button>
         <button id="btnReset2" onclick="resetToDefaults()">Reset to Defaults</button>
         
-        <h2>Threshold Profiles</h2>
+        <h2>LED Profiles</h2>
         <div class="profile-controls">
             <select id="profileSelect" onchange="selectProfile(this.value)"></select>
             <button onclick="addProfile()">New</button>
@@ -890,10 +890,10 @@
             <div id="ledPreview" class="led-preview"></div>
         </div>
         
-        <h3>Thresholds</h3>
-        <div id="thresholds"></div>
+        <h3>LED Rules</h3>
+        <div id="rules"></div>
         
-        <button onclick="addThreshold()">Add Threshold</button>
+        <button onclick="addRule()">Add Rule</button>
         
         <button id="btnSaveConfig" onclick="saveConfig()">Save Configuration</button>
         <button id="btnReload" onclick="loadConfig()">Discard Changes</button>
@@ -915,11 +915,11 @@
         }
 
         // Current config (loaded from server)
-        let config = { profiles: [{ name: 'Default', thresholds: [] }], active_profile: 0 };
+        let config = { profiles: [{ name: 'Default', rules: [] }], active_profile: 0 };
         // Default config (loaded from server, used as fallback)
         let defaults = null;
 
-        // Helper to get the active profile's thresholds
+        // Helper to get the active profile
         function getActiveProfile() {
             return config.profiles[config.active_profile] || config.profiles[0];
         }
@@ -1019,13 +1019,13 @@
             } : { r: 0, g: 0, b: 0 };
         }
 
-        function getPreviewRpmBounds(thresholds) {
-            if (!thresholds || thresholds.length === 0) {
+        function getPreviewRpmBounds(rules) {
+            if (!rules || rules.length === 0) {
                 return { min: 0, max: 10000 };
             }
             let min = Infinity;
             let max = 0;
-            for (const t of thresholds) {
+            for (const t of rules) {
                 if (t.rpm_lower !== undefined && t.rpm_lower !== null) {
                     min = Math.min(min, t.rpm_lower);
                     max = Math.max(max, t.rpm_lower);
@@ -1060,8 +1060,8 @@
             const activeProfile = getActiveProfile();
             nameInput.value = activeProfile ? activeProfile.name : '';
             
-            // Update preview RPM slider bounds based on thresholds
-            const bounds = getPreviewRpmBounds(activeProfile ? activeProfile.thresholds : []);
+            // Update preview RPM slider bounds based on rules
+            const bounds = getPreviewRpmBounds(activeProfile ? activeProfile.rules : []);
             const previewRpmInput = document.getElementById('previewRpm');
             const previewRpmSlider = document.getElementById('previewRpmSlider');
             previewRpmInput.min = bounds.min;
@@ -1080,18 +1080,18 @@
         function selectProfile(index) {
             config.active_profile = parseInt(index);
             renderProfiles();
-            renderThresholds();
+            renderRules();
         }
 
         function addProfile() {
             config.profiles.push({
                 name: 'New Profile',
-                thresholds: [],
+                rules: [],
                 preview_rpm: 3000
             });
             config.active_profile = config.profiles.length - 1;
             renderProfiles();
-            renderThresholds();
+            renderRules();
         }
 
         function copyProfile() {
@@ -1102,7 +1102,7 @@
             config.profiles.push(copy);
             config.active_profile = config.profiles.length - 1;
             renderProfiles();
-            renderThresholds();
+            renderRules();
         }
 
         function deleteProfile() {
@@ -1115,7 +1115,7 @@
                 config.active_profile = config.profiles.length - 1;
             }
             renderProfiles();
-            renderThresholds();
+            renderRules();
         }
 
         function moveProfile(direction) {
@@ -1151,10 +1151,10 @@
             const totalLeds = parseInt(document.getElementById('totalLeds').value) || 8;
             const profile = getActiveProfile();
             const rpm = profile ? (profile.preview_rpm || 3000) : 3000;
-            const thresholds = profile ? profile.thresholds : [];
+            const rules = profile ? profile.rules : [];
             
             // Compute LED colors using the same logic as the firmware
-            const leds = computeLedState(rpm, thresholds, totalLeds);
+            const leds = computeLedState(rpm, rules, totalLeds);
             
             container.innerHTML = '';
             for (let i = 0; i < totalLeds; i++) {
@@ -1171,20 +1171,20 @@
         }
 
         // Simplified LED state computation (mirrors firmware logic)
-        function computeLedState(rpm, thresholds, totalLeds) {
+        function computeLedState(rpm, rules, totalLeds) {
             const leds = Array(totalLeds).fill(null).map(() => ({ r: 0, g: 0, b: 0 }));
             
-            // Find all matching thresholds
-            const matching = thresholds.filter(t => rpm >= t.rpm_lower);
+            // Find all matching rules
+            const matching = rules.filter(t => rpm >= t.rpm_lower);
             
-            for (const threshold of matching) {
-                const ledsToLight = computeLedsToLight(rpm, threshold, totalLeds);
-                const totalRange = Math.abs(threshold.start_led - threshold.end_led) + 1;
+            for (const rule of matching) {
+                const ledsToLight = computeLedsToLight(rpm, rule, totalLeds);
+                const totalRange = Math.abs(rule.start_led - rule.end_led) + 1;
                 
                 for (let i = 0; i < ledsToLight.length; i++) {
                     const ledIdx = ledsToLight[i];
                     if (ledIdx < totalLeds) {
-                        leds[ledIdx] = interpolateColor(threshold.colors || [{ r: 255, g: 0, b: 0 }], i, totalRange);
+                        leds[ledIdx] = interpolateColor(rule.colors || [{ r: 255, g: 0, b: 0 }], i, totalRange);
                     }
                 }
             }
@@ -1192,23 +1192,23 @@
             return leds;
         }
 
-        function computeLedsToLight(rpm, threshold, totalLeds) {
-            const startLed = Math.min(threshold.start_led, totalLeds - 1);
-            const endLed = Math.min(threshold.end_led, totalLeds - 1);
+        function computeLedsToLight(rpm, rule, totalLeds) {
+            const startLed = Math.min(rule.start_led, totalLeds - 1);
+            const endLed = Math.min(rule.end_led, totalLeds - 1);
             const forward = startLed <= endLed;
             const ledCount = Math.abs(endLed - startLed) + 1;
             
             let ledsToLight;
-            if (threshold.rpm_upper === null || threshold.rpm_upper === undefined) {
+            if (rule.rpm_upper === null || rule.rpm_upper === undefined) {
                 // No upper bound - light all LEDs
                 ledsToLight = ledCount;
             } else {
                 // Proportional lighting
-                const rpmRange = threshold.rpm_upper - threshold.rpm_lower;
+                const rpmRange = rule.rpm_upper - rule.rpm_lower;
                 if (rpmRange <= 0) {
                     ledsToLight = ledCount;
                 } else {
-                    const rpmProgress = Math.min(rpm - threshold.rpm_lower, rpmRange);
+                    const rpmProgress = Math.min(rpm - rule.rpm_lower, rpmRange);
                     ledsToLight = Math.min(1 + Math.floor((rpmProgress * ledCount) / rpmRange), ledCount);
                 }
             }
@@ -1240,31 +1240,31 @@
             };
         }
 
-        function renderThresholds() {
-            const container = document.getElementById('thresholds');
+        function renderRules() {
+            const container = document.getElementById('rules');
             container.innerHTML = '';
             
             const profile = getActiveProfile();
             if (!profile) return;
             
-            profile.thresholds.forEach((threshold, index) => {
+            profile.rules.forEach((rule, index) => {
                 const div = document.createElement('div');
-                div.className = 'threshold';
-                const blinkMsHtml = threshold.blink ? 
+                div.className = 'rule';
+                const blinkMsHtml = rule.blink ? 
                     '<div class="form-group">' +
                         '<label>Blink ms:</label>' +
-                        '<input type="number" min="50" step="50" value="' + (threshold.blink_ms || 500) + '" onchange="updateThreshold(' + index + ', \'blink_ms\', parseInt(this.value))">' +
+                        '<input type="number" min="50" step="50" value="' + (rule.blink_ms || 500) + '" onchange="updateRule(' + index + ', \'blink_ms\', parseInt(this.value))">' +
                     '</div>' : '<div class="form-group"></div>';
-                const hasRpmUpper = threshold.rpm_upper !== null && threshold.rpm_upper !== undefined;
-                const rpmUpperValue = hasRpmUpper ? threshold.rpm_upper : (threshold.rpm_lower + 1000);
+                const hasRpmUpper = rule.rpm_upper !== null && rule.rpm_upper !== undefined;
+                const rpmUpperValue = hasRpmUpper ? rule.rpm_upper : (rule.rpm_lower + 1000);
                 const rpmUpperHtml = 
                     '<div class="form-group">' +
                         '<label>RPM Upper:</label>' +
-                        '<input type="number" value="' + rpmUpperValue + '" ' + (hasRpmUpper ? '' : 'disabled') + ' onchange="updateThreshold(' + index + ', \'rpm_upper\', parseInt(this.value))">' +
-                        '<input type="checkbox" ' + (hasRpmUpper ? 'checked' : '') + ' onchange="this.previousElementSibling.disabled = !this.checked; updateThreshold(' + index + ', \'rpm_upper\', this.checked ? parseInt(this.previousElementSibling.value) : null)">' +
+                        '<input type="number" value="' + rpmUpperValue + '" ' + (hasRpmUpper ? '' : 'disabled') + ' onchange="updateRule(' + index + ', \'rpm_upper\', parseInt(this.value))">' +
+                        '<input type="checkbox" ' + (hasRpmUpper ? 'checked' : '') + ' onchange="this.previousElementSibling.disabled = !this.checked; updateRule(' + index + ', \'rpm_upper\', this.checked ? parseInt(this.previousElementSibling.value) : null)">' +
                     '</div>';
                 let colorsHtml = '<div class="form-group colors-group"><label>Colors:</label>';
-                const colors = threshold.colors;
+                const colors = rule.colors;
                 colors.forEach((c, colorIndex) => {
                     const isFirst = colorIndex === 0;
                     const isLast = colorIndex === colors.length - 1;
@@ -1276,34 +1276,34 @@
                 });
                 colorsHtml += '</div>';
                 div.innerHTML = 
-                    '<div class="threshold-header">' +
-                        '<input type="text" class="threshold-title" value="' + (threshold.name || 'Threshold ' + (index + 1)) + '" onchange="updateThreshold(' + index + ', \'name\', this.value)">' +
+                    '<div class="rule-header">' +
+                        '<input type="text" class="rule-title" value="' + (rule.name || 'Rule ' + (index + 1)) + '" onchange="updateRule(' + index + ', \'name\', this.value)">' +
                     '</div>' +
-                    '<div class="threshold-grid">' +
+                    '<div class="rule-grid">' +
                         '<div class="form-group">' +
                             '<label>RPM Lower:</label>' +
-                            '<input type="number" value="' + threshold.rpm_lower + '" onchange="updateThreshold(' + index + ', \'rpm_lower\', parseInt(this.value))">' +
+                            '<input type="number" value="' + rule.rpm_lower + '" onchange="updateRule(' + index + ', \'rpm_lower\', parseInt(this.value))">' +
                         '</div>' +
                         rpmUpperHtml +
                         '<div class="form-group">' +
                             '<label>From LED:</label>' +
-                            '<input type="number" min="0" value="' + threshold.start_led + '" onchange="updateThreshold(' + index + ', \'start_led\', parseInt(this.value))">' +
+                            '<input type="number" min="0" value="' + rule.start_led + '" onchange="updateRule(' + index + ', \'start_led\', parseInt(this.value))">' +
                         '</div>' +
                         '<div class="form-group">' +
                             '<label>To LED:</label>' +
-                            '<input type="number" min="0" value="' + threshold.end_led + '" onchange="updateThreshold(' + index + ', \'end_led\', parseInt(this.value))">' +
+                            '<input type="number" min="0" value="' + rule.end_led + '" onchange="updateRule(' + index + ', \'end_led\', parseInt(this.value))">' +
                         '</div>' +
                         colorsHtml +
                         '<div class="form-group">' +
                             '<label>Blink:</label>' +
-                            '<input type="checkbox" ' + (threshold.blink ? 'checked' : '') + ' onchange="updateThreshold(' + index + ', \'blink\', this.checked); renderThresholds();">' +
+                            '<input type="checkbox" ' + (rule.blink ? 'checked' : '') + ' onchange="updateRule(' + index + ', \'blink\', this.checked); renderRules();">' +
                         '</div>' +
                         blinkMsHtml +
                     '</div>' +
-                    '<div class="threshold-buttons">' +
-                        '<button onclick="moveThreshold(' + index + ', -1)">▲</button>' +
-                        '<button onclick="moveThreshold(' + index + ', 1)">▼</button>' +
-                        '<button onclick="removeThreshold(' + index + ')">✕</button>' +
+                    '<div class="rule-buttons">' +
+                        '<button onclick="moveRule(' + index + ', -1)">▲</button>' +
+                        '<button onclick="moveRule(' + index + ', 1)">▼</button>' +
+                        '<button onclick="removeRule(' + index + ')">✕</button>' +
                     '</div>';
                 container.appendChild(div);
             });
@@ -1311,7 +1311,7 @@
 
         function updatePreviewSliderBounds() {
             const activeProfile = getActiveProfile();
-            const bounds = getPreviewRpmBounds(activeProfile ? activeProfile.thresholds : []);
+            const bounds = getPreviewRpmBounds(activeProfile ? activeProfile.rules : []);
             const previewRpmInput = document.getElementById('previewRpm');
             const previewRpmSlider = document.getElementById('previewRpmSlider');
             previewRpmInput.min = bounds.min;
@@ -1320,40 +1320,40 @@
             previewRpmSlider.max = bounds.max;
         }
 
-        function updateThreshold(index, field, value) {
-            getActiveProfile().thresholds[index][field] = value;
+        function updateRule(index, field, value) {
+            getActiveProfile().rules[index][field] = value;
             if (field === 'rpm_lower' || field === 'rpm_upper') {
                 updatePreviewSliderBounds();
             }
             renderLedPreview();
         }
 
-        function updateColor(thresholdIndex, colorIndex, value) {
-            getActiveProfile().thresholds[thresholdIndex].colors[colorIndex] = value;
+        function updateColor(ruleIndex, colorIndex, value) {
+            getActiveProfile().rules[ruleIndex].colors[colorIndex] = value;
             renderLedPreview();
         }
 
-        function addColor(thresholdIndex, afterColorIndex) {
-            const colors = getActiveProfile().thresholds[thresholdIndex].colors;
+        function addColor(ruleIndex, afterColorIndex) {
+            const colors = getActiveProfile().rules[ruleIndex].colors;
             // Insert a new color (copy of the current one) after the specified index
             const newColor = { ...colors[afterColorIndex] };
             colors.splice(afterColorIndex + 1, 0, newColor);
-            renderThresholds();
+            renderRules();
             renderLedPreview();
         }
 
-        function removeColor(thresholdIndex, colorIndex) {
-            const colors = getActiveProfile().thresholds[thresholdIndex].colors;
+        function removeColor(ruleIndex, colorIndex) {
+            const colors = getActiveProfile().rules[ruleIndex].colors;
             if (colors.length > 1) {
                 colors.splice(colorIndex, 1);
-                renderThresholds();
+                renderRules();
                 renderLedPreview();
             }
         }
 
-        function addThreshold() {
-            getActiveProfile().thresholds.push({
-                name: 'New Threshold',
+        function addRule() {
+            getActiveProfile().rules.push({
+                name: 'New Rule',
                 rpm_lower: 5000,
                 rpm_upper: null,
                 start_led: 0,
@@ -1362,25 +1362,25 @@
                 blink: false,
                 blink_ms: 500
             });
-            renderThresholds();
+            renderRules();
             updatePreviewSliderBounds();
             renderLedPreview();
         }
 
-        function moveThreshold(index, direction) {
-            const thresholds = getActiveProfile().thresholds;
+        function moveRule(index, direction) {
+            const rules = getActiveProfile().rules;
             const newIndex = index + direction;
-            if (newIndex < 0 || newIndex >= thresholds.length) return;
-            const temp = thresholds[index];
-            thresholds[index] = thresholds[newIndex];
-            thresholds[newIndex] = temp;
-            renderThresholds();
+            if (newIndex < 0 || newIndex >= rules.length) return;
+            const temp = rules[index];
+            rules[index] = rules[newIndex];
+            rules[newIndex] = temp;
+            renderRules();
             renderLedPreview();
         }
 
-        function removeThreshold(index) {
-            getActiveProfile().thresholds.splice(index, 1);
-            renderThresholds();
+        function removeRule(index) {
+            getActiveProfile().rules.splice(index, 1);
+            renderRules();
             updatePreviewSliderBounds();
             renderLedPreview();
         }
@@ -1628,7 +1628,7 @@
                     document.getElementById('brightnessValue').textContent = brightness;
                     
                     renderProfiles();
-                    renderThresholds();
+                    renderRules();
                     showStatus('Configuration loaded!', false);
                 } else {
                     showStatus('Failed to load configuration', true);
@@ -1976,7 +1976,7 @@
         (async function init() {
             await loadDefaults();  // Load defaults first
             renderProfiles();
-            renderThresholds();
+            renderRules();
             loadConfig();
             loadNetworkStatus();
             loadConnectionStatus();

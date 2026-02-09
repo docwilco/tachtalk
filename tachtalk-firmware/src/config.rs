@@ -25,16 +25,16 @@ fn default_ap_ssid() -> String {
 }
 
 // Re-export shift-lights types for use in the firmware
-pub use tachtalk_shift_lights_lib::{RGB8, ThresholdConfig};
+pub use tachtalk_shift_lights_lib::{LedRule, RGB8};
 
-/// A named collection of threshold configurations
+/// A named collection of LED rule configurations.
 ///
 /// Profiles allow users to switch between different shift light setups
 /// (e.g., "Street", "Track", "Economy") without reconfiguring each time.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ThresholdProfile {
+pub struct LedProfile {
     pub name: String,
-    pub thresholds: Vec<ThresholdConfig>,
+    pub rules: Vec<LedRule>,
     /// RPM value to show when previewing this profile (e.g., when cycling profiles)
     #[serde(default = "default_preview_rpm")]
     pub preview_rpm: u32,
@@ -228,9 +228,9 @@ pub struct Config {
     pub ap_prefix_len: u8,
     #[serde(default)]
     pub log_level: LogLevel,
-    /// Threshold profiles (named collections of thresholds)
+    /// LED profiles (named collections of LED rules)
     #[serde(default = "default_profiles")]
-    pub profiles: Vec<ThresholdProfile>,
+    pub profiles: Vec<LedProfile>,
     /// Index of the currently active profile
     #[serde(default)]
     pub active_profile: usize,
@@ -275,11 +275,11 @@ const fn default_ap_prefix_len() -> u8 {
     24
 }
 
-fn default_profile() -> ThresholdProfile {
-    ThresholdProfile {
+fn default_profile() -> LedProfile {
+    LedProfile {
         name: "Default".to_string(),
-        thresholds: vec![
-            ThresholdConfig {
+        rules: vec![
+            LedRule {
                 name: "Blue".to_string(),
                 rpm_lower: 1000,
                 rpm_upper: None,
@@ -289,7 +289,7 @@ fn default_profile() -> ThresholdProfile {
                 blink: false,
                 blink_ms: 500,
             },
-            ThresholdConfig {
+            LedRule {
                 name: "Green".to_string(),
                 rpm_lower: 1500,
                 rpm_upper: None,
@@ -299,7 +299,7 @@ fn default_profile() -> ThresholdProfile {
                 blink: false,
                 blink_ms: 500,
             },
-            ThresholdConfig {
+            LedRule {
                 name: "Yellow".to_string(),
                 rpm_lower: 2000,
                 rpm_upper: None,
@@ -309,7 +309,7 @@ fn default_profile() -> ThresholdProfile {
                 blink: false,
                 blink_ms: 500,
             },
-            ThresholdConfig {
+            LedRule {
                 name: "Red".to_string(),
                 rpm_lower: 2500,
                 rpm_upper: None,
@@ -319,7 +319,7 @@ fn default_profile() -> ThresholdProfile {
                 blink: false,
                 blink_ms: 500,
             },
-            ThresholdConfig {
+            LedRule {
                 name: "Off".to_string(),
                 rpm_lower: 3000,
                 rpm_upper: None,
@@ -329,7 +329,7 @@ fn default_profile() -> ThresholdProfile {
                 blink: false,
                 blink_ms: 500,
             },
-            ThresholdConfig {
+            LedRule {
                 name: "Shift".to_string(),
                 rpm_lower: 3000,
                 rpm_upper: None,
@@ -344,11 +344,11 @@ fn default_profile() -> ThresholdProfile {
     }
 }
 
-fn rainbow_profile() -> ThresholdProfile {
-    ThresholdProfile {
+fn rainbow_profile() -> LedProfile {
+    LedProfile {
         name: "Rainbow".to_string(),
-        thresholds: vec![
-            ThresholdConfig {
+        rules: vec![
+            LedRule {
                 name: "Rainbow".to_string(),
                 rpm_lower: 1000,
                 rpm_upper: Some(3000),
@@ -364,7 +364,7 @@ fn rainbow_profile() -> ThresholdProfile {
                 blink: false,
                 blink_ms: 500,
             },
-            ThresholdConfig {
+            LedRule {
                 name: "Shift".to_string(),
                 rpm_lower: 3000,
                 rpm_upper: None,
@@ -379,11 +379,11 @@ fn rainbow_profile() -> ThresholdProfile {
     }
 }
 
-fn martijn_profile() -> ThresholdProfile {
-    ThresholdProfile {
+fn martijn_profile() -> LedProfile {
+    LedProfile {
         name: "Martijn".to_string(),
-        thresholds: vec![
-            ThresholdConfig {
+        rules: vec![
+            LedRule {
                 name: "Left".to_string(),
                 rpm_lower: 1000,
                 rpm_upper: Some(3000),
@@ -396,7 +396,7 @@ fn martijn_profile() -> ThresholdProfile {
                 blink: false,
                 blink_ms: 500,
             },
-            ThresholdConfig {
+            LedRule {
                 name: "Right".to_string(),
                 rpm_lower: 1000,
                 rpm_upper: Some(3000),
@@ -409,7 +409,7 @@ fn martijn_profile() -> ThresholdProfile {
                 blink: false,
                 blink_ms: 500,
             },
-            ThresholdConfig {
+            LedRule {
                 name: "Shift".to_string(),
                 rpm_lower: 3000,
                 rpm_upper: None,
@@ -424,7 +424,7 @@ fn martijn_profile() -> ThresholdProfile {
     }
 }
 
-fn default_profiles() -> Vec<ThresholdProfile> {
+fn default_profiles() -> Vec<LedProfile> {
     vec![default_profile(), rainbow_profile(), martijn_profile()]
 }
 
@@ -462,12 +462,12 @@ impl Default for Config {
 }
 
 impl Config {
-    /// Get the thresholds from the active profile
+    /// Get the LED rules from the active profile
     #[must_use]
-    pub fn active_thresholds(&self) -> &[ThresholdConfig] {
+    pub fn active_rules(&self) -> &[LedRule] {
         self.profiles
             .get(self.active_profile)
-            .map_or(&[], |p| p.thresholds.as_slice())
+            .map_or(&[], |p| p.rules.as_slice())
     }
 
     /// Clamp values to valid ranges and fix invalid values
