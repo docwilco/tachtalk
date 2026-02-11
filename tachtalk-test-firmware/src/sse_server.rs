@@ -150,9 +150,46 @@ fn build_metrics_message(state: &State) -> String {
     let client_connected = metrics.client_connected.load(Ordering::Relaxed);
     let capture_overflow = metrics.capture_overflow.load(Ordering::Relaxed);
 
+    // Build PID values JSON fragment: {"0C":{"v":[13,60]},"49":{"e":"NO DATA"}}
+    let pid_json = build_pid_values_json(state);
+
     format!(
-        "event: metrics\ndata: {{\"test_running\":{test_running},\"requests_per_sec\":{requests_per_sec},\"total_requests\":{total_requests},\"total_errors\":{total_errors},\"dongle_connected\":{dongle_connected},\"bytes_captured\":{bytes_captured},\"records_captured\":{records_captured},\"buffer_usage_pct\":{buffer_usage_pct},\"client_connected\":{client_connected},\"capture_overflow\":{capture_overflow}}}\n\n"
+        "event: metrics\ndata: {{\"test_running\":{test_running},\"requests_per_sec\":{requests_per_sec},\"total_requests\":{total_requests},\"total_errors\":{total_errors},\"dongle_connected\":{dongle_connected},\"bytes_captured\":{bytes_captured},\"records_captured\":{records_captured},\"buffer_usage_pct\":{buffer_usage_pct},\"client_connected\":{client_connected},\"capture_overflow\":{capture_overflow},\"pid_values\":{{{pid_json}}}}}\n\n"
     )
+}
+
+/// Serialize current PID values as JSON object entries.
+///
+/// Each PID is keyed by its uppercase hex string. Values use `"v"` for data
+/// bytes and `"e"` for error strings:
+///   `"0C":{"v":[13,60]}` or `"49":{"e":"NO DATA"}`
+fn build_pid_values_json(state: &State) -> String {
+    use std::fmt::Write;
+    let pid_values_guard = state.pid_values.lock().unwrap();
+    let mut buf = String::new();
+    for (i, (&pid, val)) in pid_values_guard.iter().enumerate() {
+        if i > 0 {
+            buf.push(',');
+        }
+        match val {
+            crate::PidValue::Value(bytes) => {
+                let _ = write!(buf, "\"{pid:02X}\":{{\"v\":[");
+                for (j, &b) in bytes.iter().enumerate() {
+                    if j > 0 {
+                        buf.push(',');
+                    }
+                    let _ = write!(buf, "{b}");
+                }
+                buf.push_str("]}");
+            }
+            crate::PidValue::Error(msg) => {
+                // Escape any quotes in the error message
+                let escaped = msg.replace('\\', "\\\\").replace('"', "\\\"");
+                let _ = write!(buf, "\"{pid:02X}\":{{\"e\":\"{escaped}\"}}");
+            }
+        }
+    }
+    buf
 }
 
 /// Handle a new connection - read HTTP request and send SSE headers

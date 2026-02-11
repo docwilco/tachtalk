@@ -14,6 +14,7 @@ use esp_idf_svc::wifi::{
 };
 use log::{debug, error, info, warn};
 use smallvec::SmallVec;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -85,6 +86,15 @@ impl TestMetrics {
     }
 }
 
+/// Last known value (or error) for a single OBD2 PID.
+#[derive(Clone)]
+pub enum PidValue {
+    /// Raw data bytes (excludes service byte and PID byte).
+    Value(SmallVec<[u8; 4]>),
+    /// Error string from the last query attempt.
+    Error(String),
+}
+
 /// Central state shared across tasks
 pub struct State {
     pub config: Mutex<Config>,
@@ -100,6 +110,8 @@ pub struct State {
     pub test_control_tx: Mutex<Option<std::sync::mpsc::Sender<TestControlMessage>>>,
     /// Mode 5 capture buffer (shared so web server can read/clear it)
     pub capture_buffer: Mutex<Vec<u8>>,
+    /// Last PID values (or errors) keyed by Mode 01 PID byte.
+    pub pid_values: Mutex<HashMap<u8, PidValue>>,
 }
 
 /// Messages to control the test task
@@ -312,6 +324,68 @@ fn spawn_background_tasks(
     }
 }
 
+fn log_smallvec_sizes<T: Default + Copy>(type_name: &str, sizes: impl IntoIterator<Item = usize>) {
+    let ptr_size = std::mem::size_of::<usize>();
+    let elem_size = std::mem::size_of::<T>();
+    let elem_align = std::mem::align_of::<T>();
+    // SmallVec (union) layout:
+    //   struct { len: usize, data: union { inline: [T; N], heap: (*mut T, usize) } }
+    //   union_align = max(align_of::<T>(), size_of::<usize>())
+    //   union_size = round_up(max(N * elem_size, 2 * ptr_size), union_align)
+    //   total = union_align /* len + padding */ + union_size
+    let union_align = elem_align.max(ptr_size);
+    let heap_size = 2 * ptr_size;
+    let mut parts: SmallVec<[String; 16]> = SmallVec::new();
+    for n in sizes {
+        let actual = match n {
+            1 => std::mem::size_of::<SmallVec<[T; 1]>>(),
+            2 => std::mem::size_of::<SmallVec<[T; 2]>>(),
+            3 => std::mem::size_of::<SmallVec<[T; 3]>>(),
+            4 => std::mem::size_of::<SmallVec<[T; 4]>>(),
+            5 => std::mem::size_of::<SmallVec<[T; 5]>>(),
+            6 => std::mem::size_of::<SmallVec<[T; 6]>>(),
+            7 => std::mem::size_of::<SmallVec<[T; 7]>>(),
+            8 => std::mem::size_of::<SmallVec<[T; 8]>>(),
+            9 => std::mem::size_of::<SmallVec<[T; 9]>>(),
+            10 => std::mem::size_of::<SmallVec<[T; 10]>>(),
+            11 => std::mem::size_of::<SmallVec<[T; 11]>>(),
+            12 => std::mem::size_of::<SmallVec<[T; 12]>>(),
+            13 => std::mem::size_of::<SmallVec<[T; 13]>>(),
+            14 => std::mem::size_of::<SmallVec<[T; 14]>>(),
+            15 => std::mem::size_of::<SmallVec<[T; 15]>>(),
+            16 => std::mem::size_of::<SmallVec<[T; 16]>>(),
+            17 => std::mem::size_of::<SmallVec<[T; 17]>>(),
+            18 => std::mem::size_of::<SmallVec<[T; 18]>>(),
+            19 => std::mem::size_of::<SmallVec<[T; 19]>>(),
+            20 => std::mem::size_of::<SmallVec<[T; 20]>>(),
+            21 => std::mem::size_of::<SmallVec<[T; 21]>>(),
+            22 => std::mem::size_of::<SmallVec<[T; 22]>>(),
+            23 => std::mem::size_of::<SmallVec<[T; 23]>>(),
+            24 => std::mem::size_of::<SmallVec<[T; 24]>>(),
+            25 => std::mem::size_of::<SmallVec<[T; 25]>>(),
+            26 => std::mem::size_of::<SmallVec<[T; 26]>>(),
+            27 => std::mem::size_of::<SmallVec<[T; 27]>>(),
+            28 => std::mem::size_of::<SmallVec<[T; 28]>>(),
+            29 => std::mem::size_of::<SmallVec<[T; 29]>>(),
+            30 => std::mem::size_of::<SmallVec<[T; 30]>>(),
+            31 => std::mem::size_of::<SmallVec<[T; 31]>>(),
+            32 => std::mem::size_of::<SmallVec<[T; 32]>>(),
+            other => {
+                warn!("Unsupported SmallVec size {other}, skipping");
+                continue;
+            }
+        };
+        let inline_size = n * elem_size;
+        let union_size = inline_size.max(heap_size).next_multiple_of(union_align);
+        let calculated = union_align + union_size;
+        if actual != calculated {
+            warn!("SmallVec<[{type_name}; {n}]>: actual={actual}, formula={calculated} — MISMATCH");
+        }
+        parts.push(format!("{n}={actual}"));
+    }
+    info!("SmallVec<[{type_name}; N]> sizes: {}", parts.join(", "));
+}
+
 fn main() -> Result<()> {
     esp_idf_svc::sys::link_patches();
     esp_idf_svc::log::EspLogger::initialize_default();
@@ -319,17 +393,30 @@ fn main() -> Result<()> {
     info!("Starting tachtalk-test firmware...");
 
     // Log SmallVec<[u8; N]> sizes for various N to verify inline capacity on this platform
-    info!(
-        "SmallVec<[u8; N]> sizes: 4={}, 8={}, 12={}, 16={}, 20={}, 24={}, 28={}, 32={}",
-        std::mem::size_of::<SmallVec<[u8; 4]>>(),
-        std::mem::size_of::<SmallVec<[u8; 8]>>(),
-        std::mem::size_of::<SmallVec<[u8; 12]>>(),
-        std::mem::size_of::<SmallVec<[u8; 16]>>(),
-        std::mem::size_of::<SmallVec<[u8; 20]>>(),
-        std::mem::size_of::<SmallVec<[u8; 24]>>(),
-        std::mem::size_of::<SmallVec<[u8; 28]>>(),
-        std::mem::size_of::<SmallVec<[u8; 32]>>(),
-    );
+    {
+        const SIZES: &[usize] = &[4, 8, 12, 16, 20, 24, 28, 32];
+        let mut parts: SmallVec<[String; 8]> = SmallVec::new();
+        for &n in SIZES {
+            let size = match n {
+                4 => std::mem::size_of::<SmallVec<[u8; 4]>>(),
+                8 => std::mem::size_of::<SmallVec<[u8; 8]>>(),
+                12 => std::mem::size_of::<SmallVec<[u8; 12]>>(),
+                16 => std::mem::size_of::<SmallVec<[u8; 16]>>(),
+                20 => std::mem::size_of::<SmallVec<[u8; 20]>>(),
+                24 => std::mem::size_of::<SmallVec<[u8; 24]>>(),
+                28 => std::mem::size_of::<SmallVec<[u8; 28]>>(),
+                32 => std::mem::size_of::<SmallVec<[u8; 32]>>(),
+                _ => unreachable!(),
+            };
+            parts.push(format!("{n}={size}"));
+        }
+        info!("SmallVec<[u8; N]> sizes: {}", parts.join(", "));
+    }
+
+    log_smallvec_sizes::<u8>("u8", 1..33);
+    log_smallvec_sizes::<u16>("u16", 1..17);
+    log_smallvec_sizes::<u32>("u32", 1..9);
+    log_smallvec_sizes::<u64>("u64", 1..5);
 
     let peripherals = Peripherals::take()?;
     let sys_loop = EspSystemEventLoop::take()?;
@@ -355,6 +442,7 @@ fn main() -> Result<()> {
         dongle_connected: AtomicBool::new(false),
         test_control_tx: Mutex::new(Some(test_control_tx)),
         capture_buffer: Mutex::new(Vec::new()),
+        pid_values: Mutex::new(HashMap::new()),
     });
 
     spawn_background_tasks(&state, sse_rx, test_control_rx, ap_hostname, ap_ip);

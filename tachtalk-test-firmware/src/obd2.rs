@@ -577,6 +577,48 @@ impl CountLayer {
 
         total
     }
+
+    /// Walk parsed response lines extracting PID → data-bytes mappings.
+    ///
+    /// Same walk logic as [`count_pid_responses_in_lines`] but collects the
+    /// data bytes (excluding service byte and PID byte) for each PID.
+    /// When multiple ECUs respond, later values for the same PID overwrite
+    /// earlier ones (last-writer-wins is fine for live display).
+    fn extract_pid_values(parsed: &[ParsedLine]) -> HashMap<u8, SmallVec<[u8; 4]>> {
+        let mut map = HashMap::new();
+
+        for line in parsed {
+            let data = &line.data;
+            let mut pos = 0;
+
+            if pos >= data.len() {
+                continue;
+            }
+            if data[pos] != 0x41 {
+                continue;
+            }
+            pos += 1;
+
+            while pos < data.len() {
+                let pid = data[pos];
+                pos += 1;
+
+                let data_len = pid_data_length(pid) as usize;
+                if data_len == 0 {
+                    break;
+                }
+                if pos + data_len > data.len() {
+                    break;
+                }
+
+                let value: SmallVec<[u8; 4]> = SmallVec::from_slice(&data[pos..pos + data_len]);
+                pos += data_len;
+                map.insert(pid, value);
+            }
+        }
+
+        map
+    }
 }
 
 // ============================================================================
@@ -694,52 +736,53 @@ impl QueryBuilder {
             }
 
             // Select PIDs and build command based on mode
-            let command = if self.use_multi_pid {
-                // Multi-PID mode: build combined commands
-                let use_slow = fast_count >= FAST_SLOW_RATIO && !self.slow_pids.is_empty();
-                if use_slow {
-                    fast_count = 0;
-                    // Combined fast + slow PIDs
-                    let all_pids: SmallVec<[u8; 8]> = self
-                        .fast_pids
-                        .iter()
-                        .chain(self.slow_pids.iter())
-                        .copied()
-                        .collect();
-                    let (cmd, pid_count) = Self::build_command(&all_pids);
-                    self.count.pid_count = pid_count;
-                    cmd
+            let (command, queried_pids): (SmallVec<[u8; 16]>, SmallVec<[u8; 8]>) =
+                if self.use_multi_pid {
+                    // Multi-PID mode: build combined commands
+                    let use_slow = fast_count >= FAST_SLOW_RATIO && !self.slow_pids.is_empty();
+                    if use_slow {
+                        fast_count = 0;
+                        // Combined fast + slow PIDs
+                        let all_pids: SmallVec<[u8; 8]> = self
+                            .fast_pids
+                            .iter()
+                            .chain(self.slow_pids.iter())
+                            .copied()
+                            .collect();
+                        let (cmd, pid_count) = Self::build_command(&all_pids);
+                        self.count.pid_count = pid_count;
+                        (cmd, all_pids)
+                    } else {
+                        fast_count += 1;
+                        // Fast PIDs only — copy to avoid borrow conflict with &mut self
+                        let fast_copy: SmallVec<[u8; 8]> = self.fast_pids.clone();
+                        let (cmd, pid_count) = Self::build_command(&fast_copy);
+                        self.count.pid_count = pid_count;
+                        (cmd, fast_copy)
+                    }
                 } else {
-                    fast_count += 1;
-                    // Fast PIDs only — copy to avoid borrow conflict with &mut self
-                    let fast_copy: SmallVec<[u8; 8]> = self.fast_pids.clone();
-                    let (cmd, pid_count) = Self::build_command(&fast_copy);
-                    self.count.pid_count = pid_count;
-                    cmd
-                }
-            } else {
-                // Single-PID mode: round-robin with 6:1 fast:slow ratio
-                let pid = if fast_count < FAST_SLOW_RATIO && !self.fast_pids.is_empty() {
-                    fast_count += 1;
-                    let p = self.fast_pids[fast_index % self.fast_pids.len()];
-                    fast_index += 1;
-                    p
-                } else if !self.slow_pids.is_empty() {
-                    fast_count = 0;
-                    let p = self.slow_pids[slow_index % self.slow_pids.len()];
-                    slow_index += 1;
-                    p
-                } else {
-                    fast_count = 0;
-                    let p = self.fast_pids[fast_index % self.fast_pids.len()];
-                    fast_index += 1;
-                    p
-                };
+                    // Single-PID mode: round-robin with 6:1 fast:slow ratio
+                    let pid = if fast_count < FAST_SLOW_RATIO && !self.fast_pids.is_empty() {
+                        fast_count += 1;
+                        let p = self.fast_pids[fast_index % self.fast_pids.len()];
+                        fast_index += 1;
+                        p
+                    } else if !self.slow_pids.is_empty() {
+                        fast_count = 0;
+                        let p = self.slow_pids[slow_index % self.slow_pids.len()];
+                        slow_index += 1;
+                        p
+                    } else {
+                        fast_count = 0;
+                        let p = self.fast_pids[fast_index % self.fast_pids.len()];
+                        fast_index += 1;
+                        p
+                    };
 
-                self.count.pid_count = 1;
-                let (cmd, _) = Self::build_command(&[pid]);
-                cmd
-            };
+                    self.count.pid_count = 1;
+                    let (cmd, _) = Self::build_command(&[pid]);
+                    (cmd, SmallVec::from_slice(&[pid]))
+                };
 
             if command.is_empty() {
                 continue;
@@ -747,12 +790,14 @@ impl QueryBuilder {
 
             // Execute through layer stack
             match self.count.execute(&command) {
-                Ok((_response, _parsed)) => {
+                Ok((_response, parsed)) => {
                     ctx.state
                         .metrics
                         .total_requests
                         .fetch_add(1, Ordering::Relaxed);
                     requests_this_second += 1;
+
+                    update_pid_values(ctx.state, &parsed, &queried_pids);
                 }
                 Err(e) => {
                     warn!("Request failed: {e}");
@@ -767,6 +812,25 @@ impl QueryBuilder {
                     }
                 }
             }
+        }
+    }
+}
+
+/// Extract PID values from a parsed OBD2 response and store them in shared
+/// state. PIDs present in `queried_pids` but absent from the response are
+/// marked as `NO DATA`.
+fn update_pid_values(state: &State, parsed: &[ParsedLine], queried_pids: &[u8]) {
+    let values = CountLayer::extract_pid_values(parsed);
+    let mut pid_values_guard = state.pid_values.lock().unwrap();
+    for (&pid, data) in &values {
+        pid_values_guard.insert(pid, crate::PidValue::Value(data.clone()));
+    }
+    for &pid in queried_pids {
+        if !values.contains_key(&pid) {
+            pid_values_guard
+                .entry(pid)
+                .and_modify(|v| *v = crate::PidValue::Error("NO DATA".into()))
+                .or_insert_with(|| crate::PidValue::Error("NO DATA".into()));
         }
     }
 }
@@ -956,8 +1020,9 @@ pub fn test_task(state: &Arc<State>, control_rx: &std::sync::mpsc::Receiver<Test
 fn run_test(ctx: &TestContext, start_options: StartOptions) {
     let config = TestConfig::snapshot(ctx.state, start_options);
 
-    // Reset metrics
+    // Reset metrics and PID values
     ctx.state.metrics.reset();
+    ctx.state.pid_values.lock().unwrap().clear();
     ctx.state
         .metrics
         .test_running

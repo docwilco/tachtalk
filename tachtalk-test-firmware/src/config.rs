@@ -86,7 +86,6 @@ pub struct StartOptions {
 /// Response data byte count for each Mode 01 PID (excludes service byte and PID byte).
 /// Indexed by PID byte. `0` = unknown/unsupported PID.
 /// Source: SAE J1979 / ISO 15031-5.
-#[rustfmt::skip]
 const MODE01_PID_DATA_LENGTHS: [u8; 256] = {
     let mut t = [0u8; 256];
     // 0x00-0x20: PIDs supported bitmasks and basic engine data
@@ -122,7 +121,7 @@ const MODE01_PID_DATA_LENGTHS: [u8; 256] = {
     t[0x1D] = 1; // O2 sensors present (4 banks)
     t[0x1E] = 1; // Auxiliary input status
     t[0x1F] = 2; // Run time since engine start
-    // 0x20-0x40
+                 // 0x20-0x40
     t[0x20] = 4; // PIDs supported [21-40]
     t[0x21] = 2; // Distance traveled with MIL on
     t[0x22] = 2; // Fuel rail pressure (relative to manifold vacuum)
@@ -155,7 +154,7 @@ const MODE01_PID_DATA_LENGTHS: [u8; 256] = {
     t[0x3D] = 2; // Catalyst temperature: Bank 2, Sensor 1
     t[0x3E] = 2; // Catalyst temperature: Bank 1, Sensor 2
     t[0x3F] = 2; // Catalyst temperature: Bank 2, Sensor 2
-    // 0x40-0x60
+                 // 0x40-0x60
     t[0x40] = 4; // PIDs supported [41-60]
     t[0x41] = 4; // Monitor status this drive cycle
     t[0x42] = 2; // Control module voltage
@@ -188,18 +187,18 @@ const MODE01_PID_DATA_LENGTHS: [u8; 256] = {
     t[0x5D] = 2; // Fuel injection timing
     t[0x5E] = 2; // Engine fuel rate
     t[0x5F] = 1; // Emission requirements
-    // 0x60-0x80
+                 // 0x60-0x80
     t[0x60] = 4; // PIDs supported [61-80]
     t[0x61] = 1; // Driver's demand engine — percent torque
     t[0x62] = 1; // Actual engine — percent torque
     t[0x63] = 2; // Engine reference torque
     t[0x64] = 5; // Engine percent torque data
     t[0x65] = 2; // Auxiliary input / output supported
-    // 0x80-0xA0
+                 // 0x80-0xA0
     t[0x80] = 4; // PIDs supported [81-A0]
-    // 0xA0-0xC0
+                 // 0xA0-0xC0
     t[0xA0] = 4; // PIDs supported [A1-C0]
-    // 0xC0-0xE0
+                 // 0xC0-0xE0
     t[0xC0] = 4; // PIDs supported [C1-E0]
     t
 };
