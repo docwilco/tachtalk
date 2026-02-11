@@ -31,3 +31,6 @@ build/
 
 # CoPilot
 copilot_*.log
+
+# Pre-commit staged workdir
+.git-pre-commit-workdir

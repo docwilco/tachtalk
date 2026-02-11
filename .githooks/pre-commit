@@ -46,9 +46,20 @@ step "cargo fmt --all"
 
 restage_formatted
 
+# ---------- populate staged workdir for clippy ----------
+staged_dir="$root/.git-pre-commit-workdir"
+mkdir -p "$staged_dir"
+# Export staged files into a temp dir, then rsync with --checksum so only
+# files whose content actually changed get new mtimes. This prevents
+# unnecessary rebuilds (e.g. esp-idf-sys watching sdkconfig.defaults).
+staged_tmp="$(mktemp -d)"
+trap 'rm -rf "$staged_tmp"' EXIT
+(cd "$root" && git checkout-index --all --force --prefix="$staged_tmp/")
+rsync -r --checksum --delete --exclude='/target' --exclude='*/target' "$staged_tmp/" "$staged_dir/"
+
 # ---------- clippy: host crates ----------
 step "clippy (host crates)"
-if ! (cd "$root" && cargo clippy --all-targets --all-features \
+if ! (cd "$staged_dir" && cargo clippy --all-targets --all-features \
         --workspace --exclude tachtalk-firmware --exclude tachtalk-test-firmware \
         -- -W clippy::pedantic -D warnings); then
     fail "clippy (host crates)"
@@ -56,14 +67,14 @@ fi
 
 # ---------- clippy: tachtalk-firmware ----------
 step "clippy (tachtalk-firmware)"
-if ! (cd "$root/tachtalk-firmware" && cargo clippy --all-targets --all-features \
+if ! (cd "$staged_dir/tachtalk-firmware" && cargo clippy --all-targets --all-features \
         -- -W clippy::pedantic -D warnings); then
     fail "clippy (tachtalk-firmware)"
 fi
 
 # ---------- clippy: tachtalk-test-firmware ----------
 step "clippy (tachtalk-test-firmware)"
-if ! (cd "$root/tachtalk-test-firmware" && cargo clippy --all-targets --all-features \
+if ! (cd "$staged_dir/tachtalk-test-firmware" && cargo clippy --all-targets --all-features \
         -- -W clippy::pedantic -D warnings); then
     fail "clippy (tachtalk-test-firmware)"
 fi
