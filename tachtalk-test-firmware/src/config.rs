@@ -61,13 +61,12 @@ pub enum QueryMode {
     AlwaysOne,
     /// First request without count to detect ECU count, then use that
     AdaptiveCount,
-    /// Send multiple requests before waiting for responses
-    Pipelined,
     /// Pure TCP proxy with traffic recording to PSRAM
     RawCapture,
 }
 
 /// Options sent with the Start command (not persisted in NVS).
+#[allow(clippy::struct_excessive_bools)] // Flat options struct deserialized from JSON; bools are the natural representation.
 #[derive(Debug, Default, Clone, Deserialize)]
 pub struct StartOptions {
     #[serde(default)]
@@ -81,6 +80,8 @@ pub struct StartOptions {
     pub repeat_string: String,
     #[serde(default)]
     pub use_framing: bool,
+    #[serde(default)]
+    pub use_pipelining: bool,
 }
 
 /// Response data byte count for each Mode 01 PID (excludes service byte and PID byte).
@@ -298,9 +299,6 @@ pub struct TestConfig {
     /// Slow PIDs to poll (comma-separated, e.g., "0105")
     #[serde(default = "default_slow_pids")]
     pub slow_pids: String,
-    /// Pipeline bytes on wire (mode 4)
-    #[serde(default = "default_pipeline_bytes")]
-    pub pipeline_bytes: u16,
     /// Capture buffer size in bytes (mode 5)
     #[serde(default = "default_capture_buffer_size")]
     pub capture_buffer_size: u32,
@@ -332,10 +330,6 @@ fn default_slow_pids() -> String {
     "0105".to_string()
 }
 
-const fn default_pipeline_bytes() -> u16 {
-    64
-}
-
 const fn default_capture_buffer_size() -> u32 {
     4 * 1024 * 1024 // 4 MB
 }
@@ -355,7 +349,6 @@ impl Default for TestConfig {
             listen_port: default_listen_port(),
             fast_pids: default_fast_pids(),
             slow_pids: default_slow_pids(),
-            pipeline_bytes: default_pipeline_bytes(),
             capture_buffer_size: default_capture_buffer_size(),
             capture_overflow: CaptureOverflow::default(),
             obd2_timeout_ms: default_obd2_timeout_ms(),

@@ -2,11 +2,11 @@
 
 ## Summary
 
-Add three toggles (`use_multi_pid`, `use_repeat`, `use_framing`) and a configurable `repeat_string` sent with the Start command alongside `query_mode`. Implement a layered architecture for polling modes where each layer adds one behavior. Remove `ResponseCountMethod` from config — ECU counting is determined by the framing layer.
+Add four toggles (`use_multi_pid`, `use_repeat`, `use_framing`, `use_pipelining`) and a configurable `repeat_string` sent with the Start command alongside `query_mode`. Implement a layered architecture for polling modes where each layer adds one behavior. Remove `ResponseCountMethod` from config — ECU counting is determined by the framing layer.
 
 ## Layer Stack
 
-Each layer is a concrete struct holding the next layer as a field. No traits needed yet.
+Each layer is a concrete struct holding the next layer as a field. No traits needed yet. Every layer implements three methods: `execute()` (synchronous send+recv), `send()`, and `recv()`. The `execute()` method is used in the normal polling loop; `send()`/`recv()` are used in the pipelined loop to keep 1 request in-flight on the dongle.
 
 ```
 QueryBuilder  →  Count  →  Framing  →  Repeat  →  Base
@@ -14,30 +14,44 @@ QueryBuilder  →  Count  →  Framing  →  Repeat  →  Base
 
 | Layer | Responsibility |
 |-------|---------------|
-| **Query Builder** | Two modes: **single** (one PID per command, round-robin) or **multi** (all PIDs combined into one command). Drives the 6:1 fast:slow polling loop. Passes `pid_count` down to Count layer. Validates shared service byte at start (multi mode). |
-| **Count** | Three modes: `NoCount` (pass through), `AlwaysOne` (append `" 1"`), `AdaptiveCount` (learn ECU count, append learned count). Receives `pid_count` from Query Builder. |
-| **Framing** | On init: sends `ATH1` or `ATH0`. On response: parses `(Option<CAN_ID>, obd_data)`. Verifies PCI byte matches actual data length, logs warning on mismatch. When off: returns `(None, raw_line)`. |
-| **Repeat** | Tracks last command. When enabled and same command, sends configured repeat string (empty = bare CR per ELM327 spec, `"1"` = common WiFi dongle convention). Handles `?` fallback and marks `supports_repeat = Some(false)`. When disabled, passes through. |
-| **Base** | Sends bytes with `\r`, reads until `>` prompt, returns raw response buffer. |
+| **Query Builder** | Two modes: **single** (one PID per command, round-robin) or **multi** (all PIDs combined into one command). Drives the 6:1 fast:slow polling loop. Passes `pid_count` down to Count layer. Validates shared service byte at start (multi mode). Runs either `run_polling_loop` (synchronous) or `run_pipelined_loop` (1-deep pipeline) based on `use_pipelining`. |
+| **Count** | Three modes: `NoCount` (pass through), `AlwaysOne` (append `" 1"`), `AdaptiveCount` (learn ECU count, append learned count). Receives `pid_count` from Query Builder. On `send()`, queues the original command key in `pending_commands` for correlation in `recv()`. |
+| **Framing** | On init: sends `ATH1` or `ATH0`. On response: parses `(Option<CAN_ID>, obd_data)`. Verifies PCI byte matches actual data length, logs warning on mismatch. When off: returns `(None, raw_line)`. `send()` delegates directly; `recv()` calls parse after receiving. |
+| **Repeat** | Tracks last command. When enabled and same command, sends configured repeat string (empty = bare CR per ELM327 spec, `"1"` = common WiFi dongle convention). Handles `?` fallback and marks `supports_repeat = Some(false)`. When disabled, passes through. Tracks `last_was_repeat` for `recv()` to handle `?` responses. |
+| **Base** | `send()` writes bytes with `\r`, records `ClientToDongle` capture. `recv()` reads until `>` prompt, records `DongleToClient` capture. `execute()` calls `send()` then `recv()`. |
 
-### Command path (top → down)
+### send() path (top → down)
 
-1. **Query Builder** builds `"010C49"` (multi-PID) or `"010C"` (single), sets `pid_count`
-2. **Count** appends a learned count (e.g., `" 2"`), `" 1"` (always), or nothing
-3. **Framing** is transparent on command path
-4. **Repeat** substitutes the configured repeat string if same command, or passes through
-5. **Base** sends bytes, reads response
+1. **Query Builder** selects PIDs, builds command, calls `count.send()`
+2. **Count** builds actual command (appending count suffix), queues command key in `pending_commands`, calls `framing.send()`
+3. **Framing** delegates to `repeat.send()` (transparent on send path)
+4. **Repeat** substitutes the configured repeat string if same command (tracking `last_was_repeat`), or passes through to `base.send()`
+5. **Base** writes `command + \r` to TCP stream, records capture
 
-### Response path (down → up)
+### recv() path (down → up)
 
-1. **Base** returns raw bytes
-2. **Repeat** passes through (remembers what was sent)
-3. **Framing** parses each line into `(Option<CAN_ID>, obd_data)`, verifies PCI byte length
-4. **Count** learns ECU count:
+1. **Base** reads until `>` prompt, records capture, returns raw bytes
+2. **Repeat** checks `last_was_repeat`; if response contains `?`, marks `supports_repeat = Some(false)` and returns `Err("repeat_failed")`
+3. **Framing** parses each line into `(Option<CAN_ID>, obd_data)`, verifies PCI byte length; returns `(raw_response, parsed_lines)`
+4. **Count** pops command key from `pending_commands`, learns ECU count if `AdaptiveCount`:
    - Framing on: count unique CAN IDs
    - Framing off, single-PID: count response lines
    - Framing off, multi-PID: walk each line using `pid_data_lengths` to count PID responses, sum across all lines, divide by `pid_count`
-5. **Query Builder** receives response, updates metrics
+5. **Query Builder** receives response, updates PID values and metrics
+
+### execute() path (synchronous, used by polling loop)
+
+Each layer's `execute()` calls `send()` then `recv()` internally, or delegates to the next layer's `execute()`. This is the traditional synchronous path used when pipelining is disabled.
+
+### Pipelined Loop
+
+When `use_pipelining` is enabled, `QueryBuilder::run_pipelined_loop()` drives the stack using `send()`/`recv()` separately:
+
+1. **Startup**: `send(cmd1)`, `send(cmd2)` — primes the pipeline with 2 commands
+2. **Steady state**: `recv()` → process response → `send(next_cmd)` — always keeps 1 command in-flight on the dongle
+3. An `in_flight: VecDeque` tracks which PIDs correspond to each pending response
+4. On `recv()` error `"repeat_failed"`, the response is skipped (not counted as error)
+5. On disconnect, the loop exits and reports the error
 
 ## Response Parsing Details
 
@@ -249,6 +263,8 @@ pub struct StartOptions {
     pub repeat_string: String,  // e.g., "" for bare CR (ELM327 spec), "1" for WiFi dongle convention
     #[serde(default)]
     pub use_framing: bool,
+    #[serde(default)]
+    pub use_pipelining: bool,
 }
 ```
 
@@ -268,26 +284,30 @@ Remove `ResponseCountMethod` enum and the `response_count_method` field from `Te
 ### Step 3: Update UI in `src/index.html`
 
 - Add three checkboxes (`useMultiPid`, `useRepeat`, `useFraming`) grouped with the Mode `<select>` dropdown.
+- Add a `usePipelining` checkbox to enable 1-deep request pipelining.
 - Add a text input for `repeatString` next to the `useRepeat` checkbox (default empty, shown only when repeat is enabled). Empty means bare CR per ELM327 spec; `1` is the common WiFi dongle convention.
-- Update `startTest()` to include `use_multi_pid`, `use_repeat`, `repeat_string`, `use_framing` in the JSON body.
-- In `updateModeUI()`, hide all three checkboxes when mode is `pipelined` or `raw_capture`.
+- Update `startTest()` to include `use_multi_pid`, `use_repeat`, `repeat_string`, `use_framing`, `use_pipelining` in the JSON body.
+- In `updateModeUI()`, hide all checkboxes when mode is `raw_capture`.
 - Remove the `ResponseCountMethod` dropdown from the config form.
 - Remove `response_count_method` from `populateForm()` and config save logic.
 
 ### Step 4: Implement Base layer in `src/obd2.rs`
 
-Extract the existing `execute_command` function into a `Base` struct:
+`Base` struct wraps a TCP stream and provides three methods:
 
 ```rust
 struct Base {
     stream: TcpStream,
     timeout: Duration,
+    capture_state: CaptureState,
 }
 
 impl Base {
+    fn send(&mut self, command: &[u8]) -> Result<(), String> { /* write command + \r, record capture */ }
+    fn recv(&mut self) -> Result<Obd2Buffer, String> { /* read until `>`, record capture */ }
     fn execute(&mut self, command: &[u8]) -> Result<Obd2Buffer, String> {
-        // existing send + read-until-`>` logic
-        // Obd2Buffer = SmallVec<[u8; 32]> — stack-allocated for typical responses
+        self.send(command)?;
+        self.recv()
     }
 }
 ```
@@ -303,11 +323,13 @@ struct RepeatLayer {
     repeat_string: SmallVec<[u8; 2]>,  // e.g., b"" for bare CR, b"1" for WiFi dongle convention
     last_command: Option<SmallVec<[u8; 16]>>,  // last command bytes sent
     supports_repeat: Option<bool>,
+    last_was_repeat: bool,  // tracks whether send() used repeat, for recv() to handle `?`
 }
 ```
 
-- `RepeatLayer::execute(&mut self, command: &[u8]) -> Result<Obd2Buffer, String>`
-- When `enabled` and command matches `last_command` and `supports_repeat != Some(false)`: send `self.repeat_string` via `self.base` (Base appends `\r`, so empty string produces bare CR). On `?` in response, set `supports_repeat = Some(false)`, retry with full command.
+- `RepeatLayer::execute(&mut self, command: &[u8]) -> Result<Obd2Buffer, String>`: synchronous send+recv with `?` fallback retry.
+- `RepeatLayer::send(&mut self, command: &[u8]) -> Result<(), String>`: when repeat conditions met, sends repeat string and sets `last_was_repeat = true`. Otherwise sends full command and sets `last_was_repeat = false`.
+- `RepeatLayer::recv(&mut self) -> Result<Obd2Buffer, String>`: if `last_was_repeat` and response contains `?`, returns `Err("repeat_failed")` so the caller (pipelined loop) can skip that response. Marks `supports_repeat = Some(false)`.
 - When disabled or different command: pass through to `self.base`, update `last_command`.
 
 ### Step 6: Implement Framing layer in `src/obd2.rs`
@@ -326,7 +348,9 @@ struct ParsedLine {
 
 - `FramingLayer::init(&mut self)`: sends `ATH1` if enabled, `ATH0` if disabled, through the layer stack. This is the **only** layer that sends AT commands after the general init. Called after Base's `connect_and_init` and layer stack construction.
 - `FramingLayer::execute(&mut self, command: &[u8]) -> Result<Obd2Buffer, String>` — delegates to `self.repeat`, returns raw response.
-- `FramingLayer::parse_response(&self, response: &[u8]) -> Vec<ParsedLine>` — splits response into lines, for each:
+- `FramingLayer::send(&mut self, command: &[u8]) -> Result<(), String>` — delegates to `self.repeat.send()`.
+- `FramingLayer::recv(&mut self) -> Result<(Obd2Buffer, SmallVec<[ParsedLine; 4]>), String>` — calls `self.repeat.recv()`, then `parse_response()`, returns both raw and parsed.
+- `FramingLayer::parse_response(&self, response: &[u8]) -> SmallVec<[ParsedLine; 4]>` — splits response into lines, for each:
   - **Enabled**: extracts 3-char CAN ID, PCI byte, remaining data. Verifies PCI byte matches actual data length; logs warning on mismatch.
   - **Disabled**: returns `ParsedLine { ecu_id: None, data: raw_line_bytes }`.
 
@@ -337,37 +361,36 @@ struct CountLayer {
     framing: FramingLayer,
     mode: QueryMode,  // NoCount, AlwaysOne, or AdaptiveCount
     response_counts: HashMap<SmallVec<[u8; 16]>, u8>,  // command → learned ECU count
+    pending_commands: VecDeque<SmallVec<[u8; 16]>>,  // queued command keys for pipelined recv correlation
     pid_count: usize,       // set by Query Builder before each call
     pid_data_lengths: SmallVec<[u8; 6]>,  // response data byte count for each queried PID, in query order
 }
 ```
 
-- `CountLayer::execute(&mut self, command: &str) -> Result<(Obd2Buffer, Vec<ParsedLine>), String>`:
-  - `NoCount`: pass command through unchanged.
-  - `AlwaysOne`: append `" 1"` to command.
-  - `AdaptiveCount`: if count learned for this command string, append it. Otherwise send bare, then learn from response:
-    - Framing on: count unique `ecu_id` values from `parse_response()`.
-    - Framing off, single-PID: count `"41"` occurrences in the response.
-    - Framing off, multi-PID: walk each response line using `self.pid_data_lengths` to count PID responses per line (each is `41 {PID} {N data bytes}`), sum across all lines, divide by `pid_count`.
+- `CountLayer::execute(&mut self, command: &[u8]) -> Result<(Obd2Buffer, SmallVec<[ParsedLine; 4]>), String>`: synchronous send+recv with ECU count learning.
+
+- `CountLayer::send(&mut self, command: &[u8]) -> Result<(), String>`: builds actual command (with count suffix), pushes original command key into `pending_commands: VecDeque`, delegates to `framing.send()`.
+- `CountLayer::recv(&mut self) -> Result<(Obd2Buffer, SmallVec<[ParsedLine; 4]>), String>`: pops command key from `pending_commands`, learns ECU count if `AdaptiveCount`, returns raw + parsed.
 
 ### Step 8: Implement Query Builder layer in `src/obd2.rs`
 
 ```rust
 struct QueryBuilder {
     count: CountLayer,
-    fast_pids: SmallVec<[String; 4]>,   // e.g., ["010C", "0149"]
-    slow_pids: SmallVec<[String; 4]>,   // e.g., ["0105"]
+    fast_pids: SmallVec<[u8; 4]>,   // e.g., [0x0C, 0x49] — PID bytes only
+    slow_pids: SmallVec<[u8; 4]>,   // e.g., [0x05]
     use_multi_pid: bool,
 }
 ```
 
 - `QueryBuilder::new(...)`: validates all PIDs share the same service byte (first 2 chars). Returns error if not. Looks up `pid_data_length()` for each PID and stores in `CountLayer::pid_data_lengths`. Returns error for PIDs with data length 0 (unknown) when `use_multi_pid` is true.
-- `QueryBuilder::build_command(&self, pids: &[String]) -> (SmallVec<[u8; 16]>, usize)`:
+- `QueryBuilder::build_command(&self, pids: &[u8]) -> (SmallVec<[u8; 16]>, usize)`:
   - **Single mode**: takes one PID, returns `("010C", 1)`.
   - **Multi mode**: concatenates PID bytes after shared service byte, returns `("010C49", 2)`.
-- Drives the polling loop:
-  - **Single mode**: existing 6:1 round-robin over individual PIDs.
-  - **Multi mode**: fast cycle sends one combined fast-PIDs command; slow cycle sends one combined fast+slow command. 6:1 ratio = 6 fast-only calls to 1 all-PIDs call.
+- `QueryBuilder::next_command(...)`: selects PIDs via the 6:1 fast:slow ratio, calls `build_command`, updates `count.pid_count`.
+- Drives two loop variants:
+  - `run_polling_loop()`: synchronous loop calling `count.execute()` each iteration.
+  - `run_pipelined_loop()`: sends 2 initial commands, then steady-state `recv → process → send next`, keeping 1 request in-flight. Tracks in-flight PIDs via `VecDeque`.
 - Sets `self.count.pid_count` before each call.
 
 ### Step 9: Refactor `run_polling_test` in `src/obd2.rs`
@@ -379,5 +402,5 @@ Replace the existing `run_polling_test` with:
    QueryBuilder { count: CountLayer { framing: FramingLayer { repeat: RepeatLayer { base } } } }
    ```
 3. Call `framing.init()` to send the appropriate `ATH` command.
-4. Delegate to `QueryBuilder::run_polling_loop(...)` which contains the fast/slow cycling and metrics updates.
-5. `run_pipeline_test` and `run_capture_test` remain separate, using `Base` directly.
+4. Check `start_options.use_pipelining`: if true, delegate to `QueryBuilder::run_pipelined_loop()`; otherwise delegate to `QueryBuilder::run_polling_loop()`.
+5. `run_capture_test` remains separate, using `Base` directly.

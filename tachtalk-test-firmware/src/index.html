@@ -349,8 +349,7 @@
                     <option value="no_count">1. NoCount (baseline)</option>
                     <option value="always_one">2. AlwaysOne (append " 1")</option>
                     <option value="adaptive_count">3. AdaptiveCount (detect count)</option>
-                    <option value="pipelined">4. Pipelined (multi-request)</option>
-                    <option value="raw_capture">5. RawCapture (TCP proxy)</option>
+                    <option value="raw_capture">4. RawCapture (TCP proxy)</option>
                 </select>
             </div>
             
@@ -376,6 +375,11 @@
                     <label>Framing (ATH1):</label>
                     <input type="checkbox" id="useFraming">
                     <span class="help-text">Enable CAN headers for reliable ECU counting</span>
+                </div>
+                <div class="form-group">
+                    <label>Pipelining:</label>
+                    <input type="checkbox" id="usePipelining">
+                    <span class="help-text">Keep 1 request in-flight for higher throughput</span>
                 </div>
             </div>
             
@@ -523,16 +527,6 @@
                 <div class="help-text">Comma-separated, polled less frequently</div>
             </div>
             
-            <!-- Mode 4 specific -->
-            <div id="pipelineConfig" class="capture-section">
-                <h3>Pipeline Settings</h3>
-                <div class="form-group">
-                    <label>Pipeline Bytes:</label>
-                    <input type="number" id="pipelineBytes" value="32" min="8" max="256">
-                    <div class="help-text">Max bytes on wire before waiting for responses</div>
-                </div>
-            </div>
-            
             <!-- Mode 5 specific -->
             <div id="captureConfig" class="capture-section">
                 <h3>Capture Settings</h3>
@@ -622,7 +616,6 @@
             'no_count': "Send PIDs as-is without response count. Baseline for comparison - dongle uses adaptive timing (~200ms wait).",
             'always_one': "Append ' 1' to all requests to tell dongle to return after 1 ECU response. Should be faster than NoCount.",
             'adaptive_count': "First request detects how many responses the ECU sends, then uses that count for subsequent requests.",
-            'pipelined': "Send multiple requests before waiting for responses. Configurable bytes on wire.",
             'raw_capture': "Pure TCP proxy mode. Records all traffic to PSRAM buffer for later download and analysis."
         };
 
@@ -644,7 +637,6 @@
             document.getElementById('obd2Timeout').value = config.test?.obd2_timeout_ms || 1000;
             document.getElementById('fastPids').value = config.test?.fast_pids || '010C,0149';
             document.getElementById('slowPids').value = config.test?.slow_pids || '0105';
-            document.getElementById('pipelineBytes').value = config.test?.pipeline_bytes || 32;
             document.getElementById('listenPort').value = config.test?.listen_port || 35000;
             document.getElementById('captureBuffer').value = (config.test?.capture_buffer_size || 4194304) / 1048576;
             document.getElementById('captureOverflow').value = config.test?.capture_overflow || 'stop';
@@ -668,12 +660,11 @@
             document.getElementById('modeDescription').textContent = modeDescriptions[mode];
             
             // Show/hide mode-specific config
-            document.getElementById('pipelineConfig').classList.toggle('visible', mode === 'pipelined');
             document.getElementById('captureConfig').classList.toggle('visible', mode === 'raw_capture');
-            document.getElementById('captureMetrics').classList.toggle('visible', mode !== 'pipelined');
+            document.getElementById('captureMetrics').classList.toggle('visible', true);
             
             // Show/hide polling toggles (only for polling modes)
-            const isPolling = mode !== 'pipelined' && mode !== 'raw_capture';
+            const isPolling = mode !== 'raw_capture';
             document.getElementById('pollingToggles').style.display = isPolling ? 'block' : 'none';
         }
 
@@ -696,7 +687,6 @@
                     obd2_timeout_ms: parseInt(document.getElementById('obd2Timeout').value),
                     fast_pids: document.getElementById('fastPids').value,
                     slow_pids: document.getElementById('slowPids').value,
-                    pipeline_bytes: parseInt(document.getElementById('pipelineBytes').value),
                     listen_port: parseInt(document.getElementById('listenPort').value),
                     capture_buffer_size: parseInt(document.getElementById('captureBuffer').value) * 1048576,
                     capture_overflow: document.getElementById('captureOverflow').value
@@ -754,12 +744,13 @@
                 const queryMode = document.getElementById('queryMode').value;
                 const body = { query_mode: queryMode };
                 
-                // Add polling toggles for non-pipeline/capture modes
-                if (queryMode !== 'pipelined' && queryMode !== 'raw_capture') {
+                // Add polling toggles for non-capture modes
+                if (queryMode !== 'raw_capture') {
                     body.use_multi_pid = document.getElementById('useMultiPid').checked;
                     body.use_repeat = document.getElementById('useRepeat').checked;
                     body.repeat_string = document.getElementById('repeatString').value;
                     body.use_framing = document.getElementById('useFraming').checked;
+                    body.use_pipelining = document.getElementById('usePipelining').checked;
                 }
                 
                 await fetch('/api/test/start', {
@@ -900,38 +891,32 @@
             
             // Update capture metrics
             const mode = document.getElementById('queryMode').value;
-            if (mode !== 'pipelined') {
-                // Client status only relevant for raw_capture (TCP proxy)
-                const clientStatusEl = document.getElementById('clientStatus');
-                if (mode === 'raw_capture') {
-                    clientStatusEl.style.display = '';
-                    clientStatusEl.innerHTML = 
-                        `<span class="status-indicator ${data.client_connected ? 'status-connected' : 'status-disconnected'}"></span>` +
-                        `Client: ${data.client_connected ? 'Connected' : 'Disconnected'}`;
-                } else {
-                    clientStatusEl.style.display = 'none';
-                }
-                
-                const bufferPct = data.buffer_usage_pct || 0;
-                const progressBar = document.getElementById('bufferProgress');
-                progressBar.style.width = bufferPct + '%';
-                progressBar.className = 'progress-fill' + 
-                    (bufferPct > 90 ? ' danger' : bufferPct > 70 ? ' warning' : '');
-                
-                document.getElementById('bytesCapture').textContent = data.bytes_captured || 0;
-                document.getElementById('recordsCapture').textContent = data.records_captured || 0;
-                document.getElementById('overflowWarning').style.display = data.capture_overflow ? 'block' : 'none';
-
-                // Enable download/clear only when test is stopped and buffer has data
-                const hasData = (data.bytes_captured || 0) > 0;
-                document.getElementById('downloadCaptureBtn').disabled = testRunning || !hasData;
-                document.getElementById('decodeCaptureBtn').disabled = testRunning || !hasData;
-                document.getElementById('clearCaptureBtn').disabled = testRunning || !hasData;
+            // Client status only relevant for raw_capture (TCP proxy)
+            const clientStatusEl = document.getElementById('clientStatus');
+            if (mode === 'raw_capture') {
+                clientStatusEl.style.display = '';
+                clientStatusEl.innerHTML = 
+                    `<span class="status-indicator ${data.client_connected ? 'status-connected' : 'status-disconnected'}"></span>` +
+                    `Client: ${data.client_connected ? 'Connected' : 'Disconnected'}`;
             } else {
-                document.getElementById('downloadCaptureBtn').disabled = true;
-                document.getElementById('decodeCaptureBtn').disabled = true;
-                document.getElementById('clearCaptureBtn').disabled = true;
+                clientStatusEl.style.display = 'none';
             }
+            
+            const bufferPct = data.buffer_usage_pct || 0;
+            const progressBar = document.getElementById('bufferProgress');
+            progressBar.style.width = bufferPct + '%';
+            progressBar.className = 'progress-fill' + 
+                (bufferPct > 90 ? ' danger' : bufferPct > 70 ? ' warning' : '');
+            
+            document.getElementById('bytesCapture').textContent = data.bytes_captured || 0;
+            document.getElementById('recordsCapture').textContent = data.records_captured || 0;
+            document.getElementById('overflowWarning').style.display = data.capture_overflow ? 'block' : 'none';
+
+            // Enable download/clear only when test is stopped and buffer has data
+            const hasData = (data.bytes_captured || 0) > 0;
+            document.getElementById('downloadCaptureBtn').disabled = testRunning || !hasData;
+            document.getElementById('decodeCaptureBtn').disabled = testRunning || !hasData;
+            document.getElementById('clearCaptureBtn').disabled = testRunning || !hasData;
 
             // Update PID values
             updatePidValues(data.pid_values);

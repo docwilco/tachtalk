@@ -4,15 +4,17 @@
 //! 1. `NoCount`: Send PID as-is (baseline)
 //! 2. `AlwaysOne`: Append ` 1` to all requests
 //! 3. `AdaptiveCount`: Detect ECU count on first request, use that count
-//! 4. `Pipelined`: Send multiple requests before waiting for responses
-//! 5. `RawCapture`: Pure TCP proxy with traffic recording to PSRAM
+//! 4. `RawCapture`: Pure TCP proxy with traffic recording to PSRAM
+//!
+//! All polling modes support optional pipelining via `use_pipelining`,
+//! which keeps 1 request in-flight on the dongle for higher throughput.
 
 use crate::config::{pid_data_length, CaptureOverflow, QueryMode, StartOptions};
 use crate::watchdog::WatchdogHandle;
 use crate::{State, TestControlMessage};
 use log::{debug, error, info, warn};
 use smallvec::SmallVec;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::Ordering;
@@ -39,7 +41,6 @@ struct TestConfig {
     timeout: Duration,
     fast_pids: SmallVec<[u8; 8]>,
     slow_pids: SmallVec<[u8; 8]>,
-    pipeline_bytes: u16,
     listen_port: u16,
     capture: CaptureConfig,
 }
@@ -55,7 +56,6 @@ impl TestConfig {
             timeout: Duration::from_millis(cfg_guard.test.obd2_timeout_ms),
             fast_pids: cfg_guard.test.get_fast_pids(),
             slow_pids: cfg_guard.test.get_slow_pids(),
-            pipeline_bytes: cfg_guard.test.pipeline_bytes,
             listen_port: cfg_guard.test.listen_port,
             capture: CaptureConfig {
                 buffer_size: cfg_guard.test.capture_buffer_size,
@@ -75,49 +75,6 @@ impl TestConfig {
 struct CaptureConfig {
     buffer_size: u32,
     overflow: CaptureOverflow,
-}
-
-/// Round-robin PID selector with configurable fast:slow ratio.
-///
-/// Used by the legacy pipelined test mode.
-struct PidSelector {
-    fast_index: usize,
-    slow_index: usize,
-    fast_count: u32,
-}
-
-impl PidSelector {
-    fn new() -> Self {
-        Self {
-            fast_index: 0,
-            slow_index: 0,
-            fast_count: 0,
-        }
-    }
-
-    /// Select the next PID using the fast:slow ratio.
-    ///
-    /// Returns `None` when both PID lists are empty.
-    fn next(&mut self, fast_pids: &[u8], slow_pids: &[u8]) -> Option<u8> {
-        if self.fast_count < FAST_SLOW_RATIO && !fast_pids.is_empty() {
-            self.fast_count += 1;
-            let pid = fast_pids[self.fast_index % fast_pids.len()];
-            self.fast_index += 1;
-            Some(pid)
-        } else if !slow_pids.is_empty() {
-            self.fast_count = 0;
-            let pid = slow_pids[self.slow_index % slow_pids.len()];
-            self.slow_index += 1;
-            Some(pid)
-        } else if !fast_pids.is_empty() {
-            self.fast_count = 0;
-            let pid = fast_pids[self.fast_index % fast_pids.len()];
-            self.fast_index += 1;
-            Some(pid)
-        } else {
-            None
-        }
-    }
 }
 
 // ============================================================================
@@ -179,10 +136,15 @@ impl Base {
     }
 
     /// Send `command` + `\r`, read until `>` prompt, return raw response.
-    ///
-    /// When capture is enabled, records the sent command as `ClientToDongle`
-    /// and the raw response as `DongleToClient`.
     fn execute(&mut self, command: &[u8]) -> Result<Obd2Buffer, String> {
+        self.send(command)?;
+        self.recv()
+    }
+
+    /// Send `command` + `\r` to the dongle without waiting for a response.
+    ///
+    /// Records the sent command as `ClientToDongle` in the capture buffer.
+    fn send(&mut self, command: &[u8]) -> Result<(), String> {
         let mut cmd_with_cr: Obd2Buffer = command.into();
         if !cmd_with_cr.ends_with(b"\r") {
             cmd_with_cr.push(b'\r');
@@ -206,6 +168,13 @@ impl Base {
             .write_all(&cmd_with_cr)
             .map_err(|e| format!("Write error: {e}"))?;
 
+        Ok(())
+    }
+
+    /// Read until `>` prompt, return raw response.
+    ///
+    /// Records the raw response as `DongleToClient` in the capture buffer.
+    fn recv(&mut self) -> Result<Obd2Buffer, String> {
         let mut buffer = [0u8; 128];
         let mut response = Obd2Buffer::new();
         let start = Instant::now();
@@ -263,6 +232,8 @@ struct RepeatLayer {
     repeat_string: SmallVec<[u8; 2]>,
     last_command: Option<SmallVec<[u8; 16]>>,
     supports_repeat: Option<bool>,
+    /// Whether the last `send()` used the repeat string (for pipelined mode).
+    last_was_repeat: bool,
 }
 
 impl RepeatLayer {
@@ -273,6 +244,7 @@ impl RepeatLayer {
             repeat_string: repeat_string.into(),
             last_command: None,
             supports_repeat: None,
+            last_was_repeat: false,
         }
     }
 
@@ -297,6 +269,47 @@ impl RepeatLayer {
         let response = self.base.execute(command)?;
         if self.enabled {
             self.last_command = Some(command.into());
+        }
+        Ok(response)
+    }
+
+    /// Send a command through the base layer without waiting for a response.
+    ///
+    /// When repeat is enabled and the command matches the last one sent,
+    /// sends the repeat string instead. Tracks whether repeat was used so
+    /// `recv()` can handle `?` fallback.
+    fn send(&mut self, command: &[u8]) -> Result<(), String> {
+        if self.enabled && self.supports_repeat != Some(false) {
+            if let Some(ref last) = self.last_command {
+                if last.as_slice() == command {
+                    self.last_was_repeat = true;
+                    return self.base.send(&self.repeat_string);
+                }
+            }
+        }
+
+        // Different command or repeat disabled — send full command
+        self.last_was_repeat = false;
+        self.base.send(command)?;
+        if self.enabled {
+            self.last_command = Some(command.into());
+        }
+        Ok(())
+    }
+
+    /// Read a response from the base layer.
+    ///
+    /// If the last send was a repeat and the response contains `?`, marks
+    /// repeat as unsupported and returns an error so the caller can retry.
+    fn recv(&mut self) -> Result<Obd2Buffer, String> {
+        let response = self.base.recv()?;
+        if self.last_was_repeat {
+            let response_str = String::from_utf8_lossy(&response);
+            if response_str.contains('?') {
+                info!("Repeat not supported by dongle (pipelined), disabling");
+                self.supports_repeat = Some(false);
+                return Err("repeat_failed".to_string());
+            }
         }
         Ok(response)
     }
@@ -337,6 +350,18 @@ impl FramingLayer {
     /// Send a command through the stack, return raw response.
     fn execute(&mut self, command: &[u8]) -> Result<Obd2Buffer, String> {
         self.repeat.execute(command)
+    }
+
+    /// Send a command through the stack without waiting for a response.
+    fn send(&mut self, command: &[u8]) -> Result<(), String> {
+        self.repeat.send(command)
+    }
+
+    /// Read a response and parse it into structured lines.
+    fn recv(&mut self) -> Result<(Obd2Buffer, SmallVec<[ParsedLine; 4]>), String> {
+        let response = self.repeat.recv()?;
+        let parsed = self.parse_response(&response);
+        Ok((response, parsed))
     }
 
     /// Parse a raw response buffer into individual lines.
@@ -436,6 +461,8 @@ struct CountLayer {
     response_counts: HashMap<SmallVec<[u8; 16]>, u8>,
     /// Number of PIDs in the current query (set by [`QueryBuilder`] before each call).
     pid_count: usize,
+    /// Queue of original command keys for in-flight pipelined requests.
+    pending_commands: VecDeque<SmallVec<[u8; 16]>>,
 }
 
 impl CountLayer {
@@ -445,6 +472,7 @@ impl CountLayer {
             mode,
             response_counts: HashMap::new(),
             pid_count: 1,
+            pending_commands: VecDeque::new(),
         }
     }
 
@@ -476,8 +504,8 @@ impl CountLayer {
                     command.into()
                 }
             }
-            // Pipelined and RawCapture don't use the layer stack
-            QueryMode::Pipelined | QueryMode::RawCapture => unreachable!(),
+            // RawCapture doesn't use the layer stack
+            QueryMode::RawCapture => unreachable!(),
         };
 
         let response = self.framing.execute(&actual_command)?;
@@ -492,6 +520,61 @@ impl CountLayer {
                     String::from_utf8_lossy(command)
                 );
                 self.response_counts.insert(cmd_key, ecu_count);
+            }
+        }
+
+        Ok((response, parsed))
+    }
+
+    /// Build the actual command (with count suffix) from the original command.
+    fn build_actual_command(&self, command: &[u8]) -> SmallVec<[u8; 20]> {
+        let cmd_key: SmallVec<[u8; 16]> = command.into();
+        match self.mode {
+            QueryMode::NoCount => command.into(),
+            QueryMode::AlwaysOne => {
+                let mut cmd: SmallVec<[u8; 20]> = command.into();
+                cmd.extend_from_slice(b" 1");
+                cmd
+            }
+            QueryMode::AdaptiveCount => {
+                if let Some(&count) = self.response_counts.get(&cmd_key) {
+                    let mut cmd: SmallVec<[u8; 20]> = command.into();
+                    cmd.push(b' ');
+                    cmd.push(b'0' + count);
+                    cmd
+                } else {
+                    command.into()
+                }
+            }
+            QueryMode::RawCapture => unreachable!(),
+        }
+    }
+
+    /// Send a command through the framing layer without waiting for a response.
+    ///
+    /// Queues the original command key so `recv()` can correlate it for ECU
+    /// count learning.
+    fn send(&mut self, command: &[u8]) -> Result<(), String> {
+        let actual_command = self.build_actual_command(command);
+        self.pending_commands.push_back(command.into());
+        self.framing.send(&actual_command)
+    }
+
+    /// Read a response, learn ECU count if needed, return raw + parsed.
+    fn recv(&mut self) -> Result<(Obd2Buffer, SmallVec<[ParsedLine; 4]>), String> {
+        let (response, parsed) = self.framing.recv()?;
+
+        if let Some(cmd_key) = self.pending_commands.pop_front() {
+            if self.mode == QueryMode::AdaptiveCount && !self.response_counts.contains_key(&cmd_key)
+            {
+                let ecu_count = self.count_ecus(&parsed);
+                if ecu_count > 0 {
+                    info!(
+                        "Learned ECU count for {:?}: {ecu_count}",
+                        String::from_utf8_lossy(&cmd_key)
+                    );
+                    self.response_counts.insert(cmd_key, ecu_count);
+                }
             }
         }
 
@@ -814,6 +897,160 @@ impl QueryBuilder {
             }
         }
     }
+
+    /// Select the next PIDs and build a command using the 6:1 fast:slow ratio.
+    ///
+    /// Returns `(command_bytes, queried_pids)`. Updates internal `count.pid_count`.
+    fn next_command(
+        &mut self,
+        fast_index: &mut usize,
+        slow_index: &mut usize,
+        fast_count: &mut u32,
+    ) -> (SmallVec<[u8; 16]>, SmallVec<[u8; 8]>) {
+        if self.use_multi_pid {
+            let use_slow = *fast_count >= FAST_SLOW_RATIO && !self.slow_pids.is_empty();
+            if use_slow {
+                *fast_count = 0;
+                let all_pids: SmallVec<[u8; 8]> = self
+                    .fast_pids
+                    .iter()
+                    .chain(self.slow_pids.iter())
+                    .copied()
+                    .collect();
+                let (cmd, pid_count) = Self::build_command(&all_pids);
+                self.count.pid_count = pid_count;
+                (cmd, all_pids)
+            } else {
+                *fast_count += 1;
+                let fast_copy: SmallVec<[u8; 8]> = self.fast_pids.clone();
+                let (cmd, pid_count) = Self::build_command(&fast_copy);
+                self.count.pid_count = pid_count;
+                (cmd, fast_copy)
+            }
+        } else {
+            let pid = if *fast_count < FAST_SLOW_RATIO && !self.fast_pids.is_empty() {
+                *fast_count += 1;
+                let p = self.fast_pids[*fast_index % self.fast_pids.len()];
+                *fast_index += 1;
+                p
+            } else if !self.slow_pids.is_empty() {
+                *fast_count = 0;
+                let p = self.slow_pids[*slow_index % self.slow_pids.len()];
+                *slow_index += 1;
+                p
+            } else {
+                *fast_count = 0;
+                let p = self.fast_pids[*fast_index % self.fast_pids.len()];
+                *fast_index += 1;
+                p
+            };
+
+            self.count.pid_count = 1;
+            let (cmd, _) = Self::build_command(&[pid]);
+            (cmd, SmallVec::from_slice(&[pid]))
+        }
+    }
+
+    /// Run the pipelined polling loop: keep 1 request in-flight on the dongle.
+    ///
+    /// Startup: send cmd1, send cmd2. Steady state: recv → process → send next.
+    /// This overlaps the dongle's processing of cmd(N+1) with our read of
+    /// response(N), achieving ~1 request always in-flight.
+    fn run_pipelined_loop(
+        &mut self,
+        ctx: &TestContext,
+        capture_config: CaptureConfig,
+    ) -> Result<(), String> {
+        let mut fast_index: usize = 0;
+        let mut slow_index: usize = 0;
+        let mut fast_count: u32 = 0;
+        let mut last_second = Instant::now();
+        let mut requests_this_second = 0u32;
+
+        if self.fast_pids.is_empty() && self.slow_pids.is_empty() {
+            return Err("No PIDs configured".to_string());
+        }
+
+        // In-flight queue: tracks queried PIDs for each pending command.
+        let mut in_flight: VecDeque<SmallVec<[u8; 8]>> = VecDeque::with_capacity(2);
+
+        // Send first two commands to prime the pipeline
+        let (cmd1, pids1) = self.next_command(&mut fast_index, &mut slow_index, &mut fast_count);
+        self.count.send(&cmd1)?;
+        in_flight.push_back(pids1);
+
+        let (cmd2, pids2) = self.next_command(&mut fast_index, &mut slow_index, &mut fast_count);
+        self.count.send(&cmd2)?;
+        in_flight.push_back(pids2);
+
+        // Steady state: recv oldest, send next
+        loop {
+            ctx.watchdog.feed();
+
+            if ctx.check_stop()? {
+                return Ok(());
+            }
+
+            // Update requests/sec and buffer usage metrics
+            if last_second.elapsed() >= Duration::from_secs(1) {
+                ctx.state
+                    .metrics
+                    .requests_per_sec
+                    .store(requests_this_second, Ordering::Relaxed);
+                requests_this_second = 0;
+                last_second = Instant::now();
+
+                let buf_len = ctx.state.capture_buffer.lock().unwrap().len() as u64;
+                let usage_pct =
+                    u32::try_from(buf_len * 100 / u64::from(capture_config.buffer_size))
+                        .expect("percentage fits in u32");
+                ctx.state
+                    .metrics
+                    .buffer_usage_pct
+                    .store(usage_pct, Ordering::Relaxed);
+            }
+
+            // Receive the oldest in-flight response
+            let queried_pids = in_flight
+                .pop_front()
+                .expect("in_flight queue should never be empty");
+
+            match self.count.recv() {
+                Ok((_response, parsed)) => {
+                    ctx.state
+                        .metrics
+                        .total_requests
+                        .fetch_add(1, Ordering::Relaxed);
+                    requests_this_second += 1;
+
+                    update_pid_values(ctx.state, &parsed, &queried_pids);
+                }
+                Err(e) => {
+                    if e == "repeat_failed" {
+                        // Repeat string not supported — logged by RepeatLayer.
+                        // Skip this response, don't count as error.
+                        debug!("Pipelined repeat failed, skipping response");
+                    } else {
+                        warn!("Pipelined request failed: {e}");
+                        ctx.state
+                            .metrics
+                            .total_errors
+                            .fetch_add(1, Ordering::Relaxed);
+
+                        if e.contains("Disconnect") {
+                            ctx.state.dongle_connected.store(false, Ordering::Relaxed);
+                            return Err(e);
+                        }
+                    }
+                }
+            }
+
+            // Send the next command to keep 1 in-flight
+            let (cmd, pids) = self.next_command(&mut fast_index, &mut slow_index, &mut fast_count);
+            self.count.send(&cmd)?;
+            in_flight.push_back(pids);
+        }
+    }
 }
 
 /// Extract PID values from a parsed OBD2 response and store them in shared
@@ -869,20 +1106,6 @@ impl TestContext<'_> {
     }
 }
 
-/// Connect to the dongle using the Base layer (for non-layered modes).
-fn connect_dongle(config: &TestConfig) -> Result<TcpStream, String> {
-    let addr = config.dongle_addr();
-    info!("Connecting to dongle at {addr}...");
-
-    let mut stream = TcpStream::connect(&addr).map_err(|e| format!("Connect failed: {e}"))?;
-    stream.set_read_timeout(Some(config.timeout)).ok();
-    stream.set_nodelay(true).ok();
-
-    init_dongle(&mut stream, config.timeout)?;
-    info!("Dongle initialized");
-    Ok(stream)
-}
-
 /// Build a [`CaptureHeader`] from the current device state.
 pub fn build_capture_header(state: &State) -> [u8; HEADER_SIZE] {
     let record_count = state.metrics.records_captured.load(Ordering::Relaxed);
@@ -916,70 +1139,6 @@ pub fn build_capture_header(state: &State) -> [u8; HEADER_SIZE] {
     header.set_firmware_version(FIRMWARE_VERSION);
 
     header.to_bytes()
-}
-
-/// Initialize dongle connection with standard AT commands (for non-layered modes).
-fn init_dongle(stream: &mut TcpStream, timeout: Duration) -> Result<(), String> {
-    execute_command(stream, b"ATZ", timeout)?;
-    execute_command(stream, b"ATE0", timeout)?;
-    execute_command(stream, b"ATS0", timeout)?;
-    execute_command(stream, b"ATL0", timeout)?;
-    execute_command(stream, b"ATH0", timeout)?;
-    Ok(())
-}
-
-/// Execute a command on the dongle (for non-layered modes).
-fn execute_command(
-    stream: &mut TcpStream,
-    command: &[u8],
-    timeout: Duration,
-) -> Result<Obd2Buffer, String> {
-    let mut cmd_with_cr: Obd2Buffer = command.into();
-    if !cmd_with_cr.ends_with(b"\r") {
-        cmd_with_cr.push(b'\r');
-    }
-
-    debug!(
-        "Sending to dongle: {:?}",
-        String::from_utf8_lossy(&cmd_with_cr)
-    );
-
-    stream
-        .write_all(&cmd_with_cr)
-        .map_err(|e| format!("Write error: {e}"))?;
-
-    let mut buffer = [0u8; 128];
-    let mut response = Obd2Buffer::new();
-    let start = Instant::now();
-
-    loop {
-        if start.elapsed() > timeout {
-            return Err("Timeout".to_string());
-        }
-
-        match stream.read(&mut buffer) {
-            Ok(0) => return Err("Disconnected".to_string()),
-            Ok(n) => {
-                response.extend_from_slice(&buffer[..n]);
-                if response.contains(&b'>') {
-                    debug!(
-                        "Complete response: {:?}",
-                        String::from_utf8_lossy(&response)
-                    );
-                    break;
-                }
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                std::thread::sleep(Duration::from_millis(1));
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
-                return Err("Timeout".to_string());
-            }
-            Err(e) => return Err(format!("Read error: {e}")),
-        }
-    }
-
-    Ok(response)
 }
 
 /// Main test task — handles all query modes.
@@ -1048,17 +1207,17 @@ fn run_test(ctx: &TestContext, start_options: StartOptions) {
             .join(", "),
     );
     info!(
-        "Options: multi_pid={}, repeat={}, framing={}",
+        "Options: multi_pid={}, repeat={}, framing={}, pipelining={}",
         config.start_options.use_multi_pid,
         config.start_options.use_repeat,
-        config.start_options.use_framing
+        config.start_options.use_framing,
+        config.start_options.use_pipelining
     );
 
     let result = match config.start_options.query_mode {
         QueryMode::NoCount | QueryMode::AlwaysOne | QueryMode::AdaptiveCount => {
             run_polling_test(ctx, &config)
         }
-        QueryMode::Pipelined => run_pipelined_test(ctx, &config),
         QueryMode::RawCapture => run_capture_test(ctx, &config),
     };
 
@@ -1120,142 +1279,12 @@ fn run_polling_test(ctx: &TestContext, config: &TestConfig) -> Result<(), String
         config.start_options.use_multi_pid,
     )?;
 
-    // Run the polling loop
-    query_builder.run_polling_loop(ctx, config.capture)
-}
-
-/// Run pipelined test (mode 4)
-fn run_pipelined_test(ctx: &TestContext, config: &TestConfig) -> Result<(), String> {
-    let mut stream = connect_dongle(config)?;
-    ctx.state.dongle_connected.store(true, Ordering::Relaxed);
-
-    let mut pid_selector = PidSelector::new();
-    let mut last_second = Instant::now();
-    let mut requests_this_second = 0u32;
-
-    // Pipeline state
-    let mut pending_count: usize = 0;
-    let mut bytes_on_wire = 0u16;
-
-    loop {
-        ctx.watchdog.feed();
-
-        if ctx.check_stop()? {
-            return Ok(());
-        }
-
-        // Update requests/sec
-        if last_second.elapsed() >= Duration::from_secs(1) {
-            ctx.state
-                .metrics
-                .requests_per_sec
-                .store(requests_this_second, Ordering::Relaxed);
-            requests_this_second = 0;
-            last_second = Instant::now();
-        }
-
-        // Send commands until we hit the pipeline limit
-        while bytes_on_wire < config.pipeline_bytes {
-            let Some(pid) = pid_selector.next(&config.fast_pids, &config.slow_pids) else {
-                break;
-            };
-
-            // Send command with ` 1` for fast response: "01XX 1\r"
-            let mut cmd_buf = [0u8; 8];
-            let cmd = format_pid_command(pid, &mut cmd_buf);
-            // Hot path: OBD2 commands are short strings, always fits u16
-            #[allow(clippy::cast_possible_truncation)]
-            let cmd_len = cmd.len() as u16;
-
-            if let Err(e) = stream.write_all(cmd) {
-                ctx.state.dongle_connected.store(false, Ordering::Relaxed);
-                return Err(format!("Write error: {e}"));
-            }
-
-            pending_count += 1;
-            bytes_on_wire += cmd_len;
-        }
-
-        // Read responses for pending commands
-        if pending_count > 0 {
-            let response_count =
-                read_pipelined_responses(&mut stream, ctx.state, pending_count, config.timeout)?;
-            ctx.state
-                .metrics
-                .total_requests
-                .fetch_add(response_count, Ordering::Relaxed);
-            requests_this_second += response_count;
-
-            pending_count = 0;
-            bytes_on_wire = 0;
-        }
+    // Run the polling loop (or pipelined loop)
+    if config.start_options.use_pipelining {
+        query_builder.run_pipelined_loop(ctx, config.capture)
+    } else {
+        query_builder.run_polling_loop(ctx, config.capture)
     }
-}
-
-/// Format a Mode 01 PID byte into a pipelined command: `"01XX 1\r"`.
-///
-/// Writes into `buf` and returns the filled slice.
-fn format_pid_command(pid: u8, buf: &mut [u8; 8]) -> &[u8] {
-    buf[0] = b'0';
-    buf[1] = b'1';
-    buf[2] = QueryBuilder::nibble_to_hex(pid >> 4);
-    buf[3] = QueryBuilder::nibble_to_hex(pid & 0x0F);
-    buf[4] = b' ';
-    buf[5] = b'1';
-    buf[6] = b'\r';
-    &buf[..7]
-}
-
-/// Read responses for a batch of pipelined commands.
-///
-/// Returns the number of successful responses (prompt characters received).
-fn read_pipelined_responses(
-    stream: &mut TcpStream,
-    state: &State,
-    expected_count: usize,
-    timeout: Duration,
-) -> Result<u32, String> {
-    let mut buffer = [0u8; 256];
-    let mut response_buf = Vec::new();
-
-    let start = Instant::now();
-    // bytecount crate has no Xtensa support, would fall back to same loop
-    #[allow(clippy::naive_bytecount)]
-    while response_buf.iter().filter(|&&b| b == b'>').count() < expected_count {
-        if start.elapsed() > timeout {
-            // Hot path: expected_count is small, always fits u32
-            #[allow(clippy::cast_possible_truncation)]
-            let pending = expected_count as u32;
-            state
-                .metrics
-                .total_errors
-                .fetch_add(pending, Ordering::Relaxed);
-            return Ok(0);
-        }
-
-        match stream.read(&mut buffer) {
-            Ok(0) => {
-                state.dongle_connected.store(false, Ordering::Relaxed);
-                return Err("Disconnected".to_string());
-            }
-            Ok(n) => {
-                response_buf.extend_from_slice(&buffer[..n]);
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                std::thread::sleep(Duration::from_millis(1));
-            }
-            Err(e) => {
-                state.dongle_connected.store(false, Ordering::Relaxed);
-                return Err(format!("Read error: {e}"));
-            }
-        }
-    }
-
-    // bytecount crate has no Xtensa support, would fall back to same loop
-    // Hot path: response count per batch, always fits u32
-    #[allow(clippy::naive_bytecount, clippy::cast_possible_truncation)]
-    let response_count = response_buf.iter().filter(|&&b| b == b'>').count() as u32;
-    Ok(response_count)
 }
 
 /// Run capture test (mode 5) — pure TCP proxy with PSRAM recording.
