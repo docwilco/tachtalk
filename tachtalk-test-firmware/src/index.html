@@ -61,6 +61,23 @@
         select {
             width: 218px;
         }
+        .password-wrapper {
+            display: inline-flex;
+            align-items: center;
+            gap: 5px;
+        }
+        .toggle-password {
+            background-color: #444;
+            color: #fff;
+            padding: 5px 10px;
+            border: 1px solid #444;
+            border-radius: 3px;
+            cursor: pointer;
+            font-size: 0.9em;
+        }
+        .toggle-password:hover {
+            background-color: #555;
+        }
         button {
             background-color: #00ff00;
             color: #000;
@@ -604,7 +621,10 @@
             <div id="wifiList" style="display: none; margin: 10px 0 10px 155px;"></div>
             <div class="form-group">
                 <label>Password:</label>
-                <input type="password" id="wifiPassword">
+                <span class="password-wrapper">
+                    <input type="password" id="wifiPassword">
+                    <button type="button" class="toggle-password" onclick="togglePasswordVisibility(this)">Show</button>
+                </span>
             </div>
             <div class="form-group">
                 <label>Use DHCP:</label>
@@ -628,7 +648,10 @@
             </div>
             <div class="form-group">
                 <label>AP Password:</label>
-                <input type="password" id="apPassword" placeholder="Leave empty for open">
+                <span class="password-wrapper">
+                    <input type="password" id="apPassword" placeholder="Leave empty for open">
+                    <button type="button" class="toggle-password" onclick="togglePasswordVisibility(this)">Show</button>
+                </span>
             </div>
             
             <button onclick="saveConfig()">Save WiFi Settings</button>
@@ -701,6 +724,17 @@
             'adaptive_count': "First request detects how many responses the ECU sends, then uses that count for subsequent requests.",
             'raw_capture': "Pure TCP proxy mode. Records all traffic to PSRAM buffer for later download and analysis."
         };
+
+        function togglePasswordVisibility(button) {
+            const input = button.previousElementSibling;
+            if (input.type === 'password') {
+                input.type = 'text';
+                button.textContent = 'Hide';
+            } else {
+                input.type = 'password';
+                button.textContent = 'Show';
+            }
+        }
 
         async function loadConfig() {
             try {
@@ -1435,56 +1469,62 @@
             if (!confirm(msg)) return;
 
             statusEl.className = 'ota-status info';
-            statusEl.textContent = 'Downloading firmware from GitHub...';
+            statusEl.textContent = 'Starting firmware download on device...';
             statusEl.style.display = 'block';
             progressEl.style.display = 'block';
             barEl.style.width = '0%';
             barEl.textContent = '0%';
 
             try {
-                const dlResp = await fetch(asset.browser_download_url);
-                if (!dlResp.ok) throw new Error('Download failed: HTTP ' + dlResp.status);
-                const firmware = await dlResp.arrayBuffer();
-
-                statusEl.textContent = 'Uploading to device (' + (firmware.byteLength / 1024).toFixed(0) + ' KB)...';
-
-                await new Promise((resolve, reject) => {
-                    const xhr = new XMLHttpRequest();
-                    xhr.open('POST', '/api/ota/upload');
-                    xhr.setRequestHeader('Content-Type', 'application/octet-stream');
-                    xhr.upload.onprogress = (e) => {
-                        if (e.lengthComputable) {
-                            const pct = Math.round(e.loaded / e.total * 100);
-                            barEl.style.width = pct + '%';
-                            barEl.textContent = pct + '%';
-                        }
-                    };
-                    xhr.onload = () => {
-                        if (xhr.status === 200) {
-                            try {
-                                const resp = JSON.parse(xhr.responseText);
-                                if (resp.success) resolve();
-                                else reject(new Error(resp.error || 'OTA failed'));
-                            } catch { resolve(); }
-                        } else {
-                            reject(new Error('Upload failed: HTTP ' + xhr.status));
-                        }
-                    };
-                    xhr.onerror = () => reject(new Error('Upload network error'));
-                    xhr.ontimeout = () => reject(new Error('Upload timed out'));
-                    xhr.timeout = 120000;
-                    xhr.send(firmware);
+                // Tell the device to download the firmware directly from GitHub
+                const resp = await fetch('/api/ota/download', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ url: asset.browser_download_url })
                 });
+                const result = await resp.json();
+                if (!resp.ok || !result.success) {
+                    throw new Error(result.error || 'Failed to start download');
+                }
 
-                barEl.style.width = '100%';
-                barEl.textContent = '100%';
-                statusEl.className = 'ota-status success';
-                statusEl.textContent = 'Update successful! Device is rebooting...';
+                // Poll for progress
+                const OTA_DOWNLOADING = 1, OTA_FLASHING = 2, OTA_DONE = 3, OTA_ERROR = 255;
+                const pollInterval = setInterval(async () => {
+                    try {
+                        const sr = await fetch('/api/ota/status');
+                        const st = await sr.json();
+                        const pct = st.progress || 0;
+                        barEl.style.width = pct + '%';
+                        barEl.textContent = pct + '%';
 
-                setTimeout(() => {
-                    statusEl.textContent += ' Reconnecting in 10s...';
-                    setTimeout(() => { location.reload(); }, 10000);
-                }, 5000);
+                        if (st.status === OTA_DOWNLOADING) {
+                            statusEl.textContent = 'Device is downloading firmware... ' + pct + '%';
+                        } else if (st.status === OTA_FLASHING) {
+                            statusEl.textContent = 'Downloading and flashing... ' + pct + '%';
+                        } else if (st.status === OTA_DONE) {
+                            clearInterval(pollInterval);
+                            barEl.style.width = '100%';
+                            barEl.textContent = '100%';
+                            statusEl.className = 'ota-status success';
+                            statusEl.textContent = 'Update successful! Device is rebooting...';
+                            setTimeout(() => {
+                                statusEl.textContent += ' Reconnecting in 10s...';
+                                setTimeout(() => { location.reload(); }, 10000);
+                            }, 5000);
+                        } else if (st.status === OTA_ERROR) {
+                            clearInterval(pollInterval);
+                            statusEl.className = 'ota-status error';
+                            statusEl.textContent = 'Update failed: ' + (st.error || 'unknown error');
+                            progressEl.style.display = 'none';
+                        }
+                    } catch {
+                        // Device may have rebooted — stop polling and try to reconnect
+                        clearInterval(pollInterval);
+                        statusEl.className = 'ota-status success';
+                        statusEl.textContent = 'Device is rebooting... Reconnecting in 15s...';
+                        setTimeout(() => { location.reload(); }, 15000);
+                    }
+                }, 1000);
 
             } catch (e) {
                 statusEl.className = 'ota-status error';

@@ -40,7 +40,7 @@ use obd2::{cache_manager_task, dongle_task, CacheManagerSender, DongleSender, Ob
 use rpm_leds::{rpm_led_task, LedController, RpmTaskSender};
 use sse_server::{sse_server_task, SseSender};
 
-use std::sync::atomic::{AtomicBool, AtomicU32};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8};
 
 /// Metrics for PID polling
 pub struct PollingMetrics {
@@ -111,6 +111,12 @@ pub struct State {
     pub supported_pids: Mutex<obd2::SupportedPidsCache>,
     /// Whether the ECU supports multi-PID queries (e.g., `010C0D` for RPM + vehicle speed)
     pub supports_multi_pid: AtomicBool,
+    /// OTA download status: 0=idle, 1=downloading, 2=flashing, 3=done, 255=error
+    pub ota_status: AtomicU8,
+    /// OTA progress percentage (0-100)
+    pub ota_progress: AtomicU8,
+    /// OTA error message (set when `ota_status` == 255)
+    pub ota_error: Mutex<String>,
 }
 
 /// Create STA network interface with static IP or DHCP based on config
@@ -381,6 +387,9 @@ fn spawn_background_tasks(
         polling_metrics: PollingMetrics::default(),
         supported_pids: Mutex::new(obd2::SupportedPidsCache::default()),
         supports_multi_pid: AtomicBool::new(false),
+        ota_status: AtomicU8::new(0),
+        ota_progress: AtomicU8::new(0),
+        ota_error: Mutex::new(String::new()),
     });
 
     // Start DNS server for captive portal

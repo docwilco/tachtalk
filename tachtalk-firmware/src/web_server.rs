@@ -895,7 +895,30 @@ fn register_captive_portal(
     Ok(())
 }
 
-/// Register OTA firmware update routes: `/api/ota/info`, `/api/ota/upload`
+/// OTA download request body
+#[derive(serde::Deserialize)]
+struct OtaDownloadRequest<'a> {
+    url: &'a str,
+}
+
+/// Schedule a reboot after a successful OTA, stopping WiFi first.
+fn schedule_ota_reboot(state: Arc<State>) {
+    crate::thread_util::spawn_named(c"ota-reboot", move || {
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        info!("Stopping WiFi before OTA reboot...");
+        if let Ok(mut wifi_guard) = state.wifi.lock() {
+            if let Err(e) = wifi_guard.stop() {
+                warn!("Failed to stop WiFi: {e:?}");
+            }
+        }
+        info!("Rebooting into new firmware...");
+        unsafe {
+            esp_idf_svc::sys::esp_restart();
+        }
+    });
+}
+
+/// Register OTA firmware info and direct-upload routes: `/api/ota/info`, `/api/ota/upload`
 fn register_ota_routes(server: &mut EspHttpServer<'static>, state: &Arc<State>) -> Result<()> {
     // GET firmware info (version + variant)
     server.fn_handler(
@@ -947,22 +970,7 @@ fn register_ota_routes(server: &mut EspHttpServer<'static>, state: &Arc<State>) 
                     info!("OTA upload: success, scheduling reboot");
                     let mut response = req.into_ok_response()?;
                     response.write_all(b"{\"success\":true}")?;
-
-                    // Reboot after response is sent
-                    let state = state_clone.clone();
-                    crate::thread_util::spawn_named(c"ota-reboot", move || {
-                        std::thread::sleep(std::time::Duration::from_secs(2));
-                        info!("Stopping WiFi before OTA reboot...");
-                        if let Ok(mut wifi_guard) = state.wifi.lock() {
-                            if let Err(e) = wifi_guard.stop() {
-                                warn!("Failed to stop WiFi: {e:?}");
-                            }
-                        }
-                        info!("Rebooting into new firmware...");
-                        unsafe {
-                            esp_idf_svc::sys::esp_restart();
-                        }
-                    });
+                    schedule_ota_reboot(state_clone.clone());
                 }
                 Err(e) => {
                     error!("OTA upload failed: {e:?}");
@@ -976,6 +984,122 @@ fn register_ota_routes(server: &mut EspHttpServer<'static>, state: &Arc<State>) 
                 }
             }
 
+            Ok(())
+        },
+    )?;
+
+    Ok(())
+}
+
+/// Register server-side OTA download and status routes: `/api/ota/download`, `/api/ota/status`
+fn register_ota_download_routes(
+    server: &mut EspHttpServer<'static>,
+    state: &Arc<State>,
+) -> Result<()> {
+    // POST: start server-side firmware download + OTA
+    let state_clone = state.clone();
+    server.fn_handler(
+        "/api/ota/download",
+        Method::Post,
+        move |mut req| -> Result<(), esp_idf_svc::io::EspIOError> {
+            info!("HTTP: POST /api/ota/download");
+
+            // Reject if OTA already in progress
+            let current = state_clone
+                .ota_status
+                .load(std::sync::atomic::Ordering::Relaxed);
+            if current != crate::ota::OTA_STATUS_IDLE && current != crate::ota::OTA_STATUS_ERROR {
+                let mut response = req.into_response(
+                    409,
+                    Some("Conflict"),
+                    &[("Content-Type", "application/json")],
+                )?;
+                response.write_all(b"{\"success\":false,\"error\":\"OTA already in progress\"}")?;
+                return Ok(());
+            }
+
+            // Read JSON body
+            let mut body = [0u8; 1024];
+            let mut total = 0;
+            loop {
+                let n = req.read(&mut body[total..])?;
+                if n == 0 {
+                    break;
+                }
+                total += n;
+                if total >= body.len() {
+                    break;
+                }
+            }
+
+            let body_str = core::str::from_utf8(&body[..total]).unwrap_or("");
+            let parsed: OtaDownloadRequest<'_> = serde_json::from_str(body_str).map_err(|e| {
+                warn!("OTA download: invalid JSON: {e}");
+                esp_idf_svc::io::EspIOError::from(esp_idf_svc::sys::EspError::from_infallible::<
+                    { esp_idf_svc::sys::ESP_ERR_INVALID_ARG },
+                >())
+            })?;
+
+            let url = parsed.url.to_owned();
+            info!("OTA download: url={url}");
+
+            // Reset status
+            state_clone.ota_status.store(
+                crate::ota::OTA_STATUS_DOWNLOADING,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            state_clone
+                .ota_progress
+                .store(0, std::sync::atomic::Ordering::Relaxed);
+            *state_clone.ota_error.lock().unwrap() = String::new();
+
+            // Spawn download thread (needs its own stack for TLS)
+            let state = state_clone.clone();
+            crate::thread_util::spawn_named(c"ota-download", move || {
+                match crate::ota::download_and_update(&url, &state.ota_status, &state.ota_progress)
+                {
+                    Ok(()) => {
+                        info!("OTA download: success, scheduling reboot");
+                        schedule_ota_reboot(state);
+                    }
+                    Err(e) => {
+                        error!("OTA download failed: {e:?}");
+                        *state.ota_error.lock().unwrap() = format!("{e}");
+                        state.ota_status.store(
+                            crate::ota::OTA_STATUS_ERROR,
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
+                    }
+                }
+            });
+
+            let mut response = req.into_ok_response()?;
+            response.write_all(b"{\"success\":true}")?;
+            Ok(())
+        },
+    )?;
+
+    // GET: poll OTA download/flash progress
+    let state_clone = state.clone();
+    server.fn_handler(
+        "/api/ota/status",
+        Method::Get,
+        move |req| -> Result<(), esp_idf_svc::io::EspIOError> {
+            let status = state_clone
+                .ota_status
+                .load(std::sync::atomic::Ordering::Relaxed);
+            let progress = state_clone
+                .ota_progress
+                .load(std::sync::atomic::Ordering::Relaxed);
+            let json = if status == crate::ota::OTA_STATUS_ERROR {
+                let error = state_clone.ota_error.lock().unwrap();
+                let escaped = error.replace('\\', "\\\\").replace('"', "\\\"");
+                format!("{{\"status\":{status},\"progress\":{progress},\"error\":\"{escaped}\"}}")
+            } else {
+                format!("{{\"status\":{status},\"progress\":{progress}}}")
+            };
+            let mut response = req.into_ok_response()?;
+            response.write_all(json.as_bytes())?;
             Ok(())
         },
     )?;
@@ -1007,6 +1131,7 @@ pub fn start_server(
     register_status_routes(&mut server, state)?;
     register_debug_routes(&mut server, state)?;
     register_ota_routes(&mut server, state)?;
+    register_ota_download_routes(&mut server, state)?;
 
     // Captive portal wildcard must be registered last
     if let Some(hostname) = ap_hostname {

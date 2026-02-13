@@ -18,7 +18,7 @@ use esp_idf_svc::wifi::{
 use log::{debug, error, info, warn};
 use smallvec::SmallVec;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 
 mod config;
@@ -116,6 +116,12 @@ pub struct State {
     pub capture_buffer: Mutex<Vec<u8>>,
     /// Last PID values (or errors) keyed by Mode 01 PID byte.
     pub pid_values: Mutex<HashMap<u8, PidValue>>,
+    /// OTA download status: 0=idle, 1=downloading, 2=flashing, 3=done, 255=error
+    pub ota_status: AtomicU8,
+    /// OTA progress percentage (0-100)
+    pub ota_progress: AtomicU8,
+    /// OTA error message (set when `ota_status` == 255)
+    pub ota_error: Mutex<String>,
 }
 
 /// Messages to control the test task
@@ -454,6 +460,9 @@ fn main() -> Result<()> {
         test_control_tx: Mutex::new(Some(test_control_tx)),
         capture_buffer: Mutex::new(Vec::new()),
         pid_values: Mutex::new(HashMap::new()),
+        ota_status: AtomicU8::new(0),
+        ota_progress: AtomicU8::new(0),
+        ota_error: Mutex::new(String::new()),
     });
 
     spawn_background_tasks(&state, sse_rx, test_control_rx, ap_hostname, ap_ip);
