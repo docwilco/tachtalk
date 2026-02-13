@@ -23,6 +23,8 @@ CONFIG_FREERTOS_HZ=1000
 # TLS certificate bundle for HTTPS client (OTA downloads from GitHub)
 CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y
 CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_FULL=y
+# Use default allocator so large TLS buffers go to PSRAM instead of scarce internal SRAM
+CONFIG_MBEDTLS_DEFAULT_MEM_ALLOC=y
 
 # Set compile-time max log level to DEBUG, runtime default to INFO
 CONFIG_LOG_MAXIMUM_LEVEL_DEBUG=y

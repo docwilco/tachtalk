@@ -772,20 +772,27 @@ struct OtaDownloadRequest<'a> {
     url: &'a str,
 }
 
-/// Schedule a reboot after a successful OTA, stopping WiFi first.
+/// Stop WiFi and reboot into new firmware. Does not return.
+fn perform_ota_reboot(state: &Arc<State>) -> ! {
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    info!("Stopping WiFi before OTA reboot...");
+    if let Ok(mut wifi_guard) = state.wifi.lock() {
+        if let Err(e) = wifi_guard.stop() {
+            warn!("Failed to stop WiFi: {e:?}");
+        }
+    }
+    info!("Rebooting into new firmware...");
+    unsafe {
+        esp_idf_svc::sys::esp_restart();
+    }
+}
+
+/// Schedule a reboot on a new thread after a successful OTA upload.
+///
+/// Needed for the upload path where we must return the HTTP response first.
 fn schedule_ota_reboot(state: Arc<State>) {
     crate::thread_util::spawn_named(c"ota-reboot", move || {
-        std::thread::sleep(std::time::Duration::from_secs(2));
-        info!("Stopping WiFi before OTA reboot...");
-        if let Ok(mut wifi_guard) = state.wifi.lock() {
-            if let Err(e) = wifi_guard.stop() {
-                warn!("Failed to stop WiFi: {e:?}");
-            }
-        }
-        info!("Rebooting into new firmware...");
-        unsafe {
-            esp_idf_svc::sys::esp_restart();
-        }
+        perform_ota_reboot(&state);
     });
 }
 
@@ -862,12 +869,11 @@ fn register_ota_routes(server: &mut EspHttpServer<'static>, state: &Arc<State>) 
     Ok(())
 }
 
-/// Register server-side OTA download and status routes: `/api/ota/download`, `/api/ota/status`
+/// Register server-side OTA download route: `POST /api/ota/download`
 fn register_ota_download_routes(
     server: &mut EspHttpServer<'static>,
     state: &Arc<State>,
 ) -> Result<()> {
-    // POST: start server-side firmware download + OTA
     let state_clone = state.clone();
     server.fn_handler(
         "/api/ota/download",
@@ -930,8 +936,8 @@ fn register_ota_download_routes(
                 match crate::ota::download_and_update(&url, &state.ota_status, &state.ota_progress)
                 {
                     Ok(()) => {
-                        info!("OTA download: success, scheduling reboot");
-                        schedule_ota_reboot(state);
+                        info!("OTA download: success, rebooting");
+                        perform_ota_reboot(&state);
                     }
                     Err(e) => {
                         error!("OTA download failed: {e:?}");
@@ -950,7 +956,14 @@ fn register_ota_download_routes(
         },
     )?;
 
-    // GET: poll OTA download/flash progress
+    Ok(())
+}
+
+/// Register OTA status polling route: `GET /api/ota/status`
+fn register_ota_status_route(
+    server: &mut EspHttpServer<'static>,
+    state: &Arc<State>,
+) -> Result<()> {
     let state_clone = state.clone();
     server.fn_handler(
         "/api/ota/status",
@@ -1060,6 +1073,7 @@ pub fn start_server(state: &Arc<State>, ap_hostname: Option<&str>, ap_ip: Ipv4Ad
     register_debug_routes(&mut server, state)?;
     register_ota_routes(&mut server, state)?;
     register_ota_download_routes(&mut server, state)?;
+    register_ota_status_route(&mut server, state)?;
 
     // Captive portal wildcard must be registered last
     if let Some(hostname) = &ap_hostname {

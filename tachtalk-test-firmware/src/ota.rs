@@ -20,8 +20,8 @@ pub const OTA_STATUS_DONE: u8 = 3;
 /// OTA status: error occurred (see `ota_error` for details)
 pub const OTA_STATUS_ERROR: u8 = 255;
 
-/// Firmware version from `Cargo.toml`.
-pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+/// Firmware version from git describe (e.g. "v0.1.0" or "v0.1.0-test3").
+pub const VERSION: &str = env!("GIT_VERSION");
 
 /// Mark the currently running OTA slot as valid.
 ///
@@ -127,6 +127,7 @@ pub fn download_and_update(
         timeout: Some(core::time::Duration::from_secs(60)),
         follow_redirects_policy: FollowRedirectsPolicy::FollowAll,
         buffer_size: Some(4096),
+        buffer_size_tx: Some(2048),
         ..Default::default()
     })?;
 

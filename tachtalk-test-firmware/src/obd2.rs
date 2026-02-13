@@ -31,7 +31,7 @@ pub type Obd2Buffer = SmallVec<[u8; 32]>;
 const FAST_SLOW_RATIO: u32 = 6;
 
 /// Firmware version string for capture header
-const FIRMWARE_VERSION: &str = env!("CARGO_PKG_VERSION");
+const FIRMWARE_VERSION: &str = env!("GIT_VERSION");
 
 /// Snapshot of test configuration taken at test start.
 struct TestConfig {

@@ -7,7 +7,7 @@ target-dir = "target"
 
 [target.xtensa-esp32s3-espidf]
 linker = "ldproxy"
-runner = "espflash flash --monitor --baud 3000000"
+runner = "espflash flash --erase-parts otadata --monitor --baud 3000000"
 
 [unstable]
 build-std = ["std", "panic_abort"]
