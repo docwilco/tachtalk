@@ -49,11 +49,11 @@ jobs:
       - name: Convert to binary images
         run: |
           espflash save-image --chip esp32s3 --flash-size 16mb \
-            tachtalk-firmware/target/xtensa-esp32s3-espidf/release/tachtalk-firmware \
+            tachtalk-firmware/target/xtensa-esp32s3-espidf/release/tachtalk \
             tachtalk-firmware-${{ github.ref_name }}.bin
 
           espflash save-image --chip esp32s3 --flash-size 16mb \
-            tachtalk-test-firmware/target/xtensa-esp32s3-espidf/release/tachtalk-test-firmware \
+            tachtalk-test-firmware/target/xtensa-esp32s3-espidf/release/tachtalk-test \
             tachtalk-test-firmware-${{ github.ref_name }}.bin
 
       - name: Create GitHub Release
