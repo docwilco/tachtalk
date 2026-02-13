@@ -3,6 +3,9 @@ use esp_idf_hal::delay::FreeRtos;
 use esp_idf_hal::gpio::AnyIOPin;
 use esp_idf_hal::prelude::*;
 use esp_idf_svc::eventloop::EspSystemEventLoop;
+
+/// Firmware variant identifier for OTA: "regular" or "test"
+pub const FIRMWARE_VARIANT: &str = "regular";
 use esp_idf_svc::ipv4::{
     self, ClientConfiguration as IpClientConfiguration, ClientSettings as IpClientSettings,
     Configuration as IpConfiguration, Ipv4Addr, Mask, Subnet,
@@ -24,6 +27,7 @@ mod controls;
 mod cpu_metrics;
 mod dns;
 mod obd2;
+mod ota;
 mod rpm_leds;
 mod sse_server;
 mod thread_util;
@@ -461,6 +465,13 @@ fn main() -> Result<()> {
     // implemented by esp-idf-sys might not link properly. See https://github.com/esp-rs/esp-idf-template/issues/71
     esp_idf_svc::sys::link_patches();
     esp_idf_svc::log::EspLogger::initialize_default();
+
+    // Mark the running OTA slot as valid so the bootloader won't roll back.
+    // Must be called early — if the firmware crashes before this, the bootloader
+    // reverts to the previous image on the next reset.
+    if let Err(e) = ota::mark_running_slot_valid() {
+        warn!("Failed to mark OTA slot valid: {e:?}");
+    }
 
     info!("Starting tachtalk firmware...");
     info!(

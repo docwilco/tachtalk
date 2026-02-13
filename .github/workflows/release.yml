@@ -1,0 +1,44 @@
+name: Build and Release Firmware
+
+on:
+  push:
+    tags: ["v*.*.*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container:
+      image: espressif/idf-rust:esp32s3_latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build regular firmware
+        working-directory: tachtalk-firmware
+        run: cargo build --release
+
+      - name: Build test firmware
+        working-directory: tachtalk-test-firmware
+        run: cargo build --release
+
+      - name: Convert to binary images
+        run: |
+          espflash save-image --chip esp32s3 --flash-size 16mb \
+            tachtalk-firmware/target/xtensa-esp32s3-espidf/release/tachtalk-firmware \
+            tachtalk-firmware-${{ github.ref_name }}.bin
+
+          espflash save-image --chip esp32s3 --flash-size 16mb \
+            tachtalk-test-firmware/target/xtensa-esp32s3-espidf/release/tachtalk-test-firmware \
+            tachtalk-test-firmware-${{ github.ref_name }}.bin
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          # Tags containing a hyphen are pre-releases (e.g. v0.2.0-beta.1)
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          generate_release_notes: true
+          files: |
+            tachtalk-firmware-${{ github.ref_name }}.bin
+            tachtalk-test-firmware-${{ github.ref_name }}.bin

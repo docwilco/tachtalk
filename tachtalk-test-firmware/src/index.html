@@ -332,6 +332,47 @@
         .type-badge.rt-rx { background-color: #1a4a1a; color: #44cc44; }
         .type-badge.rt-connect { background-color: #4a3a1a; color: #ffaa00; }
         .type-badge.rt-disconnect { background-color: #4a1a1a; color: #ff4444; }
+        /* OTA update section */
+        .ota-section {
+            background-color: #2a3a2a;
+            padding: 15px;
+            margin: 15px 0;
+            border-radius: 5px;
+            border-left: 4px solid #ff8800;
+        }
+        .ota-section h2 { margin-top: 0; }
+        .ota-info span { color: #ff8800; font-weight: bold; }
+        .ota-progress {
+            width: 100%;
+            height: 24px;
+            background-color: #333;
+            border-radius: 4px;
+            margin: 10px 0;
+            overflow: hidden;
+            display: none;
+        }
+        .ota-progress-bar {
+            height: 100%;
+            background-color: #ff8800;
+            width: 0%;
+            transition: width 0.3s;
+            text-align: center;
+            line-height: 24px;
+            font-size: 0.85em;
+            font-weight: bold;
+            color: #000;
+        }
+        .ota-status {
+            margin: 10px 0;
+            padding: 8px;
+            border-radius: 4px;
+            display: none;
+        }
+        .ota-status.info { background-color: #2a2a3a; border: 1px solid #0088ff; display: block; }
+        .ota-status.error { background-color: #5a1a1a; border: 1px solid #ff0000; display: block; }
+        .ota-status.success { background-color: #2d5016; border: 1px solid #00ff00; display: block; }
+        button.ota-btn { background-color: #ff8800; }
+        button.ota-btn:hover { background-color: #dd7700; }
     </style>
 </head>
 <body>
@@ -606,6 +647,48 @@
                 </select>
             </div>
             <button onclick="rebootDevice()" class="danger">Reboot Device</button>
+        </div>
+
+        <!-- Firmware Update -->
+        <div class="ota-section">
+            <h2>🔄 Firmware Update</h2>
+            <div class="ota-info">
+                <div class="form-group">
+                    <label>Current Version:</label>
+                    <span id="otaCurrentVersion">—</span>
+                </div>
+                <div class="form-group">
+                    <label>Variant:</label>
+                    <span id="otaCurrentVariant">—</span>
+                </div>
+            </div>
+            <div class="ota-controls">
+                <button class="ota-btn" onclick="otaCheckReleases()">Check for Updates</button>
+                <div id="otaReleaseControls" style="display:none; margin-top: 15px;">
+                    <div class="form-group">
+                        <label>Version:</label>
+                        <select id="otaVersionSelect"></select>
+                    </div>
+                    <div class="form-group">
+                        <label>Variant:</label>
+                        <select id="otaVariantSelect">
+                            <option value="regular">Regular</option>
+                            <option value="test">Test</option>
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label style="width: auto;">
+                            <input type="checkbox" id="otaShowPrerelease" onchange="otaFilterReleases()">
+                            Show pre-releases
+                        </label>
+                    </div>
+                    <button class="ota-btn" onclick="otaStartUpdate()">Update Firmware</button>
+                </div>
+            </div>
+            <div id="otaProgress" class="ota-progress">
+                <div id="otaProgressBar" class="ota-progress-bar">0%</div>
+            </div>
+            <div id="otaStatus" class="ota-status"></div>
         </div>
     </div>
 
@@ -1261,9 +1344,159 @@
         document.getElementById('useDhcp').addEventListener('change', updateDhcpUI);
         document.getElementById('useRepeat').addEventListener('change', updateRepeatUI);
 
+        // ---- OTA firmware update ----
+        const OTA_GITHUB_API = 'https://api.github.com/repos/docwilco/tachtalk/releases';
+        let otaReleases = [];
+
+        async function otaLoadInfo() {
+            try {
+                const resp = await fetch('/api/ota/info');
+                const info = await resp.json();
+                document.getElementById('otaCurrentVersion').textContent = info.version;
+                document.getElementById('otaCurrentVariant').textContent = info.variant;
+                document.getElementById('otaVariantSelect').value = info.variant;
+            } catch (e) {
+                document.getElementById('otaCurrentVersion').textContent = '(error)';
+            }
+        }
+
+        async function otaCheckReleases() {
+            const statusEl = document.getElementById('otaStatus');
+            statusEl.className = 'ota-status info';
+            statusEl.textContent = 'Fetching releases from GitHub...';
+            statusEl.style.display = 'block';
+            try {
+                const resp = await fetch(OTA_GITHUB_API);
+                if (!resp.ok) throw new Error('GitHub API returned ' + resp.status);
+                otaReleases = await resp.json();
+                otaReleases = otaReleases.filter(r => !r.draft);
+                otaFilterReleases();
+                document.getElementById('otaReleaseControls').style.display = 'block';
+                statusEl.style.display = 'none';
+            } catch (e) {
+                statusEl.className = 'ota-status error';
+                statusEl.textContent = 'Failed to fetch releases: ' + e.message;
+            }
+        }
+
+        function otaFilterReleases() {
+            const showPre = document.getElementById('otaShowPrerelease').checked;
+            const select = document.getElementById('otaVersionSelect');
+            const prev = select.value;
+            select.innerHTML = '';
+            const filtered = otaReleases.filter(r => showPre || !r.prerelease);
+            if (filtered.length === 0) {
+                const opt = document.createElement('option');
+                opt.textContent = '(no releases found)';
+                opt.disabled = true;
+                select.appendChild(opt);
+                return;
+            }
+            filtered.forEach((r, i) => {
+                const opt = document.createElement('option');
+                opt.value = r.tag_name;
+                const date = r.published_at ? ' (' + r.published_at.slice(0, 10) + ')' : '';
+                const pre = r.prerelease ? ' [pre-release]' : '';
+                opt.textContent = r.tag_name + date + pre;
+                if (i === 0) opt.selected = true;
+                select.appendChild(opt);
+            });
+            if (prev && [...select.options].some(o => o.value === prev)) {
+                select.value = prev;
+            }
+        }
+
+        function otaFindAsset(tagName, variant) {
+            const release = otaReleases.find(r => r.tag_name === tagName);
+            if (!release) return null;
+            const prefix = variant === 'test' ? 'tachtalk-test-firmware-' : 'tachtalk-firmware-';
+            return release.assets.find(a => a.name === prefix + tagName + '.bin') || null;
+        }
+
+        async function otaStartUpdate() {
+            const tag = document.getElementById('otaVersionSelect').value;
+            const variant = document.getElementById('otaVariantSelect').value;
+            const asset = otaFindAsset(tag, variant);
+            const statusEl = document.getElementById('otaStatus');
+            const progressEl = document.getElementById('otaProgress');
+            const barEl = document.getElementById('otaProgressBar');
+
+            if (!asset) {
+                statusEl.className = 'ota-status error';
+                statusEl.textContent = 'No firmware binary found for ' + variant + ' ' + tag;
+                statusEl.style.display = 'block';
+                return;
+            }
+
+            const currentVariant = document.getElementById('otaCurrentVariant').textContent;
+            const msg = 'Flash ' + variant + ' firmware ' + tag + ' (' + (asset.size / 1024).toFixed(0) + ' KB)?'
+                + (variant !== currentVariant ? '\n\nWarning: you are switching from ' + currentVariant + ' to ' + variant + ' firmware!' : '')
+                + '\n\nThe device will reboot after the update.';
+            if (!confirm(msg)) return;
+
+            statusEl.className = 'ota-status info';
+            statusEl.textContent = 'Downloading firmware from GitHub...';
+            statusEl.style.display = 'block';
+            progressEl.style.display = 'block';
+            barEl.style.width = '0%';
+            barEl.textContent = '0%';
+
+            try {
+                const dlResp = await fetch(asset.browser_download_url);
+                if (!dlResp.ok) throw new Error('Download failed: HTTP ' + dlResp.status);
+                const firmware = await dlResp.arrayBuffer();
+
+                statusEl.textContent = 'Uploading to device (' + (firmware.byteLength / 1024).toFixed(0) + ' KB)...';
+
+                await new Promise((resolve, reject) => {
+                    const xhr = new XMLHttpRequest();
+                    xhr.open('POST', '/api/ota/upload');
+                    xhr.setRequestHeader('Content-Type', 'application/octet-stream');
+                    xhr.upload.onprogress = (e) => {
+                        if (e.lengthComputable) {
+                            const pct = Math.round(e.loaded / e.total * 100);
+                            barEl.style.width = pct + '%';
+                            barEl.textContent = pct + '%';
+                        }
+                    };
+                    xhr.onload = () => {
+                        if (xhr.status === 200) {
+                            try {
+                                const resp = JSON.parse(xhr.responseText);
+                                if (resp.success) resolve();
+                                else reject(new Error(resp.error || 'OTA failed'));
+                            } catch { resolve(); }
+                        } else {
+                            reject(new Error('Upload failed: HTTP ' + xhr.status));
+                        }
+                    };
+                    xhr.onerror = () => reject(new Error('Upload network error'));
+                    xhr.ontimeout = () => reject(new Error('Upload timed out'));
+                    xhr.timeout = 120000;
+                    xhr.send(firmware);
+                });
+
+                barEl.style.width = '100%';
+                barEl.textContent = '100%';
+                statusEl.className = 'ota-status success';
+                statusEl.textContent = 'Update successful! Device is rebooting...';
+
+                setTimeout(() => {
+                    statusEl.textContent += ' Reconnecting in 10s...';
+                    setTimeout(() => { location.reload(); }, 10000);
+                }, 5000);
+
+            } catch (e) {
+                statusEl.className = 'ota-status error';
+                statusEl.textContent = 'Update failed: ' + e.message;
+                progressEl.style.display = 'none';
+            }
+        }
+
         // Initialize
         loadConfig();
         connectSSE();
+        otaLoadInfo();
     </script>
 </body>
 </html>

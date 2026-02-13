@@ -1,3 +1,15 @@
+# N16R8 has 16MB flash
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+
+# Custom OTA partition table: two 3MB OTA slots, no factory partition.
+# Path is resolved relative to the workspace directory (crate root).
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
+# Enable OTA rollback: new firmware must call mark_running_slot_valid()
+# or the bootloader reverts to the previous image on next reset.
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
+
 # Rust often needs a bit of an extra main task stack size compared to C (the default is 3K)
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=16384
 

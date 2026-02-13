@@ -766,6 +766,94 @@ fn register_debug_routes(server: &mut EspHttpServer<'static>, state: &Arc<State>
     Ok(())
 }
 
+/// Register OTA firmware update routes: `/api/ota/info`, `/api/ota/upload`
+fn register_ota_routes(server: &mut EspHttpServer<'static>, state: &Arc<State>) -> Result<()> {
+    // GET firmware info (version + variant)
+    server.fn_handler(
+        "/api/ota/info",
+        Method::Get,
+        move |req| -> Result<(), esp_idf_svc::io::EspIOError> {
+            debug!("HTTP: GET /api/ota/info");
+            let info = crate::ota::firmware_info();
+            let json = serde_json::to_string(&info).unwrap_or_default();
+            let mut response = req.into_ok_response()?;
+            response.write_all(json.as_bytes())?;
+            Ok(())
+        },
+    )?;
+
+    // POST firmware binary upload for OTA
+    let state_clone = state.clone();
+    server.fn_handler(
+        "/api/ota/upload",
+        Method::Post,
+        move |mut req| -> Result<(), esp_idf_svc::io::EspIOError> {
+            info!("HTTP: POST /api/ota/upload");
+
+            let content_length: usize = req
+                .header("Content-Length")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
+
+            if content_length == 0 {
+                warn!("OTA upload: missing or zero Content-Length");
+                req.into_status_response(400)?;
+                return Ok(());
+            }
+
+            info!("OTA upload: Content-Length={content_length}");
+
+            let result = crate::ota::perform_ota(
+                |buf| {
+                    let n = req
+                        .read(buf)
+                        .map_err(|e| anyhow::anyhow!("read error: {e}"))?;
+                    Ok(n)
+                },
+                content_length,
+            );
+
+            match result {
+                Ok(()) => {
+                    info!("OTA upload: success, scheduling reboot");
+                    let mut response = req.into_ok_response()?;
+                    response.write_all(b"{\"success\":true}")?;
+
+                    // Reboot after response is sent
+                    let state = state_clone.clone();
+                    crate::thread_util::spawn_named(c"ota-reboot", move || {
+                        std::thread::sleep(std::time::Duration::from_secs(2));
+                        info!("Stopping WiFi before OTA reboot...");
+                        if let Ok(mut wifi_guard) = state.wifi.lock() {
+                            if let Err(e) = wifi_guard.stop() {
+                                warn!("Failed to stop WiFi: {e:?}");
+                            }
+                        }
+                        info!("Rebooting into new firmware...");
+                        unsafe {
+                            esp_idf_svc::sys::esp_restart();
+                        }
+                    });
+                }
+                Err(e) => {
+                    error!("OTA upload failed: {e:?}");
+                    let mut response = req.into_response(
+                        500,
+                        Some("OTA Failed"),
+                        &[("Content-Type", "application/json")],
+                    )?;
+                    let body = format!("{{\"success\":false,\"error\":\"{e}\"}}");
+                    response.write_all(body.as_bytes())?;
+                }
+            }
+
+            Ok(())
+        },
+    )?;
+
+    Ok(())
+}
+
 /// Register captive portal wildcard handler (must be last — matches /*)
 fn register_captive_portal(
     server: &mut EspHttpServer<'static>,
@@ -846,6 +934,7 @@ pub fn start_server(state: &Arc<State>, ap_hostname: Option<&str>, ap_ip: Ipv4Ad
     register_capture_routes(&mut server, state)?;
     register_network_routes(&mut server, state)?;
     register_debug_routes(&mut server, state)?;
+    register_ota_routes(&mut server, state)?;
 
     // Captive portal wildcard must be registered last
     if let Some(hostname) = &ap_hostname {
