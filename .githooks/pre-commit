@@ -55,7 +55,10 @@ mkdir -p "$staged_dir"
 staged_tmp="$(mktemp -d)"
 trap 'rm -rf "$staged_tmp"' EXIT
 (cd "$root" && git checkout-index --all --force --prefix="$staged_tmp/")
-rsync -r --checksum --delete --exclude='/target' --exclude='*/target' "$staged_tmp/" "$staged_dir/"
+rsync -r --checksum --delete \
+    --exclude='/target' --exclude='*/target' \
+    --exclude='.embuild' --exclude='*/.embuild' \
+    "$staged_tmp/" "$staged_dir/"
 
 # ---------- clippy: host crates ----------
 step "clippy (host crates)"
