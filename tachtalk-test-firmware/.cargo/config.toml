@@ -16,7 +16,7 @@ build-std = ["std", "panic_abort"]
 MCU = "esp32s3"
 ESP_IDF_VERSION = "v5.3"
 ESP_IDF_SDKCONFIG_DEFAULTS = { value = "sdkconfig.defaults", relative = true }
-ESP_IDF_SYS_ROOT_CRATE = "tachtalk-firmware"
+ESP_IDF_SYS_ROOT_CRATE = "tachtalk-test-firmware"
 # Copy partitions.csv into the esp-idf-sys cmake build directory so that
 # CONFIG_PARTITION_TABLE_CUSTOM_FILENAME can find it.
 ESP_IDF_GLOB_0_BASE = { value = ".", relative = true }

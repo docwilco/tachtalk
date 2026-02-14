@@ -9,6 +9,7 @@ permissions:
 
 env:
   GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  RUSTC_WRAPPER: sccache
 
 jobs:
   build:
@@ -31,6 +32,9 @@ jobs:
         with:
           default: true
           ldproxy: true
+
+      - name: Set up sccache
+        uses: mozilla-actions/sccache-action@v0.0.7
 
       - name: Install espflash
         run: |
