@@ -34,7 +34,7 @@ jobs:
           ldproxy: true
 
       - name: Set up sccache
-        uses: mozilla-actions/sccache-action@v0.0.7
+        uses: mozilla-actions/sccache-action@v0.0.9
 
       - name: Install espflash
         run: |
