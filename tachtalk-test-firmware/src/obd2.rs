@@ -9,7 +9,9 @@
 //! All polling modes support optional pipelining via `use_pipelining`,
 //! which keeps 1 request in-flight on the dongle for higher throughput.
 
-use crate::config::{pid_data_length, CaptureOverflow, QueryMode, StartOptions};
+use crate::config::{
+    CaptureOverflow, PidDataLengths, QueryMode, StartOptions, MODE01_PID_DATA_LENGTHS,
+};
 use crate::watchdog::WatchdogHandle;
 use crate::{State, TestControlMessage};
 use log::{debug, error, info, warn};
@@ -453,12 +455,22 @@ impl FramingLayer {
 // Layer 4: Count — ECU response count learning and appending
 // ============================================================================
 
+/// Look up PID data length from a (possibly runtime-updated) lookup table.
+#[inline]
+fn resolve_pid_data_length(pid: u8, pid_lengths: &PidDataLengths) -> Option<u8> {
+    pid_lengths[pid as usize]
+}
+
 /// Learns ECU count from responses and appends the count suffix to commands.
 struct CountLayer {
     framing: FramingLayer,
     mode: QueryMode,
     /// Learned ECU counts keyed by command string.
     response_counts: HashMap<SmallVec<[u8; 16]>, u8>,
+    /// PID → data-byte-count lookup table.
+    /// Initialized from the static SAE J1979 table; updated at runtime when
+    /// single-PID query responses reveal lengths for vendor-specific PIDs.
+    pid_lengths: PidDataLengths,
     /// Number of PIDs in the current query (set by [`QueryBuilder`] before each call).
     pid_count: usize,
     /// Queue of original command keys for in-flight pipelined requests.
@@ -471,6 +483,7 @@ impl CountLayer {
             framing,
             mode,
             response_counts: HashMap::new(),
+            pid_lengths: MODE01_PID_DATA_LENGTHS,
             pid_count: 1,
             pending_commands: VecDeque::new(),
         }
@@ -522,6 +535,9 @@ impl CountLayer {
                 self.response_counts.insert(cmd_key, ecu_count);
             }
         }
+
+        // Learn PID data length from single-PID responses
+        self.learn_pid_data_length(&parsed);
 
         Ok((response, parsed))
     }
@@ -578,7 +594,60 @@ impl CountLayer {
             }
         }
 
+        // Learn PID data length from single-PID responses
+        self.learn_pid_data_length(&parsed);
+
         Ok((response, parsed))
+    }
+
+    /// Learn the data byte count for a PID from a single-PID query response.
+    ///
+    /// For a single-PID query, each ECU response line has format:
+    /// `41 XX DD DD DD...` — the bytes after service byte + PID are data bytes.
+    /// Only learns when `pid_count == 1` (single-PID query).
+    /// Verifies all ECU responses agree on the length before storing.
+    fn learn_pid_data_length(&mut self, parsed: &[ParsedLine]) {
+        if self.pid_count != 1 {
+            return;
+        }
+        let mut target_pid: Option<u8> = None;
+        let mut learned_len: Option<u8> = None;
+
+        for line in parsed {
+            if line.data.len() < 2 || line.data[0] != 0x41 {
+                continue;
+            }
+            let pid = line.data[1];
+
+            if target_pid.is_none() {
+                if self.pid_lengths[pid as usize].is_some() {
+                    return; // Already known
+                }
+                target_pid = Some(pid);
+            } else if target_pid != Some(pid) {
+                continue;
+            }
+
+            // OBD2 CAN single-frame data is at most 7 bytes; always fits u8.
+            #[allow(clippy::cast_possible_truncation)]
+            let data_len = (line.data.len() - 2) as u8;
+            match learned_len {
+                None => learned_len = Some(data_len),
+                Some(prev) if prev != data_len => {
+                    warn!(
+                        "Inconsistent data length for PID {pid:02X}: \
+                         {prev} vs {data_len}, not learning"
+                    );
+                    return;
+                }
+                _ => {}
+            }
+        }
+
+        if let (Some(pid), Some(len)) = (target_pid, learned_len) {
+            info!("Learned data length for PID {pid:02X}: {len} bytes");
+            self.pid_lengths[pid as usize] = Some(len);
+        }
     }
 
     /// Count ECUs from parsed response lines.
@@ -604,7 +673,7 @@ impl CountLayer {
             count
         } else {
             // Framing off, multi-PID: walk each line counting PID responses
-            let total_pid_responses = Self::count_pid_responses_in_lines(parsed);
+            let total_pid_responses = Self::count_pid_responses_in_lines(parsed, &self.pid_lengths);
             if total_pid_responses == 0 || self.pid_count == 0 {
                 return 0;
             }
@@ -620,7 +689,7 @@ impl CountLayer {
     ///
     /// Multi-PID CAN responses have ONE service byte (`0x41`) followed by
     /// concatenated PID + data pairs: `41 | 0C xx xx | 49 xx | 05 xx`.
-    fn count_pid_responses_in_lines(parsed: &[ParsedLine]) -> usize {
+    fn count_pid_responses_in_lines(parsed: &[ParsedLine], pid_lengths: &PidDataLengths) -> usize {
         let mut total = 0;
 
         for line in parsed {
@@ -642,11 +711,11 @@ impl CountLayer {
                 let pid = data[pos];
                 pos += 1; // skip PID byte
 
-                let data_len = pid_data_length(pid) as usize;
-                if data_len == 0 {
+                let Some(data_len) = resolve_pid_data_length(pid, pid_lengths) else {
                     warn!("Unknown PID 0x{pid:02X} in multi-PID response, stopping parse");
                     break;
-                }
+                };
+                let data_len = usize::from(data_len);
 
                 if pos + data_len > data.len() {
                     // Incomplete PID response — might be split across lines
@@ -667,7 +736,10 @@ impl CountLayer {
     /// data bytes (excluding service byte and PID byte) for each PID.
     /// When multiple ECUs respond, later values for the same PID overwrite
     /// earlier ones (last-writer-wins is fine for live display).
-    fn extract_pid_values(parsed: &[ParsedLine]) -> HashMap<u8, SmallVec<[u8; 4]>> {
+    fn extract_pid_values(
+        parsed: &[ParsedLine],
+        pid_lengths: &PidDataLengths,
+    ) -> HashMap<u8, SmallVec<[u8; 4]>> {
         let mut map = HashMap::new();
 
         for line in parsed {
@@ -686,10 +758,10 @@ impl CountLayer {
                 let pid = data[pos];
                 pos += 1;
 
-                let data_len = pid_data_length(pid) as usize;
-                if data_len == 0 {
+                let Some(data_len) = resolve_pid_data_length(pid, pid_lengths) else {
                     break;
-                }
+                };
+                let data_len = usize::from(data_len);
                 if pos + data_len > data.len() {
                     break;
                 }
@@ -729,7 +801,7 @@ impl QueryBuilder {
         if use_multi_pid {
             // Validate all PIDs have known data lengths
             for &pid in fast_pids.iter().chain(slow_pids.iter()) {
-                if pid_data_length(pid) == 0 {
+                if resolve_pid_data_length(pid, &count.pid_lengths).is_none() {
                     return Err(format!("Unknown PID data length for 0x{pid:02X}"));
                 }
             }
@@ -819,53 +891,8 @@ impl QueryBuilder {
             }
 
             // Select PIDs and build command based on mode
-            let (command, queried_pids): (SmallVec<[u8; 16]>, SmallVec<[u8; 8]>) =
-                if self.use_multi_pid {
-                    // Multi-PID mode: build combined commands
-                    let use_slow = fast_count >= FAST_SLOW_RATIO && !self.slow_pids.is_empty();
-                    if use_slow {
-                        fast_count = 0;
-                        // Combined fast + slow PIDs
-                        let all_pids: SmallVec<[u8; 8]> = self
-                            .fast_pids
-                            .iter()
-                            .chain(self.slow_pids.iter())
-                            .copied()
-                            .collect();
-                        let (cmd, pid_count) = Self::build_command(&all_pids);
-                        self.count.pid_count = pid_count;
-                        (cmd, all_pids)
-                    } else {
-                        fast_count += 1;
-                        // Fast PIDs only — copy to avoid borrow conflict with &mut self
-                        let fast_copy: SmallVec<[u8; 8]> = self.fast_pids.clone();
-                        let (cmd, pid_count) = Self::build_command(&fast_copy);
-                        self.count.pid_count = pid_count;
-                        (cmd, fast_copy)
-                    }
-                } else {
-                    // Single-PID mode: round-robin with 6:1 fast:slow ratio
-                    let pid = if fast_count < FAST_SLOW_RATIO && !self.fast_pids.is_empty() {
-                        fast_count += 1;
-                        let p = self.fast_pids[fast_index % self.fast_pids.len()];
-                        fast_index += 1;
-                        p
-                    } else if !self.slow_pids.is_empty() {
-                        fast_count = 0;
-                        let p = self.slow_pids[slow_index % self.slow_pids.len()];
-                        slow_index += 1;
-                        p
-                    } else {
-                        fast_count = 0;
-                        let p = self.fast_pids[fast_index % self.fast_pids.len()];
-                        fast_index += 1;
-                        p
-                    };
-
-                    self.count.pid_count = 1;
-                    let (cmd, _) = Self::build_command(&[pid]);
-                    (cmd, SmallVec::from_slice(&[pid]))
-                };
+            let (command, queried_pids) =
+                self.next_command(&mut fast_index, &mut slow_index, &mut fast_count);
 
             if command.is_empty() {
                 continue;
@@ -880,7 +907,7 @@ impl QueryBuilder {
                         .fetch_add(1, Ordering::Relaxed);
                     requests_this_second += 1;
 
-                    update_pid_values(ctx.state, &parsed, &queried_pids);
+                    update_pid_values(ctx.state, &parsed, &queried_pids, &self.count.pid_lengths);
                 }
                 Err(e) => {
                     warn!("Request failed: {e}");
@@ -1023,7 +1050,7 @@ impl QueryBuilder {
                         .fetch_add(1, Ordering::Relaxed);
                     requests_this_second += 1;
 
-                    update_pid_values(ctx.state, &parsed, &queried_pids);
+                    update_pid_values(ctx.state, &parsed, &queried_pids, &self.count.pid_lengths);
                 }
                 Err(e) => {
                     if e == "repeat_failed" {
@@ -1056,8 +1083,13 @@ impl QueryBuilder {
 /// Extract PID values from a parsed OBD2 response and store them in shared
 /// state. PIDs present in `queried_pids` but absent from the response are
 /// marked as `NO DATA`.
-fn update_pid_values(state: &State, parsed: &[ParsedLine], queried_pids: &[u8]) {
-    let values = CountLayer::extract_pid_values(parsed);
+fn update_pid_values(
+    state: &State,
+    parsed: &[ParsedLine],
+    queried_pids: &[u8],
+    pid_lengths: &PidDataLengths,
+) {
+    let values = CountLayer::extract_pid_values(parsed, pid_lengths);
     let mut pid_values_guard = state.pid_values.lock().unwrap();
     for (&pid, data) in &values {
         pid_values_guard.insert(pid, crate::PidValue::Value(data.clone()));

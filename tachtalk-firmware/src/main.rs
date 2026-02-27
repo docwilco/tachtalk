@@ -26,6 +26,7 @@ mod config;
 mod controls;
 mod cpu_metrics;
 mod dns;
+mod heap_diag;
 mod obd2;
 mod ota;
 mod rpm_leds;
@@ -39,10 +40,12 @@ use config::Config;
 use obd2::{cache_manager_task, dongle_task, CacheManagerSender, DongleSender, Obd2Proxy};
 use rpm_leds::{rpm_led_task, LedController, RpmTaskSender};
 use sse_server::{sse_server_task, SseSender};
+use thread_util::StackMemory::{Internal, SpiRam};
 
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8};
 
 /// Metrics for PID polling
+#[derive(Default)]
 pub struct PollingMetrics {
     /// Number of PIDs in the fast polling queue
     pub fast_pid_count: AtomicU32,
@@ -62,22 +65,11 @@ pub struct PollingMetrics {
     pub fast_pids: Mutex<Vec<String>>,
     /// List of PIDs in the slow queue (for display)
     pub slow_pids: Mutex<Vec<String>>,
-}
-
-impl Default for PollingMetrics {
-    fn default() -> Self {
-        Self {
-            fast_pid_count: AtomicU32::new(0),
-            slow_pid_count: AtomicU32::new(0),
-            promotions: AtomicU32::new(0),
-            demotions: AtomicU32::new(0),
-            removals: AtomicU32::new(0),
-            dongle_requests_total: AtomicU32::new(0),
-            dongle_requests_per_sec: AtomicU32::new(0),
-            fast_pids: Mutex::new(Vec::new()),
-            slow_pids: Mutex::new(Vec::new()),
-        }
-    }
+    // --- Capture metrics ---
+    /// Number of records captured
+    pub records_captured: AtomicU32,
+    /// Whether capture buffer has overflowed
+    pub capture_overflow: AtomicBool,
 }
 
 /// Central state shared across tasks
@@ -109,14 +101,55 @@ pub struct State {
     /// Cached responses for supported PIDs queries (0100, 0120, ..., 01E0)
     /// plus a `ready` flag indicating whether capability queries have completed.
     pub supported_pids: Mutex<obd2::SupportedPidsCache>,
-    /// Whether the ECU supports multi-PID queries (e.g., `010C0D` for RPM + vehicle speed)
-    pub supports_multi_pid: AtomicBool,
     /// OTA download status: 0=idle, 1=downloading, 2=flashing, 3=done, 255=error
     pub ota_status: AtomicU8,
     /// OTA progress percentage (0-100)
     pub ota_progress: AtomicU8,
     /// OTA error message (set when `ota_status` == 255)
     pub ota_error: Mutex<String>,
+    /// Traffic capture buffer (in PSRAM)
+    pub capture_buffer: Mutex<Vec<u8>>,
+    /// Runtime capture toggle (independent of config, toggled via API)
+    pub capture_active: AtomicBool,
+}
+
+impl State {
+    /// Create a new `State` with the given injected dependencies; all other fields
+    /// are initialised to their default (zero / empty) values.
+    fn new(
+        config: Config,
+        wifi: EspWifi<'static>,
+        ap_ssid: String,
+        sse_tx: SseSender,
+        rpm_tx: RpmTaskSender,
+        dongle_control_tx: DongleSender,
+        cache_manager_tx: CacheManagerSender,
+    ) -> Self {
+        let capture_enabled = config.obd2.capture_enabled;
+        Self {
+            config: Mutex::new(config),
+            wifi: Mutex::new(wifi),
+            ap_ssid,
+            sse_tx,
+            rpm_tx,
+            dongle_control_tx,
+            cache_manager_tx,
+            shared_rpm: Mutex::default(),
+            at_command_log: Mutex::default(),
+            pid_log: Mutex::default(),
+            dongle_connected: AtomicBool::new(false),
+            dongle_tcp_info: Mutex::default(),
+            obd2_client_count: AtomicU32::new(0),
+            client_tcp_info: Mutex::default(),
+            polling_metrics: PollingMetrics::default(),
+            supported_pids: Mutex::default(),
+            ota_status: AtomicU8::new(0),
+            ota_progress: AtomicU8::new(0),
+            ota_error: Mutex::default(),
+            capture_buffer: Mutex::default(),
+            capture_active: AtomicBool::new(capture_enabled),
+        }
+    }
 }
 
 /// Create STA network interface with static IP or DHCP based on config
@@ -369,28 +402,15 @@ fn spawn_background_tasks(
     let (cache_manager_tx, cache_manager_rx) = std::sync::mpsc::channel();
     let (rpm_tx, rpm_rx) = std::sync::mpsc::channel();
 
-    let state = Arc::new(State {
-        config: Mutex::new(config),
-        wifi: Mutex::new(wifi),
+    let state = Arc::new(State::new(
+        config,
+        wifi,
         ap_ssid,
         sse_tx,
         rpm_tx,
         dongle_control_tx,
         cache_manager_tx,
-        shared_rpm: Mutex::new(None),
-        at_command_log: Mutex::new(HashSet::new()),
-        pid_log: Mutex::new(HashSet::new()),
-        dongle_connected: AtomicBool::new(false),
-        dongle_tcp_info: Mutex::new(None),
-        obd2_client_count: AtomicU32::new(0),
-        client_tcp_info: Mutex::new(Vec::new()),
-        polling_metrics: PollingMetrics::default(),
-        supported_pids: Mutex::new(obd2::SupportedPidsCache::default()),
-        supports_multi_pid: AtomicBool::new(false),
-        ota_status: AtomicU8::new(0),
-        ota_progress: AtomicU8::new(0),
-        ota_error: Mutex::new(String::new()),
-    });
+    ));
 
     // Start DNS server for captive portal
     dns::start_dns_server(ap_ip);
@@ -398,7 +418,7 @@ fn spawn_background_tasks(
     // Start SSE server for RPM streaming (on port 81)
     {
         let state = state.clone();
-        thread_util::spawn_named(c"sse_srv", move || {
+        thread_util::spawn_named(c"sse_srv", 6144, SpiRam, move || {
             sse_server_task(&sse_rx, &state);
         });
     }
@@ -406,7 +426,7 @@ fn spawn_background_tasks(
     // Start OBD2 dongle task
     {
         let state = state.clone();
-        thread_util::spawn_named(c"dongle", move || {
+        thread_util::spawn_named(c"dongle", 8192, Internal, move || {
             dongle_task(&state, &dongle_control_rx);
         });
     }
@@ -414,7 +434,7 @@ fn spawn_background_tasks(
     // Start cache manager task
     {
         let state = state.clone();
-        thread_util::spawn_named(c"cache_mgr", move || {
+        thread_util::spawn_named(c"cache_mgr", 6144, Internal, move || {
             cache_manager_task(&state, &cache_manager_rx);
         });
     }
@@ -423,25 +443,21 @@ fn spawn_background_tasks(
     // Pin to Core 1 to avoid interference from WiFi (which runs on Core 0)
     {
         let state = state.clone();
-        thread_util::spawn_named_on_core(c"rpm_led", esp_idf_hal::cpu::Core::Core1, move || {
-            rpm_led_task(&state, led_controller, rpm_rx);
-        });
-    }
-
-    // Start web server
-    {
-        let state = state.clone();
-        thread_util::spawn_named(c"web_srv", move || {
-            if let Err(e) = web_server::start_server(&state, Some(ap_hostname), ap_ip) {
-                error!("Web server error: {e:?}");
-            }
-        });
+        thread_util::spawn_named_on_core(
+            c"rpm_led",
+            esp_idf_hal::cpu::Core::Core1,
+            4096,
+            Internal,
+            move || {
+                rpm_led_task(&state, led_controller, rpm_rx);
+            },
+        );
     }
 
     // Start OBD2 proxy
     {
         let state = state.clone();
-        thread_util::spawn_named(c"obd2_proxy", move || {
+        thread_util::spawn_named(c"obd2_proxy", 4096, Internal, move || {
             let proxy = Obd2Proxy::new(state);
             if let Err(e) = proxy.run() {
                 error!("OBD2 proxy error: {e:?}");
@@ -453,7 +469,7 @@ fn spawn_background_tasks(
     // Start WiFi connection manager
     {
         let state = state.clone();
-        thread_util::spawn_named(c"wifi_mgr", move || {
+        thread_util::spawn_named(c"wifi_mgr", 4096, SpiRam, move || {
             wifi_connection_manager(&state);
         });
     }
@@ -461,9 +477,14 @@ fn spawn_background_tasks(
     // Start controls task (rotary encoder and/or button)
     if let Some(driver) = encoder_driver {
         let state = state.clone();
-        thread_util::spawn_named(c"controls", move || {
+        thread_util::spawn_named(c"controls", 6144, Internal, move || {
             controls::controls_task(&state, driver);
         });
+    }
+
+    // Start web server
+    if let Err(e) = web_server::start_server(&state, Some(ap_hostname), ap_ip) {
+        error!("Web server error: {e:?}");
     }
 
     state
@@ -483,13 +504,16 @@ fn main() -> Result<()> {
     }
 
     info!("Starting tachtalk firmware...");
+
+    // Register main task stack size for diagnostic output
+    thread_util::register_stack_size(
+        c"main",
+        esp_idf_svc::sys::CONFIG_ESP_MAIN_TASK_STACK_SIZE as usize,
+    );
+
     info!(
         "LWIP_MAX_SOCKETS: {}",
         esp_idf_svc::sys::CONFIG_LWIP_MAX_SOCKETS
-    );
-    info!(
-        "Obd2Buffer size: {} bytes",
-        std::mem::size_of::<obd2::Obd2Buffer>()
     );
 
     let peripherals = Peripherals::take()?;
@@ -530,6 +554,9 @@ fn main() -> Result<()> {
         if dump_sockets {
             web_server::log_sockets();
         }
+
+        // Heap memory stats
+        heap_diag::log_heap_stats();
 
         // Print polling metrics
         let metrics = &state.polling_metrics;

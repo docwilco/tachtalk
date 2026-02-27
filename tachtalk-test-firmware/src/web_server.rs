@@ -345,12 +345,17 @@ fn register_config_write_routes(
                     info!("Config changed (requires restart), restarting in 2 seconds...");
                     let mut response = req.into_ok_response()?;
                     response.write_all(b"{\"restart\":true}")?;
-                    crate::thread_util::spawn_named(c"restart", || {
-                        std::thread::sleep(std::time::Duration::from_secs(2));
-                        unsafe {
-                            esp_idf_svc::sys::esp_restart();
-                        }
-                    });
+                    crate::thread_util::spawn_named(
+                        c"restart",
+                        4096,
+                        crate::thread_util::StackMemory::Spiram,
+                        || {
+                            std::thread::sleep(std::time::Duration::from_secs(2));
+                            unsafe {
+                                esp_idf_svc::sys::esp_restart();
+                            }
+                        },
+                    );
                 } else {
                     req.into_ok_response()?;
                 }
@@ -743,21 +748,26 @@ fn register_debug_routes(server: &mut EspHttpServer<'static>, state: &Arc<State>
             req.into_ok_response()?;
 
             let state = state_clone.clone();
-            crate::thread_util::spawn_named(c"restart", move || {
-                std::thread::sleep(std::time::Duration::from_secs(1));
+            crate::thread_util::spawn_named(
+                c"restart",
+                4096,
+                crate::thread_util::StackMemory::Spiram,
+                move || {
+                    std::thread::sleep(std::time::Duration::from_secs(1));
 
-                info!("Stopping WiFi before reboot...");
-                if let Ok(mut wifi_guard) = state.wifi.lock() {
-                    if let Err(e) = wifi_guard.stop() {
-                        warn!("Failed to stop WiFi: {e:?}");
+                    info!("Stopping WiFi before reboot...");
+                    if let Ok(mut wifi_guard) = state.wifi.lock() {
+                        if let Err(e) = wifi_guard.stop() {
+                            warn!("Failed to stop WiFi: {e:?}");
+                        }
                     }
-                }
 
-                info!("Rebooting device now...");
-                unsafe {
-                    esp_idf_svc::sys::esp_restart();
-                }
-            });
+                    info!("Rebooting device now...");
+                    unsafe {
+                        esp_idf_svc::sys::esp_restart();
+                    }
+                },
+            );
 
             Ok(())
         },
@@ -791,9 +801,14 @@ fn perform_ota_reboot(state: &Arc<State>) -> ! {
 ///
 /// Needed for the upload path where we must return the HTTP response first.
 fn schedule_ota_reboot(state: Arc<State>) {
-    crate::thread_util::spawn_named(c"ota-reboot", move || {
-        perform_ota_reboot(&state);
-    });
+    crate::thread_util::spawn_named(
+        c"ota-reboot",
+        4096,
+        crate::thread_util::StackMemory::Spiram,
+        move || {
+            perform_ota_reboot(&state);
+        },
+    );
 }
 
 /// Register OTA firmware info and direct-upload routes: `/api/ota/info`, `/api/ota/upload`
@@ -930,11 +945,19 @@ fn register_ota_download_routes(
                 .store(0, std::sync::atomic::Ordering::Relaxed);
             *state_clone.ota_error.lock().unwrap() = String::new();
 
-            // Spawn download thread (needs its own stack for TLS)
+            // Spawn download thread – stack MUST be in internal SRAM because
+            // esp_ota_begin disables the SPI flash cache (and thus PSRAM access)
+            // while it erases flash sectors.
             let state = state_clone.clone();
-            crate::thread_util::spawn_named(c"ota-download", move || {
-                match crate::ota::download_and_update(&url, &state.ota_status, &state.ota_progress)
-                {
+            crate::thread_util::spawn_named(
+                c"ota-download",
+                16384,
+                crate::thread_util::StackMemory::Internal,
+                move || match crate::ota::download_and_update(
+                    &url,
+                    &state.ota_status,
+                    &state.ota_progress,
+                ) {
                     Ok(()) => {
                         info!("OTA download: success, rebooting");
                         perform_ota_reboot(&state);
@@ -947,8 +970,8 @@ fn register_ota_download_routes(
                             std::sync::atomic::Ordering::Relaxed,
                         );
                     }
-                }
-            });
+                },
+            );
 
             let mut response = req.into_ok_response()?;
             response.write_all(b"{\"success\":true}")?;

@@ -9,8 +9,8 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use esp_idf_svc::sys::{
-    esp_get_free_heap_size, esp_get_minimum_free_heap_size, lwip_getpeername, lwip_getsockname,
-    lwip_getsockopt, sockaddr, sockaddr_in, AF_INET,
+    heap_caps_get_free_size, heap_caps_get_minimum_free_size, lwip_getpeername, lwip_getsockname,
+    lwip_getsockopt, sockaddr, sockaddr_in, AF_INET, MALLOC_CAP_INTERNAL, MALLOC_CAP_SPIRAM,
 };
 use std::mem::MaybeUninit;
 
@@ -133,6 +133,16 @@ struct TcpStatus {
     dongle: Option<TcpConnectionInfo>,
     /// Client connections
     clients: Vec<TcpConnectionInfo>,
+}
+
+/// Capture status response
+#[derive(serde::Serialize)]
+struct CaptureStatus {
+    buffer_bytes: u32,
+    buffer_capacity: u32,
+    records: u32,
+    overflow: bool,
+    capture_active: bool,
 }
 
 /// Socket type enumeration
@@ -264,8 +274,10 @@ pub fn log_sockets() {
 struct DebugInfo {
     at_commands: Vec<String>,
     pids: Vec<String>,
-    free_heap: u32,
-    min_free_heap: u32,
+    internal_free: usize,
+    internal_min_free: usize,
+    spiram_free: usize,
+    spiram_min_free: usize,
 }
 
 /// Polling metrics response
@@ -434,12 +446,17 @@ fn register_post_config(server: &mut EspHttpServer<'static>, state: &Arc<State>)
                     }
                     let mut response = req.into_ok_response()?;
                     response.write_all(b"{\"restart\":true}")?;
-                    crate::thread_util::spawn_named(c"restart", || {
-                        std::thread::sleep(std::time::Duration::from_secs(2));
-                        unsafe {
-                            esp_idf_svc::sys::esp_restart();
-                        }
-                    });
+                    crate::thread_util::spawn_named(
+                        c"restart",
+                        4096,
+                        crate::thread_util::StackMemory::SpiRam,
+                        || {
+                            std::thread::sleep(std::time::Duration::from_secs(2));
+                            unsafe {
+                                esp_idf_svc::sys::esp_restart();
+                            }
+                        },
+                    );
                 } else {
                     req.into_ok_response()?;
                 }
@@ -770,19 +787,27 @@ fn register_debug_routes(server: &mut EspHttpServer<'static>, state: &Arc<State>
                 })
                 .unwrap_or_default();
 
-            // SAFETY: These are simple C functions that return u32 values
-            let free_heap = unsafe { esp_get_free_heap_size() };
-            let min_free_heap = unsafe { esp_get_minimum_free_heap_size() };
+            // SAFETY: These are simple C functions that return a usize
+            let internal_free =
+                unsafe { heap_caps_get_free_size(MALLOC_CAP_INTERNAL) };
+            let internal_min_free =
+                unsafe { heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL) };
+            let spiram_free =
+                unsafe { heap_caps_get_free_size(MALLOC_CAP_SPIRAM) };
+            let spiram_min_free =
+                unsafe { heap_caps_get_minimum_free_size(MALLOC_CAP_SPIRAM) };
 
             let info = DebugInfo {
                 at_commands,
                 pids,
-                free_heap,
-                min_free_heap,
+                internal_free,
+                internal_min_free,
+                spiram_free,
+                spiram_min_free,
             };
 
             let json = serde_json::to_string(&info).unwrap_or_else(|_| {
-                r#"{"at_commands":[],"free_heap":0,"min_free_heap":0}"#.to_string()
+                r#"{"at_commands":[],"internal_free":0,"internal_min_free":0,"spiram_free":0,"spiram_min_free":0}"#.to_string()
             });
 
             let mut response = req.into_ok_response()?;
@@ -803,22 +828,27 @@ fn register_debug_routes(server: &mut EspHttpServer<'static>, state: &Arc<State>
 
             // Schedule restart after response is sent
             let state = state_clone.clone();
-            crate::thread_util::spawn_named(c"restart", move || {
-                std::thread::sleep(std::time::Duration::from_secs(1));
+            crate::thread_util::spawn_named(
+                c"restart",
+                4096,
+                crate::thread_util::StackMemory::SpiRam,
+                move || {
+                    std::thread::sleep(std::time::Duration::from_secs(1));
 
-                // Stop WiFi before restarting to ensure clean shutdown
-                info!("Stopping WiFi before reboot...");
-                if let Ok(mut wifi) = state.wifi.lock() {
-                    if let Err(e) = wifi.stop() {
-                        warn!("Failed to stop WiFi: {e:?}");
+                    // Stop WiFi before restarting to ensure clean shutdown
+                    info!("Stopping WiFi before reboot...");
+                    if let Ok(mut wifi) = state.wifi.lock() {
+                        if let Err(e) = wifi.stop() {
+                            warn!("Failed to stop WiFi: {e:?}");
+                        }
                     }
-                }
 
-                info!("Rebooting device now...");
-                unsafe {
-                    esp_idf_svc::sys::esp_restart();
-                }
-            });
+                    info!("Rebooting device now...");
+                    unsafe {
+                        esp_idf_svc::sys::esp_restart();
+                    }
+                },
+            );
 
             Ok(())
         },
@@ -920,9 +950,168 @@ fn perform_ota_reboot(state: &Arc<State>) -> ! {
 ///
 /// Needed for the upload path where we must return the HTTP response first.
 fn schedule_ota_reboot(state: Arc<State>) {
-    crate::thread_util::spawn_named(c"ota-reboot", move || {
-        perform_ota_reboot(&state);
-    });
+    crate::thread_util::spawn_named(
+        c"ota-reboot",
+        4096,
+        crate::thread_util::StackMemory::SpiRam,
+        move || {
+            perform_ota_reboot(&state);
+        },
+    );
+}
+
+/// Register capture routes: /api/capture (GET), /api/capture/clear, /api/capture/status,
+/// /api/capture/start, /api/capture/stop
+fn register_capture_routes(server: &mut EspHttpServer<'static>, state: &Arc<State>) -> Result<()> {
+    register_capture_data_routes(server, state)?;
+    register_capture_control_routes(server, state)?;
+    Ok(())
+}
+
+/// Register capture data routes: download (GET) and clear (POST).
+fn register_capture_data_routes(
+    server: &mut EspHttpServer<'static>,
+    state: &Arc<State>,
+) -> Result<()> {
+    // GET capture download endpoint — returns header + raw binary capture data
+    let state_clone = state.clone();
+    server.fn_handler(
+        "/api/capture",
+        Method::Get,
+        move |req| -> Result<(), esp_idf_svc::io::EspIOError> {
+            info!("HTTP: GET /api/capture");
+
+            let buf_guard = state_clone.capture_buffer.lock().unwrap();
+
+            if buf_guard.is_empty() {
+                req.into_status_response(204)?;
+                return Ok(());
+            }
+
+            // Hot path: capture buffer capped at 6 MB by config validation, fits u32
+            #[allow(clippy::cast_possible_truncation)]
+            let buffer_len = buf_guard.len() as u32;
+            let header = crate::obd2::build_capture_header(&state_clone, buffer_len);
+
+            let total_len = header.len() + buf_guard.len();
+            let content_len = total_len.to_string();
+            let mut response = req.into_response(
+                200,
+                Some("OK"),
+                &[
+                    ("Content-Type", "application/octet-stream"),
+                    (
+                        "Content-Disposition",
+                        "attachment; filename=\"capture.ttcap\"",
+                    ),
+                    ("Content-Length", &content_len),
+                ],
+            )?;
+            response.write_all(&header)?;
+            response.write_all(&buf_guard)?;
+
+            Ok(())
+        },
+    )?;
+
+    // POST capture clear endpoint — clears the capture buffer
+    let state_clone = state.clone();
+    server.fn_handler(
+        "/api/capture/clear",
+        Method::Post,
+        move |req| -> Result<(), esp_idf_svc::io::EspIOError> {
+            info!("HTTP: POST /api/capture/clear");
+
+            {
+                let mut buf_guard = state_clone.capture_buffer.lock().unwrap();
+                buf_guard.clear();
+            }
+            state_clone
+                .polling_metrics
+                .records_captured
+                .store(0, Ordering::Relaxed);
+            state_clone
+                .polling_metrics
+                .capture_overflow
+                .store(false, Ordering::Relaxed);
+
+            info!("Capture buffer cleared");
+            req.into_ok_response()?;
+            Ok(())
+        },
+    )?;
+
+    Ok(())
+}
+
+/// Register capture control routes: status (GET), start (POST), stop (POST).
+fn register_capture_control_routes(
+    server: &mut EspHttpServer<'static>,
+    state: &Arc<State>,
+) -> Result<()> {
+    // GET capture status endpoint
+    let state_clone = state.clone();
+    server.fn_handler(
+        "/api/capture/status",
+        Method::Get,
+        move |req| -> Result<(), esp_idf_svc::io::EspIOError> {
+            debug!("HTTP: GET /api/capture/status");
+
+            let buffer_bytes = u32::try_from(state_clone.capture_buffer.lock().unwrap().len())
+                .expect("buffer length fits in u32");
+            let buffer_capacity = state_clone.config.lock().unwrap().obd2.capture_buffer_size;
+            let capture_active = state_clone.capture_active.load(Ordering::Relaxed);
+            let records = state_clone
+                .polling_metrics
+                .records_captured
+                .load(Ordering::Relaxed);
+            let overflow = state_clone
+                .polling_metrics
+                .capture_overflow
+                .load(Ordering::Relaxed);
+
+            let status = CaptureStatus {
+                buffer_bytes,
+                buffer_capacity,
+                records,
+                overflow,
+                capture_active,
+            };
+
+            let json = serde_json::to_string(&status).unwrap_or_else(|_| "{}".to_string());
+            let mut response = req.into_ok_response()?;
+            response.write_all(json.as_bytes())?;
+            Ok(())
+        },
+    )?;
+
+    // POST capture start — enables capture recording at runtime
+    let state_clone = state.clone();
+    server.fn_handler(
+        "/api/capture/start",
+        Method::Post,
+        move |req| -> Result<(), esp_idf_svc::io::EspIOError> {
+            info!("HTTP: POST /api/capture/start");
+            state_clone.capture_active.store(true, Ordering::Relaxed);
+            req.into_ok_response()?;
+            Ok(())
+        },
+    )?;
+
+    // POST capture stop — disables capture recording at runtime
+    let state_clone = state.clone();
+    server.fn_handler(
+        "/api/capture/stop",
+        Method::Post,
+        move |req| -> Result<(), esp_idf_svc::io::EspIOError> {
+            info!("HTTP: POST /api/capture/stop");
+            state_clone.capture_active.store(false, Ordering::Relaxed);
+            req.into_ok_response()?;
+            Ok(())
+        },
+    )?;
+
+    Ok(())
 }
 
 /// Register OTA firmware info and direct-upload routes: `/api/ota/info`, `/api/ota/upload`
@@ -1059,11 +1248,19 @@ fn register_ota_download_routes(
                 .store(0, std::sync::atomic::Ordering::Relaxed);
             *state_clone.ota_error.lock().unwrap() = String::new();
 
-            // Spawn download thread (needs its own stack for TLS)
+            // Spawn download thread – stack MUST be in internal SRAM because
+            // esp_ota_begin disables the SPI flash cache (and thus PSRAM access)
+            // while it erases flash sectors.
             let state = state_clone.clone();
-            crate::thread_util::spawn_named(c"ota-download", move || {
-                match crate::ota::download_and_update(&url, &state.ota_status, &state.ota_progress)
-                {
+            crate::thread_util::spawn_named(
+                c"ota-download",
+                16384,
+                crate::thread_util::StackMemory::Internal,
+                move || match crate::ota::download_and_update(
+                    &url,
+                    &state.ota_status,
+                    &state.ota_progress,
+                ) {
                     Ok(()) => {
                         info!("OTA download: success, rebooting");
                         perform_ota_reboot(&state);
@@ -1076,8 +1273,8 @@ fn register_ota_download_routes(
                             std::sync::atomic::Ordering::Relaxed,
                         );
                     }
-                }
-            });
+                },
+            );
 
             let mut response = req.into_ok_response()?;
             response.write_all(b"{\"success\":true}")?;
@@ -1143,6 +1340,7 @@ pub fn start_server(
     register_network_routes(&mut server, state)?;
     register_status_routes(&mut server, state)?;
     register_debug_routes(&mut server, state)?;
+    register_capture_routes(&mut server, state)?;
     register_ota_routes(&mut server, state)?;
     register_ota_download_routes(&mut server, state)?;
     register_ota_status_route(&mut server, state)?;

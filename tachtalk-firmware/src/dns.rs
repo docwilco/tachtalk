@@ -17,11 +17,16 @@ static AP_IP: OnceLock<Ipv4Addr> = OnceLock::new();
 /// causing all DNS lookups to resolve to the captive portal.
 pub fn start_dns_server(ap_ip: Ipv4Addr) {
     AP_IP.get_or_init(|| ap_ip);
-    crate::thread_util::spawn_named(c"dns_srv", || {
-        if let Err(e) = run_dns_server() {
-            error!("DNS server error: {e}");
-        }
-    });
+    crate::thread_util::spawn_named(
+        c"dns_srv",
+        6144,
+        crate::thread_util::StackMemory::SpiRam,
+        || {
+            if let Err(e) = run_dns_server() {
+                error!("DNS server error: {e}");
+            }
+        },
+    );
 }
 
 fn run_dns_server() -> std::io::Result<()> {

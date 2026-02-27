@@ -2,6 +2,7 @@ use anyhow::Result;
 use esp_idf_hal::delay::FreeRtos;
 use esp_idf_hal::prelude::*;
 use esp_idf_svc::eventloop::EspSystemEventLoop;
+use thread_util::StackMemory::{Internal, Spiram};
 
 /// Firmware variant identifier for OTA: "regular" or "test"
 pub const FIRMWARE_VARIANT: &str = "test";
@@ -122,6 +123,33 @@ pub struct State {
     pub ota_progress: AtomicU8,
     /// OTA error message (set when `ota_status` == 255)
     pub ota_error: Mutex<String>,
+}
+
+impl State {
+    /// Create a new `State` with the given injected dependencies; all other fields
+    /// are initialised to their default (zero / empty) values.
+    fn new(
+        config: Config,
+        wifi: EspWifi<'static>,
+        ap_ssid: String,
+        sse_tx: SseSender,
+        test_control_tx: std::sync::mpsc::Sender<TestControlMessage>,
+    ) -> Self {
+        Self {
+            config: Mutex::new(config),
+            wifi: Mutex::new(wifi),
+            ap_ssid,
+            sse_tx,
+            metrics: TestMetrics::default(),
+            dongle_connected: AtomicBool::new(false),
+            test_control_tx: Mutex::new(Some(test_control_tx)),
+            capture_buffer: Mutex::default(),
+            pid_values: Mutex::default(),
+            ota_status: AtomicU8::new(0),
+            ota_progress: AtomicU8::new(0),
+            ota_error: Mutex::default(),
+        }
+    }
 }
 
 /// Messages to control the test task
@@ -302,7 +330,7 @@ fn spawn_background_tasks(
     // Start SSE server for metrics streaming (on port 81)
     {
         let state = state.clone();
-        thread_util::spawn_named(c"sse_srv", move || {
+        thread_util::spawn_named(c"sse_srv", 8192, Spiram, move || {
             sse_server_task(&sse_rx, &state);
         });
     }
@@ -310,7 +338,7 @@ fn spawn_background_tasks(
     // Start test task (handles modes 1-5)
     {
         let state = state.clone();
-        thread_util::spawn_named(c"test_task", move || {
+        thread_util::spawn_named(c"test_task", 8192, Internal, move || {
             obd2::test_task(&state, &test_control_rx);
         });
     }
@@ -318,7 +346,7 @@ fn spawn_background_tasks(
     // Start web server
     {
         let state = state.clone();
-        thread_util::spawn_named(c"web_srv", move || {
+        thread_util::spawn_named(c"web_srv", 8192, Spiram, move || {
             if let Err(e) = web_server::start_server(&state, Some(&ap_hostname), ap_ip) {
                 error!("Web server error: {e:?}");
             }
@@ -328,7 +356,7 @@ fn spawn_background_tasks(
     // Start WiFi connection manager
     {
         let state = state.clone();
-        thread_util::spawn_named(c"wifi_mgr", move || {
+        thread_util::spawn_named(c"wifi_mgr", 8192, Spiram, move || {
             wifi_connection_manager(&state);
         });
     }
@@ -450,20 +478,7 @@ fn main() -> Result<()> {
     let (test_control_tx, test_control_rx) = std::sync::mpsc::channel();
 
     // Create central State struct
-    let state = Arc::new(State {
-        config: Mutex::new(config),
-        wifi: Mutex::new(wifi),
-        ap_ssid,
-        sse_tx,
-        metrics: TestMetrics::default(),
-        dongle_connected: AtomicBool::new(false),
-        test_control_tx: Mutex::new(Some(test_control_tx)),
-        capture_buffer: Mutex::new(Vec::new()),
-        pid_values: Mutex::new(HashMap::new()),
-        ota_status: AtomicU8::new(0),
-        ota_progress: AtomicU8::new(0),
-        ota_error: Mutex::new(String::new()),
-    });
+    let state = Arc::new(State::new(config, wifi, ap_ssid, sse_tx, test_control_tx));
 
     spawn_background_tasks(&state, sse_rx, test_control_rx, ap_hostname, ap_ip);
 

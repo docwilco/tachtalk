@@ -105,11 +105,19 @@ fn run_sse_server(rx: &Receiver<SseMessage>, state: &Arc<State>) -> std::io::Res
         // Send metrics periodically
         if last_metrics.elapsed() >= METRICS_INTERVAL && !clients.is_empty() {
             let metrics = &state.polling_metrics;
+            // Hot path: capture buffer capped at 6 MB by config validation, fits u32
+            #[allow(clippy::cast_possible_truncation)]
+            let capture_bytes = state.capture_buffer.lock().unwrap().len() as u32;
+            let capture_active = state.capture_active.load(Ordering::Relaxed);
             let msg = format!(
-                "event: metrics\ndata: {{\"fast_pids\":{},\"slow_pids\":{},\"reqs_per_sec\":{}}}\n\n",
+                "event: metrics\ndata: {{\"fast_pids\":{},\"slow_pids\":{},\"reqs_per_sec\":{},\"capture_bytes\":{},\"capture_records\":{},\"capture_overflow\":{},\"capture_active\":{}}}\n\n",
                 metrics.fast_pid_count.load(Ordering::Relaxed),
                 metrics.slow_pid_count.load(Ordering::Relaxed),
                 metrics.dongle_requests_per_sec.load(Ordering::Relaxed),
+                capture_bytes,
+                metrics.records_captured.load(Ordering::Relaxed),
+                metrics.capture_overflow.load(Ordering::Relaxed),
+                capture_active,
             );
             let before = clients.len();
             clients.retain(|client| send_to_client(client, msg.as_bytes()).is_ok());

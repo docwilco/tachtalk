@@ -3,6 +3,8 @@
 //! This library provides types and functions for implementing ELM327-compatible
 //! OBD2 adapters and clients.
 
+use std::io::{self, Write};
+
 /// Per-connection client state (ELM327 settings)
 #[derive(Debug, Clone)]
 #[allow(clippy::struct_excessive_bools)] // These are independent ELM327 protocol flags
@@ -48,26 +50,27 @@ impl ClientState {
         }
     }
 
-    /// Format a dongle response according to client settings
-    /// The dongle sends compact hex (no spaces), so we add spaces if enabled
-    #[must_use]
-    pub fn format_response(&self, response: &[u8]) -> Vec<u8> {
+    /// Write a dongle response to `out`, formatted according to client settings.
+    ///
+    /// The dongle sends compact hex (no spaces); this inserts spaces between
+    /// hex byte pairs when `spaces_enabled` is true.
+    ///
+    /// # Errors
+    /// Returns `io::Error` if writing to `out` fails.
+    pub fn write_response(&self, response: &[u8], out: &mut impl Write) -> io::Result<()> {
         if !self.spaces_enabled {
-            // No formatting needed, return as-is
-            return response.to_vec();
+            return out.write_all(response);
         }
 
-        let mut result = Vec::with_capacity(response.len() * 3 / 2);
         let mut hex_count = 0;
 
         for &byte in response {
-            // Check if this is a hex digit
             let is_hex = byte.is_ascii_hexdigit();
 
             if is_hex {
                 // Add space before every pair of hex digits (except the first)
                 if hex_count > 0 && hex_count % 2 == 0 {
-                    result.push(b' ');
+                    out.write_all(b" ")?;
                 }
                 hex_count += 1;
             } else {
@@ -75,9 +78,24 @@ impl ClientState {
                 hex_count = 0;
             }
 
-            result.push(byte);
+            out.write_all(&[byte])?;
         }
 
+        Ok(())
+    }
+
+    /// Format a dongle response according to client settings.
+    ///
+    /// Convenience wrapper around [`write_response`](Self::write_response)
+    /// that returns a new `Vec<u8>`.
+    ///
+    /// # Panics
+    /// Cannot panic: `Vec` implements infallible `Write`.
+    #[must_use]
+    pub fn format_response(&self, response: &[u8]) -> Vec<u8> {
+        let mut result = Vec::with_capacity(response.len() * 3 / 2);
+        // Vec::write_all is infallible
+        self.write_response(response, &mut result).unwrap();
         result
     }
 

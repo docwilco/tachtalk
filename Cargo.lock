@@ -1472,14 +1472,14 @@ dependencies = [
 
 [[package]]
 name = "tachtalk-benchmark-client"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "clap",
 ]
 
 [[package]]
 name = "tachtalk-capture-decode"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "clap",
  "tachtalk-capture-format",
@@ -1487,19 +1487,20 @@ dependencies = [
 
 [[package]]
 name = "tachtalk-capture-format"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "tachtalk-elm327-lib"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "tachtalk-firmware"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "embedded-svc",
  "embuild",
+ "enumset",
  "esp-idf-hal",
  "esp-idf-svc",
  "esp-idf-sys",
@@ -1510,6 +1511,7 @@ dependencies = [
  "serde_json",
  "smallvec",
  "smart-leds",
+ "tachtalk-capture-format",
  "tachtalk-elm327-lib",
  "tachtalk-shift-lights-lib",
  "ws2812-esp32-rmt-driver",
@@ -1517,7 +1519,7 @@ dependencies = [
 
 [[package]]
 name = "tachtalk-mock-elm327-server"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "clap",
  "tachtalk-elm327-lib",
@@ -1525,7 +1527,7 @@ dependencies = [
 
 [[package]]
 name = "tachtalk-shift-lights-lib"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "num-integer",
  "rgb",
@@ -1535,11 +1537,12 @@ dependencies = [
 
 [[package]]
 name = "tachtalk-test-firmware"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "embedded-svc",
  "embuild",
+ "enumset",
  "esp-idf-hal",
  "esp-idf-svc",
  "esp-idf-sys",

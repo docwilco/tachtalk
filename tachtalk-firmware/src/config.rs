@@ -139,14 +139,150 @@ pub enum SlowPollMode {
     Ratio,
 }
 
+/// Complete PID → data-length lookup table.
+///
+/// A `[Option<u8>; 256]` array indexed by PID byte, initialized from the
+/// SAE J1979 static table. Runtime-learned lengths for vendor-specific PIDs
+/// can be written directly into a mutable copy.
+pub type PidDataLengths = [Option<u8>; 256];
+
+/// Response data byte count for each Mode 01 PID (excludes the 0x41 service byte and PID byte).
+/// Indexed by PID byte. `None` = unknown/unsupported PID.
+/// Source: SAE J1979 / ISO 15031-5.
+///
+/// Use this to initialize a mutable `PidDataLengths` that can be updated
+/// at runtime as unknown PID lengths are learned.
+pub const MODE01_PID_DATA_LENGTHS: PidDataLengths = {
+    let mut t = [None; 256];
+    // 0x00-0x20: PIDs supported bitmasks and basic engine data
+    t[0x00] = Some(4); // PIDs supported [01-20]
+    t[0x01] = Some(4); // Monitor status since DTCs cleared
+    t[0x02] = Some(2); // Freeze DTC
+    t[0x03] = Some(2); // Fuel system status
+    t[0x04] = Some(1); // Calculated engine load
+    t[0x05] = Some(1); // Engine coolant temperature
+    t[0x06] = Some(1); // Short term fuel trim — Bank 1
+    t[0x07] = Some(1); // Long term fuel trim — Bank 1
+    t[0x08] = Some(1); // Short term fuel trim — Bank 2
+    t[0x09] = Some(1); // Long term fuel trim — Bank 2
+    t[0x0A] = Some(1); // Fuel pressure
+    t[0x0B] = Some(1); // Intake manifold absolute pressure
+    t[0x0C] = Some(2); // Engine RPM
+    t[0x0D] = Some(1); // Vehicle speed
+    t[0x0E] = Some(1); // Timing advance
+    t[0x0F] = Some(1); // Intake air temperature
+    t[0x10] = Some(2); // MAF air flow rate
+    t[0x11] = Some(1); // Throttle position
+    t[0x12] = Some(1); // Commanded secondary air status
+    t[0x13] = Some(1); // O2 sensors present (2 banks)
+    t[0x14] = Some(2); // O2 sensor 1 — voltage & trim
+    t[0x15] = Some(2); // O2 sensor 2
+    t[0x16] = Some(2); // O2 sensor 3
+    t[0x17] = Some(2); // O2 sensor 4
+    t[0x18] = Some(2); // O2 sensor 5
+    t[0x19] = Some(2); // O2 sensor 6
+    t[0x1A] = Some(2); // O2 sensor 7
+    t[0x1B] = Some(2); // O2 sensor 8
+    t[0x1C] = Some(1); // OBD standards this vehicle conforms to
+    t[0x1D] = Some(1); // O2 sensors present (4 banks)
+    t[0x1E] = Some(1); // Auxiliary input status
+    t[0x1F] = Some(2); // Run time since engine start
+                       // 0x20-0x40
+    t[0x20] = Some(4); // PIDs supported [21-40]
+    t[0x21] = Some(2); // Distance traveled with MIL on
+    t[0x22] = Some(2); // Fuel rail pressure (relative to manifold vacuum)
+    t[0x23] = Some(2); // Fuel rail gauge pressure (diesel/GDI)
+    t[0x24] = Some(4); // O2 sensor 1 — equiv ratio & voltage
+    t[0x25] = Some(4); // O2 sensor 2
+    t[0x26] = Some(4); // O2 sensor 3
+    t[0x27] = Some(4); // O2 sensor 4
+    t[0x28] = Some(4); // O2 sensor 5
+    t[0x29] = Some(4); // O2 sensor 6
+    t[0x2A] = Some(4); // O2 sensor 7
+    t[0x2B] = Some(4); // O2 sensor 8
+    t[0x2C] = Some(1); // Commanded EGR
+    t[0x2D] = Some(1); // EGR error
+    t[0x2E] = Some(1); // Commanded evaporative purge
+    t[0x2F] = Some(1); // Fuel tank level input
+    t[0x30] = Some(1); // Warm-ups since codes cleared
+    t[0x31] = Some(2); // Distance traveled since codes cleared
+    t[0x32] = Some(2); // Evap system vapor pressure
+    t[0x33] = Some(1); // Absolute barometric pressure
+    t[0x34] = Some(4); // O2 sensor 1 — equiv ratio & current
+    t[0x35] = Some(4); // O2 sensor 2
+    t[0x36] = Some(4); // O2 sensor 3
+    t[0x37] = Some(4); // O2 sensor 4
+    t[0x38] = Some(4); // O2 sensor 5
+    t[0x39] = Some(4); // O2 sensor 6
+    t[0x3A] = Some(4); // O2 sensor 7
+    t[0x3B] = Some(4); // O2 sensor 8
+    t[0x3C] = Some(2); // Catalyst temperature: Bank 1, Sensor 1
+    t[0x3D] = Some(2); // Catalyst temperature: Bank 2, Sensor 1
+    t[0x3E] = Some(2); // Catalyst temperature: Bank 1, Sensor 2
+    t[0x3F] = Some(2); // Catalyst temperature: Bank 2, Sensor 2
+                       // 0x40-0x60
+    t[0x40] = Some(4); // PIDs supported [41-60]
+    t[0x41] = Some(4); // Monitor status this drive cycle
+    t[0x42] = Some(2); // Control module voltage
+    t[0x43] = Some(2); // Absolute load value
+    t[0x44] = Some(2); // Fuel-air commanded equivalence ratio
+    t[0x45] = Some(1); // Relative throttle position
+    t[0x46] = Some(1); // Ambient air temperature
+    t[0x47] = Some(1); // Absolute throttle position B
+    t[0x48] = Some(1); // Absolute throttle position C
+    t[0x49] = Some(1); // Accelerator pedal position D
+    t[0x4A] = Some(1); // Accelerator pedal position E
+    t[0x4B] = Some(1); // Accelerator pedal position F
+    t[0x4C] = Some(1); // Commanded throttle actuator
+    t[0x4D] = Some(2); // Time run with MIL on
+    t[0x4E] = Some(2); // Time since trouble codes cleared
+    t[0x4F] = Some(4); // Max values (equiv ratio, O2 voltage, O2 current, intake pressure)
+    t[0x50] = Some(4); // Max air flow rate from MAF sensor
+    t[0x51] = Some(1); // Fuel type
+    t[0x52] = Some(1); // Ethanol fuel %
+    t[0x53] = Some(2); // Absolute evap system vapor pressure
+    t[0x54] = Some(2); // Evap system vapor pressure
+    t[0x55] = Some(2); // Short term secondary O2 trim — Bank 1 & 3
+    t[0x56] = Some(2); // Long term secondary O2 trim — Bank 1 & 3
+    t[0x57] = Some(2); // Short term secondary O2 trim — Bank 2 & 4
+    t[0x58] = Some(2); // Long term secondary O2 trim — Bank 2 & 4
+    t[0x59] = Some(2); // Fuel rail absolute pressure
+    t[0x5A] = Some(1); // Relative accelerator pedal position
+    t[0x5B] = Some(1); // Hybrid battery pack remaining life
+    t[0x5C] = Some(1); // Engine oil temperature
+    t[0x5D] = Some(2); // Fuel injection timing
+    t[0x5E] = Some(2); // Engine fuel rate
+    t[0x5F] = Some(1); // Emission requirements
+                       // 0x60-0x80
+    t[0x60] = Some(4); // PIDs supported [61-80]
+    t[0x61] = Some(1); // Driver's demand engine — percent torque
+    t[0x62] = Some(1); // Actual engine — percent torque
+    t[0x63] = Some(2); // Engine reference torque
+    t[0x64] = Some(5); // Engine percent torque data
+    t[0x65] = Some(2); // Auxiliary input / output supported
+                       // 0x80-0xA0
+    t[0x80] = Some(4); // PIDs supported [81-A0]
+                       // 0xA0-0xC0
+    t[0xA0] = Some(4); // PIDs supported [A1-C0]
+                       // 0xC0-0xE0
+    t[0xC0] = Some(4); // PIDs supported [C1-E0]
+    t
+};
+
 /// OBD2 network configuration
+// Allow: many simple on/off options for different query strategies and
+// features, not a state machine
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Obd2Config {
     /// IP address of the OBD2 dongle
+    #[serde(default = "default_dongle_ip")]
     pub dongle_ip: String,
     /// Port of the OBD2 dongle
+    #[serde(default = "default_dongle_port")]
     pub dongle_port: u16,
     /// Port to listen on for OBD2 clients
+    #[serde(default = "default_listen_port")]
     pub listen_port: u16,
     /// Slow poll mode: interval or ratio
     #[serde(default)]
@@ -166,9 +302,47 @@ pub struct Obd2Config {
     /// Time without consumption before removing PID from polling (ms)
     #[serde(default = "default_pid_inactive_removal_ms")]
     pub pid_inactive_removal_ms: u64,
-    /// Whether to test multi-PID query support at boot
+    // --- Advanced layered stack options ---
+    /// Combine multiple PIDs into single commands (e.g., `010C0D0F`).
+    /// Auto-detects ECU support on the first multi-PID attempt.
     #[serde(default)]
-    pub test_multi_pid: bool,
+    pub use_multi_pid: bool,
+    /// Maximum PIDs per multi-PID command (1-6, OBD2 spec limit is 6)
+    #[serde(default = "default_max_pids_per_query")]
+    pub max_pids_per_query: u8,
+    /// Use repeat command for identical consecutive queries
+    #[serde(default)]
+    pub use_repeat: bool,
+    /// Repeat command string (empty = bare CR per ELM327 spec)
+    #[serde(default)]
+    pub repeat_string: String,
+    /// Enable CAN framing (ATH1) for header parsing
+    #[serde(default)]
+    pub use_framing: bool,
+    /// Enable pipelined queries (keep 1 request in-flight).
+    /// NOTE: Not yet implemented — config field reserved for future use.
+    #[serde(default)]
+    pub use_pipelining: bool,
+    // --- Capture options ---
+    /// Enable traffic capture to PSRAM buffer
+    #[serde(default)]
+    pub capture_enabled: bool,
+    /// Capture buffer size in bytes (16KB - 6MB)
+    #[serde(default = "default_capture_buffer_size")]
+    pub capture_buffer_size: u32,
+}
+
+// Serde wants functions for default values
+fn default_dongle_ip() -> String {
+    "192.168.0.10".to_string()
+}
+
+const fn default_dongle_port() -> u16 {
+    35000
+}
+
+const fn default_listen_port() -> u16 {
+    35000
 }
 
 const fn default_slow_poll_interval_ms() -> u64 {
@@ -191,19 +365,34 @@ const fn default_pid_inactive_removal_ms() -> u64 {
     4000
 }
 
+const fn default_max_pids_per_query() -> u8 {
+    6
+}
+
+const fn default_capture_buffer_size() -> u32 {
+    4 * 1024 * 1024
+}
+
 impl Default for Obd2Config {
     fn default() -> Self {
         Self {
-            dongle_ip: "192.168.0.10".to_string(),
-            dongle_port: 35000,
-            listen_port: 35000,
+            dongle_ip: default_dongle_ip(),
+            dongle_port: default_dongle_port(),
+            listen_port: default_listen_port(),
             slow_poll_mode: SlowPollMode::default(),
             slow_poll_interval_ms: default_slow_poll_interval_ms(),
             slow_poll_ratio: default_slow_poll_ratio(),
             promotion_wait_threshold_ms: default_promotion_wait_threshold_ms(),
             fast_demotion_ms: default_fast_demotion_ms(),
             pid_inactive_removal_ms: default_pid_inactive_removal_ms(),
-            test_multi_pid: false,
+            use_multi_pid: false,
+            max_pids_per_query: default_max_pids_per_query(),
+            use_repeat: false,
+            repeat_string: String::new(),
+            use_framing: false,
+            use_pipelining: false,
+            capture_enabled: false,
+            capture_buffer_size: default_capture_buffer_size(),
         }
     }
 }
@@ -484,6 +673,13 @@ impl Config {
         if self.ip.ip.is_empty() {
             warn!("Static IP is empty, resetting to default");
             self.ip.ip = default_static_ip();
+        }
+        // Clamp capture buffer size (16KB - 6MB). Upper bound preserves
+        // ~2MB of the 8MB PSRAM for TLS, WiFi, and heap allocations.
+        if self.obd2.capture_buffer_size < 16 * 1024 {
+            self.obd2.capture_buffer_size = 16 * 1024;
+        } else if self.obd2.capture_buffer_size > 6 * 1024 * 1024 {
+            self.obd2.capture_buffer_size = 6 * 1024 * 1024;
         }
     }
 

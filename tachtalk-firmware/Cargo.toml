@@ -10,10 +10,12 @@ name = "tachtalk"
 path = "src/main.rs"
 
 [dependencies]
+tachtalk-capture-format = { path = "../tachtalk-capture-format" }
 tachtalk-elm327-lib = { path = "../tachtalk-elm327-lib" }
 tachtalk-shift-lights-lib = { path = "../tachtalk-shift-lights-lib" }
 anyhow.workspace = true
 embedded-svc.workspace = true
+enumset.workspace = true
 esp-idf-hal.workspace = true
 esp-idf-svc.workspace = true
 esp-idf-sys.workspace = true

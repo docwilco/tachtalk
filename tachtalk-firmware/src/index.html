@@ -473,6 +473,59 @@
         .hidden {
             display: none;
         }
+        /* Capture Section */
+        .capture-progress-bar {
+            width: 100%;
+            height: 16px;
+            background-color: #333;
+            border-radius: 3px;
+            overflow: hidden;
+            margin: 6px 0;
+        }
+        .capture-progress-fill {
+            height: 100%;
+            background-color: #00ff00;
+            transition: width 0.3s;
+        }
+        .capture-progress-fill.warning {
+            background-color: #ffaa00;
+        }
+        .capture-progress-fill.danger {
+            background-color: #ff4444;
+        }
+        .capture-overflow-warning {
+            color: #ff4444;
+            font-size: 0.9em;
+            margin: 5px 0;
+        }
+        .capture-buttons {
+            display: flex;
+            gap: 8px;
+            margin-top: 10px;
+            flex-wrap: wrap;
+        }
+        .capture-buttons button, .capture-buttons a.btn {
+            padding: 6px 12px;
+            font-size: 0.9em;
+        }
+        a.btn {
+            display: inline-block;
+            background-color: #00ff00;
+            color: #000;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+            font-weight: bold;
+            text-decoration: none;
+        }
+        a.btn:hover {
+            background-color: #00dd00;
+        }
+        a.btn.disabled {
+            opacity: 0.7;
+            cursor: not-allowed;
+            pointer-events: none;
+        }
         .debug-section {
             background-color: #2a2a3a;
             padding: 10px 15px;
@@ -719,12 +772,31 @@
         <details class="debug-section">
             <summary>🔧 Debug Info</summary>
             <div class="debug-content">
-                <div class="debug-row"><span>Free Heap:</span><span id="freeHeap">---</span></div>
-                <div class="debug-row"><span>Min Free Heap:</span><span id="minFreeHeap">---</span></div>
+                <div class="debug-row"><span>Internal Free:</span><span id="internalFree">---</span></div>
+                <div class="debug-row"><span>Internal Min Free:</span><span id="internalMinFree">---</span></div>
+                <div class="debug-row"><span>PSRAM Free:</span><span id="spiramFree">---</span></div>
+                <div class="debug-row"><span>PSRAM Min Free:</span><span id="spiramMinFree">---</span></div>
                 <h3>Polling Metrics</h3>
                 <div class="debug-row"><span>Fast PIDs:</span><span id="metricsFastPids">---</span></div>
                 <div class="debug-row"><span>Slow PIDs:</span><span id="metricsSlowPids">---</span></div>
                 <div class="debug-row"><span>Requests/sec:</span><span id="metricsReqsPerSec">---</span></div>
+                <h3>Capture</h3>
+                <div class="debug-row">
+                    <span>Buffer:</span>
+                    <span><span id="captureBytes">0</span> / <span id="captureRecords">0</span> records</span>
+                </div>
+                <div class="capture-progress-bar">
+                    <div id="captureProgressFill" class="capture-progress-fill" style="width: 0%"></div>
+                </div>
+                <div id="captureOverflowWarning" class="capture-overflow-warning" style="display: none;">
+                    ⚠️ Buffer overflow - capture stopped
+                </div>
+                <div class="capture-buttons">
+                    <button id="startCaptureBtn" onclick="startCapture()" class="btn">Start</button>
+                    <button id="stopCaptureBtn" onclick="stopCapture()" style="display: none;">Stop</button>
+                    <a id="downloadCaptureBtn" class="btn disabled" href="/api/capture">Download</a>
+                    <button id="clearCaptureBtn" onclick="clearCapture()" class="danger" disabled>Clear</button>
+                </div>
                 <h3>AT Commands Received</h3>
                 <div id="atCommands" class="at-commands">Loading...</div>
                 <h3>OBD2 PIDs Requested</h3>
@@ -858,9 +930,44 @@
                 <small style="color: #888;">Remove inactive PIDs after</small>
             </div>
             <div class="form-group">
-                <label>Test Multi-PID:</label>
-                <input type="checkbox" id="obd2TestMultiPid">
-                <small style="color: #888;">Test multi-PID query support at boot (experimental)</small>
+                <label>Use Multi-PID:</label>
+                <input type="checkbox" id="obd2UseMultiPid">
+                <small style="color: #888;">Send multiple PIDs per query (auto-detects ECU support)</small>
+            </div>
+            <div class="form-group">
+                <label>Max PIDs per Query:</label>
+                <input type="number" id="obd2MaxPidsPerQuery" placeholder="6" min="2" max="6">
+                <small style="color: #888;">Maximum PIDs in a single query (2-6, default 6)</small>
+            </div>
+            <div class="form-group">
+                <label>Use Repeat:</label>
+                <input type="checkbox" id="obd2UseRepeat">
+                <small style="color: #888;">Repeat last command instead of resending (auto-detects support)</small>
+            </div>
+            <div class="form-group">
+                <label>Repeat String:</label>
+                <input type="text" id="obd2RepeatString" placeholder="" style="width: 80px;">
+                <small style="color: #888;">Repeat command (empty = bare CR per ELM327 spec)</small>
+            </div>
+            <div class="form-group">
+                <label>Use CAN Framing:</label>
+                <input type="checkbox" id="obd2UseFraming">
+                <small style="color: #888;">Enable ATH1 for CAN header parsing</small>
+            </div>
+            <div class="form-group">
+                <label>Use Pipelining:</label>
+                <input type="checkbox" id="obd2UsePipelining">
+                <small style="color: #888;">Keep one request in-flight for lower latency</small>
+            </div>
+            <div class="form-group">
+                <label>Capture Enabled:</label>
+                <input type="checkbox" id="obd2CaptureEnabled">
+                <small style="color: #888;">Enable traffic capture to PSRAM buffer</small>
+            </div>
+            <div class="form-group">
+                <label>Capture Buffer Size:</label>
+                <input type="number" id="obd2CaptureBufferSize" placeholder="65536" min="16384" max="6291456">
+                <small style="color: #888;">Buffer size in bytes (16KB - 6MB)</small>
             </div>
         </div>
         
@@ -1491,7 +1598,14 @@
                     promotion_wait_threshold_ms: parseInt(document.getElementById('obd2PromotionThreshold').value) || d('obd2.promotion_wait_threshold_ms'),
                     fast_demotion_ms: parseInt(document.getElementById('obd2FastDemotionMs').value) || d('obd2.fast_demotion_ms'),
                     pid_inactive_removal_ms: parseInt(document.getElementById('obd2PidRemovalMs').value) || d('obd2.pid_inactive_removal_ms'),
-                    test_multi_pid: document.getElementById('obd2TestMultiPid').checked
+                    use_multi_pid: document.getElementById('obd2UseMultiPid').checked,
+                    max_pids_per_query: parseInt(document.getElementById('obd2MaxPidsPerQuery').value) || d('obd2.max_pids_per_query'),
+                    use_repeat: document.getElementById('obd2UseRepeat').checked,
+                    repeat_string: document.getElementById('obd2RepeatString').value,
+                    use_framing: document.getElementById('obd2UseFraming').checked,
+                    use_pipelining: document.getElementById('obd2UsePipelining').checked,
+                    capture_enabled: document.getElementById('obd2CaptureEnabled').checked,
+                    capture_buffer_size: parseInt(document.getElementById('obd2CaptureBufferSize').value) || d('obd2.capture_buffer_size')
                 },
                 obd2_timeout_ms: parseInt(document.getElementById('obd2TimeoutMs').value) || d('obd2_timeout_ms'),
                 wifi: {
@@ -1680,7 +1794,14 @@
                     document.getElementById('obd2PromotionThreshold').value = obd2Config.promotion_wait_threshold_ms ?? d('obd2.promotion_wait_threshold_ms');
                     document.getElementById('obd2FastDemotionMs').value = obd2Config.fast_demotion_ms ?? d('obd2.fast_demotion_ms');
                     document.getElementById('obd2PidRemovalMs').value = obd2Config.pid_inactive_removal_ms ?? d('obd2.pid_inactive_removal_ms');
-                    document.getElementById('obd2TestMultiPid').checked = obd2Config.test_multi_pid ?? d('obd2.test_multi_pid');
+                    document.getElementById('obd2UseMultiPid').checked = obd2Config.use_multi_pid ?? d('obd2.use_multi_pid');
+                    document.getElementById('obd2MaxPidsPerQuery').value = obd2Config.max_pids_per_query ?? d('obd2.max_pids_per_query');
+                    document.getElementById('obd2UseRepeat').checked = obd2Config.use_repeat ?? d('obd2.use_repeat');
+                    document.getElementById('obd2RepeatString').value = obd2Config.repeat_string ?? d('obd2.repeat_string');
+                    document.getElementById('obd2UseFraming').checked = obd2Config.use_framing ?? d('obd2.use_framing');
+                    document.getElementById('obd2UsePipelining').checked = obd2Config.use_pipelining ?? d('obd2.use_pipelining');
+                    document.getElementById('obd2CaptureEnabled').checked = obd2Config.capture_enabled ?? d('obd2.capture_enabled');
+                    document.getElementById('obd2CaptureBufferSize').value = obd2Config.capture_buffer_size ?? d('obd2.capture_buffer_size');
                     toggleSlowPollMode();
                     
                     // Log level
@@ -1945,7 +2066,99 @@
                 document.getElementById('metricsFastPids').textContent = data.fast_pids;
                 document.getElementById('metricsSlowPids').textContent = data.slow_pids;
                 document.getElementById('metricsReqsPerSec').textContent = data.reqs_per_sec;
+                
+                // Update capture metrics if present
+                if (data.capture_bytes !== undefined) {
+                    updateCaptureMetrics(data.capture_bytes, data.capture_records, data.capture_overflow, data.capture_active);
+                }
             });
+        }
+
+        function updateCaptureMetrics(bytes, records, overflow, active) {
+            document.getElementById('captureBytes').textContent = formatBytes(bytes);
+            document.getElementById('captureRecords').textContent = records;
+            
+            // Update start/stop button visibility
+            if (active !== undefined) {
+                document.getElementById('startCaptureBtn').style.display = active ? 'none' : '';
+                document.getElementById('stopCaptureBtn').style.display = active ? '' : 'none';
+            }
+            
+            // Update buttons
+            const hasData = bytes > 0;
+            const dlBtn = document.getElementById('downloadCaptureBtn');
+            if (hasData) {
+                dlBtn.classList.remove('disabled');
+                dlBtn.download = 'capture_' + new Date().toISOString().replace(/[:.]/g, '-') + '.ttcap';
+            } else {
+                dlBtn.classList.add('disabled');
+                dlBtn.removeAttribute('download');
+            }
+            document.getElementById('clearCaptureBtn').disabled = !hasData;
+            
+            // Show overflow warning
+            const overflowWarning = document.getElementById('captureOverflowWarning');
+            overflowWarning.style.display = overflow ? 'block' : 'none';
+            
+            // Update progress bar using configured capture buffer size
+            const progressFill = document.getElementById('captureProgressFill');
+            const maxBuffer = config.obd2?.capture_buffer_size;
+            if (maxBuffer) {
+                const pct = Math.min(100, (bytes / maxBuffer) * 100);
+                progressFill.style.width = pct + '%';
+                progressFill.className = 'capture-progress-fill' + (pct > 90 ? ' danger' : pct > 70 ? ' warning' : '');
+            } else {
+                progressFill.style.width = '0%';
+                progressFill.className = 'capture-progress-fill';
+            }
+        }
+
+
+
+        async function clearCapture() {
+            if (!confirm('Clear the capture buffer? This cannot be undone.')) return;
+            
+            try {
+                const response = await fetch('/api/capture/clear', { method: 'POST' });
+                if (response.ok) {
+                    showStatus('Capture buffer cleared', false);
+                    updateCaptureMetrics(0, 0, false);
+                } else {
+                    showStatus('Clear failed: ' + response.statusText, true);
+                }
+            } catch (e) {
+                showStatus('Clear error: ' + e, true);
+            }
+        }
+
+        async function startCapture() {
+            try {
+                const response = await fetch('/api/capture/start', { method: 'POST' });
+                if (response.ok) {
+                    document.getElementById('startCaptureBtn').style.display = 'none';
+                    document.getElementById('stopCaptureBtn').style.display = '';
+                    showStatus('Capture started', false);
+                } else {
+                    showStatus('Start failed: ' + response.statusText, true);
+                }
+            } catch (e) {
+                showStatus('Start error: ' + e, true);
+            }
+        }
+
+        async function stopCapture() {
+            try {
+                const response = await fetch('/api/capture/stop', { method: 'POST' });
+                if (response.ok) {
+                    document.getElementById('startCaptureBtn').style.display = '';
+                    document.getElementById('stopCaptureBtn').style.display = 'none';
+                    showStatus('Capture stopped', false);
+                } else {
+                    showStatus('Stop failed: ' + response.statusText, true);
+                }
+            } catch (e) {
+                showStatus('Stop error: ' + e, true);
+            }
         }
 
         function formatBytes(bytes) {
@@ -2025,8 +2238,10 @@
                 const response = await fetch('/api/debug_info');
                 const info = await response.json();
                 
-                document.getElementById('freeHeap').textContent = formatBytes(info.free_heap);
-                document.getElementById('minFreeHeap').textContent = formatBytes(info.min_free_heap);
+                document.getElementById('internalFree').textContent = formatBytes(info.internal_free);
+                document.getElementById('internalMinFree').textContent = formatBytes(info.internal_min_free);
+                document.getElementById('spiramFree').textContent = formatBytes(info.spiram_free);
+                document.getElementById('spiramMinFree').textContent = formatBytes(info.spiram_min_free);
                 
                 const el = document.getElementById('atCommands');
                 if (info.at_commands.length === 0) {
@@ -2044,8 +2259,10 @@
             } catch (e) {
                 document.getElementById('atCommands').textContent = '(error)';
                 document.getElementById('pids').textContent = '(error)';
-                document.getElementById('freeHeap').textContent = '---';
-                document.getElementById('minFreeHeap').textContent = '---';
+                document.getElementById('internalFree').textContent = '---';
+                document.getElementById('internalMinFree').textContent = '---';
+                document.getElementById('spiramFree').textContent = '---';
+                document.getElementById('spiramMinFree').textContent = '---';
             }
         }
 

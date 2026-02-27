@@ -14,6 +14,7 @@ tachtalk-capture-format = { workspace = true }
 tachtalk-elm327-lib = { path = "../tachtalk-elm327-lib" }
 anyhow.workspace = true
 embedded-svc.workspace = true
+enumset.workspace = true
 esp-idf-hal.workspace = true
 esp-idf-svc.workspace = true
 esp-idf-sys.workspace = true
