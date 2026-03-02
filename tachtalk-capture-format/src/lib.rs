@@ -25,6 +25,11 @@
 //! - `data_len`: u16 LE — length of the following data
 //! - `data`: `[u8; data_len]`
 
+// deku derive macros generate double parentheses in expanded code
+#![allow(clippy::double_parens)]
+
+use deku::prelude::*;
+
 /// Capture file magic bytes: `TachTalk` (8 bytes).
 pub const MAGIC: &[u8; 8] = b"TachTalk";
 
@@ -50,32 +55,25 @@ pub const FLAG_OVERFLOW: u16 = 1 << 0;
 pub const FLAG_NTP_SYNCED: u16 = 1 << 1;
 
 /// Capture record types.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, DekuRead, DekuWrite)]
+#[deku(id_type = "u8")]
 #[repr(u8)]
 pub enum RecordType {
     /// Data sent from client to dongle.
+    #[deku(id = 0)]
     ClientToDongle = 0,
     /// Data sent from dongle to client.
+    #[deku(id = 1)]
     DongleToClient = 1,
     /// Client connected event (no data payload).
+    #[deku(id = 2)]
     Connect = 2,
     /// Client disconnected event (no data payload).
+    #[deku(id = 3)]
     Disconnect = 3,
 }
 
 impl RecordType {
-    /// Try to convert a raw `u8` to a `RecordType`.
-    #[must_use]
-    pub fn from_u8(value: u8) -> Option<Self> {
-        match value {
-            0 => Some(Self::ClientToDongle),
-            1 => Some(Self::DongleToClient),
-            2 => Some(Self::Connect),
-            3 => Some(Self::Disconnect),
-            _ => None,
-        }
-    }
-
     /// Human-readable label for this record type.
     #[must_use]
     pub fn label(self) -> &'static str {
@@ -106,7 +104,8 @@ impl RecordType {
 /// | 34 | 2  | Flags (u16 LE) |
 /// | 36 | 16 | Firmware version (null-terminated UTF-8) |
 /// | 52 | 12 | Reserved (zero) |
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, DekuRead, DekuWrite)]
+#[deku(endian = "little", magic = b"TachTalk")]
 pub struct CaptureHeader {
     /// Format version.
     pub version: u16,
@@ -125,6 +124,7 @@ pub struct CaptureHeader {
     /// Flags (see `FLAG_OVERFLOW`, `FLAG_NTP_SYNCED`).
     pub flags: u16,
     /// Firmware version string (null-terminated, max 15 chars + null).
+    #[deku(pad_bytes_after = "12")] // RESERVED_SIZE
     pub firmware_version: [u8; FIRMWARE_VERSION_MAX_LEN],
 }
 
@@ -179,23 +179,22 @@ impl CaptureHeader {
     }
 
     /// Serialize the header to a 64-byte array.
+    ///
+    /// Uses deku's `DekuContainerWrite` internally. The inherent method
+    /// shadows the trait method to preserve the infallible `[u8; HEADER_SIZE]`
+    /// return type.
+    ///
+    /// # Panics
+    ///
+    /// Panics if deku serialization fails or produces the wrong size, which
+    /// would indicate a bug in the struct definition.
     #[must_use]
     pub fn to_bytes(&self) -> [u8; HEADER_SIZE] {
-        let mut buf = [0u8; HEADER_SIZE];
-
-        buf[0..8].copy_from_slice(MAGIC);
-        buf[8..10].copy_from_slice(&self.version.to_le_bytes());
-        buf[10..12].copy_from_slice(&self.header_size.to_le_bytes());
-        buf[12..16].copy_from_slice(&self.record_count.to_le_bytes());
-        buf[16..20].copy_from_slice(&self.data_length.to_le_bytes());
-        buf[20..28].copy_from_slice(&self.capture_start_ms.to_le_bytes());
-        buf[28..32].copy_from_slice(&self.dongle_ip);
-        buf[32..34].copy_from_slice(&self.dongle_port.to_le_bytes());
-        buf[34..36].copy_from_slice(&self.flags.to_le_bytes());
-        buf[36..36 + FIRMWARE_VERSION_MAX_LEN].copy_from_slice(&self.firmware_version);
-        // buf[52..64] reserved, already zero
-
-        buf
+        let bytes =
+            DekuContainerWrite::to_bytes(self).expect("CaptureHeader serialization is infallible");
+        bytes
+            .try_into()
+            .expect("CaptureHeader serializes to exactly HEADER_SIZE bytes")
     }
 
     /// Parse a capture header from a reader.
@@ -206,7 +205,7 @@ impl CaptureHeader {
     /// # Errors
     ///
     /// Returns `io::ErrorKind::UnexpectedEof` if the header is truncated,
-    /// or `io::ErrorKind::InvalidData` if the magic bytes don't match.
+    /// or `io::ErrorKind::InvalidData` if the magic bytes or fields are invalid.
     pub fn from_reader(reader: &mut impl std::io::Read) -> std::io::Result<Option<Self>> {
         let mut buf = [0u8; HEADER_SIZE];
         // Detect clean EOF vs truncated header
@@ -217,41 +216,10 @@ impl CaptureHeader {
         }
         std::io::Read::read_exact(reader, &mut buf[1..])?;
 
-        if &buf[0..8] != MAGIC {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "invalid capture header magic",
-            ));
-        }
+        let (_, header) = <Self as DekuContainerRead>::from_bytes((&buf, 0))
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
 
-        let version = u16::from_le_bytes([buf[8], buf[9]]);
-        let header_size = u16::from_le_bytes([buf[10], buf[11]]);
-        let record_count = u32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]);
-        let data_length = u32::from_le_bytes([buf[16], buf[17], buf[18], buf[19]]);
-        let capture_start_ms = u64::from_le_bytes([
-            buf[20], buf[21], buf[22], buf[23], buf[24], buf[25], buf[26], buf[27],
-        ]);
-
-        let mut dongle_ip = [0u8; 4];
-        dongle_ip.copy_from_slice(&buf[28..32]);
-
-        let dongle_port = u16::from_le_bytes([buf[32], buf[33]]);
-        let flags = u16::from_le_bytes([buf[34], buf[35]]);
-
-        let mut firmware_version = [0u8; FIRMWARE_VERSION_MAX_LEN];
-        firmware_version.copy_from_slice(&buf[36..36 + FIRMWARE_VERSION_MAX_LEN]);
-
-        Ok(Some(Self {
-            version,
-            header_size,
-            record_count,
-            data_length,
-            capture_start_ms,
-            dongle_ip,
-            dongle_port,
-            flags,
-            firmware_version,
-        }))
+        Ok(Some(header))
     }
 }
 
@@ -264,6 +232,16 @@ pub struct CaptureRecord {
     pub record_type: RecordType,
     /// Payload data.
     pub data: Vec<u8>,
+}
+
+/// Raw 7-byte record header for deku-based parsing.
+#[derive(DekuRead)]
+struct RawRecordHeader {
+    #[deku(endian = "little")]
+    timestamp_ms: u32,
+    record_type: RecordType,
+    #[deku(endian = "little")]
+    data_len: u16,
 }
 
 /// Iterator over capture records from a reader.
@@ -310,17 +288,14 @@ impl<R: std::io::Read> Iterator for RecordIter<R> {
             return Some(Err(RecordError::Io(e)));
         }
 
-        let timestamp_ms = u32::from_le_bytes([header[0], header[1], header[2], header[3]]);
-        let type_byte = header[4];
-        let data_len = u16::from_le_bytes([header[5], header[6]]) as usize;
-
-        let Some(record_type) = RecordType::from_u8(type_byte) else {
+        let Ok((_, raw)) = <RawRecordHeader as DekuContainerRead>::from_bytes((&header, 0)) else {
             return Some(Err(RecordError::InvalidType {
                 offset: self.offset,
-                type_byte,
+                type_byte: header[4],
             }));
         };
 
+        let data_len = usize::from(raw.data_len);
         let mut data = vec![0u8; data_len];
         if let Err(e) = std::io::Read::read_exact(&mut self.reader, &mut data) {
             return Some(Err(RecordError::Io(e)));
@@ -329,8 +304,8 @@ impl<R: std::io::Read> Iterator for RecordIter<R> {
         self.offset += (RECORD_HEADER_SIZE + data_len) as u64;
 
         Some(Ok(CaptureRecord {
-            timestamp_ms,
-            record_type,
+            timestamp_ms: raw.timestamp_ms,
+            record_type: raw.record_type,
             data,
         }))
     }
