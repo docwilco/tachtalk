@@ -444,10 +444,9 @@ fn register_test_routes(server: &mut EspHttpServer<'static>, state: &Arc<State>)
             info!("HTTP: POST /api/test/start");
 
             // Parse start options from request body
-            let mut buf = [0u8; 512];
-            let bytes_read = req.read(&mut buf)?;
-            let start_options = if bytes_read > 0 {
-                match serde_json::from_slice::<crate::config::StartOptions>(&buf[..bytes_read]) {
+            let reader = StdRead(&mut req);
+            let start_options =
+                match serde_json::from_reader::<_, crate::config::StartOptions>(reader) {
                     Ok(parsed) => {
                         info!(
                             "Start request: mode={:?}, multi_pid={}, repeat={}, framing={}",
@@ -462,11 +461,7 @@ fn register_test_routes(server: &mut EspHttpServer<'static>, state: &Arc<State>)
                         warn!("Failed to parse start request body: {e}, using defaults");
                         crate::config::StartOptions::default()
                     }
-                }
-            } else {
-                warn!("No body in start request, using defaults");
-                crate::config::StartOptions::default()
-            };
+                };
 
             if let Some(tx) = state_clone.test_control_tx.lock().unwrap().as_ref() {
                 if tx.send(TestControlMessage::Start(start_options)).is_err() {
@@ -810,8 +805,8 @@ fn register_debug_routes(server: &mut EspHttpServer<'static>, state: &Arc<State>
 
 /// OTA download request body
 #[derive(serde::Deserialize)]
-struct OtaDownloadRequest<'a> {
-    url: &'a str,
+struct OtaDownloadRequest {
+    url: String,
 }
 
 /// Stop WiFi and reboot into new firmware. Does not return.
@@ -935,27 +930,13 @@ fn register_ota_download_routes(
                 return Ok(());
             }
 
-            // Read JSON body
-            let mut body = [0u8; 1024];
-            let mut total = 0;
-            loop {
-                let n = req.read(&mut body[total..])?;
-                if n == 0 {
-                    break;
-                }
-                total += n;
-                if total >= body.len() {
-                    break;
-                }
-            }
-
-            let body_str = core::str::from_utf8(&body[..total]).unwrap_or("");
-            let parsed: OtaDownloadRequest<'_> = serde_json::from_str(body_str).map_err(|e| {
+            let reader = StdRead(&mut req);
+            let parsed: OtaDownloadRequest = serde_json::from_reader(reader).map_err(|e| {
                 warn!("OTA download: invalid JSON: {e}");
                 EspIOError::from(EspError::from_infallible::<{ ESP_ERR_INVALID_ARG }>())
             })?;
 
-            let url = parsed.url.to_owned();
+            let url = parsed.url;
             info!("OTA download: url={url}");
 
             // Reset status

@@ -535,12 +535,9 @@ fn register_post_brightness(server: &mut EspHttpServer<'static>, state: &Arc<Sta
         Method::Post,
         move |mut req| -> HandlerResult {
             debug!("HTTP: POST /api/brightness");
-            let mut buf = [0u8; 32];
-            let bytes_read = req.read(&mut buf)?;
+            let reader = StdRead(&mut req);
 
-            if let Ok(brightness_req) =
-                serde_json::from_slice::<BrightnessRequest>(&buf[..bytes_read])
-            {
+            if let Ok(brightness_req) = serde_json::from_reader::<_, BrightnessRequest>(reader) {
                 debug!(
                     "Brightness update: {} (save={})",
                     brightness_req.brightness, brightness_req.save
@@ -928,8 +925,8 @@ fn register_captive_portal(
 
 /// OTA download request body
 #[derive(serde::Deserialize)]
-struct OtaDownloadRequest<'a> {
-    url: &'a str,
+struct OtaDownloadRequest {
+    url: String,
 }
 
 /// Stop WiFi and reboot into new firmware. Does not return.
@@ -1202,27 +1199,13 @@ fn register_ota_download_routes(
                 return Ok(());
             }
 
-            // Read JSON body
-            let mut body = [0u8; 1024];
-            let mut total = 0;
-            loop {
-                let n = req.read(&mut body[total..])?;
-                if n == 0 {
-                    break;
-                }
-                total += n;
-                if total >= body.len() {
-                    break;
-                }
-            }
-
-            let body_str = core::str::from_utf8(&body[..total]).unwrap_or("");
-            let parsed: OtaDownloadRequest<'_> = serde_json::from_str(body_str).map_err(|e| {
+            let reader = StdRead(&mut req);
+            let parsed: OtaDownloadRequest = serde_json::from_reader(reader).map_err(|e| {
                 warn!("OTA download: invalid JSON: {e}");
                 EspIOError::from(EspError::from_infallible::<{ ESP_ERR_INVALID_ARG }>())
             })?;
 
-            let url = parsed.url.to_owned();
+            let url = parsed.url;
             info!("OTA download: url={url}");
 
             // Reset status
