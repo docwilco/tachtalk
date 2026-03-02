@@ -6,7 +6,7 @@
 //! - Proxy server: accepts client connections, reads from cache
 //! - AT commands (ATE0, ATZ, etc.) are handled locally per connection using `tachtalk_elm327`
 
-use anyhow::{Context, Result};
+use crate::error::{Error, Result};
 use indexmap::IndexSet;
 use log::{debug, error, info, warn};
 use smallvec::SmallVec;
@@ -2036,10 +2036,10 @@ impl Obd2Proxy {
         state
             .cache_manager_tx
             .send(CacheManagerMessage::RegisterClient(reply_tx))
-            .map_err(|_| anyhow::anyhow!("Cache manager channel closed"))?;
+            .map_err(|_| Error::CacheManagerChannelClosed)?;
         let (client_id, client_cache) = reply_rx
             .recv()
-            .map_err(|_| anyhow::anyhow!("Failed to register with cache manager"))?;
+            .map_err(|_| Error::CacheManagerRegistrationFailed)?;
 
         // Track connection info
         let tcp_info = (local, peer);
@@ -2128,9 +2128,7 @@ impl Obd2Proxy {
             }
 
             let response = client_state.handle_at_command(command);
-            writer
-                .write_all(response.as_bytes())
-                .context("Failed to write AT response")?;
+            writer.write_all(response.as_bytes())?;
             return Ok(());
         }
 
@@ -2172,9 +2170,7 @@ impl Obd2Proxy {
             let supported_pids_guard = state.supported_pids.lock().unwrap();
             if let Some(ref cached_response) = supported_pids_guard.entries[idx] {
                 client_state.last_obd_command = Some(effective_command);
-                client_state
-                    .write_response(cached_response, writer)
-                    .context("Failed to write supported PIDs response")?;
+                client_state.write_response(cached_response, writer)?;
                 drop(supported_pids_guard);
                 return Ok(());
             }
@@ -2202,9 +2198,7 @@ impl Obd2Proxy {
                 client_state.last_obd_command = Some(effective_command);
 
                 let formatted = format_cached_for_client(pid, &response, client_state);
-                writer
-                    .write_all(&formatted)
-                    .context("Failed to write response")?;
+                writer.write_all(&formatted)?;
             }
             Err(e) => {
                 error!("Cache error: {e}");

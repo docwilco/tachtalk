@@ -13,7 +13,7 @@ path = "src/main.rs"
 tachtalk-capture-format = { path = "../tachtalk-capture-format" }
 tachtalk-elm327-lib = { path = "../tachtalk-elm327-lib" }
 tachtalk-shift-lights-lib = { path = "../tachtalk-shift-lights-lib" }
-anyhow.workspace = true
+derive_more.workspace = true
 embedded-svc.workspace = true
 enumset.workspace = true
 esp-idf-hal.workspace = true

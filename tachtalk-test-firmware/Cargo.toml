@@ -12,7 +12,7 @@ path = "src/main.rs"
 [dependencies]
 tachtalk-capture-format = { workspace = true }
 tachtalk-elm327-lib = { path = "../tachtalk-elm327-lib" }
-anyhow.workspace = true
+derive_more.workspace = true
 embedded-svc.workspace = true
 enumset.workspace = true
 esp-idf-hal.workspace = true

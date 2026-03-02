@@ -4,7 +4,7 @@
 //! to the device via `POST /api/ota/upload`. This module handles writing the
 //! received data to the inactive OTA partition and rebooting into the new image.
 
-use anyhow::Result;
+use crate::error::{Error, Result};
 use esp_idf_svc::ota::EspOta;
 use log::info;
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -93,7 +93,7 @@ where
     }
 
     if written == 0 {
-        anyhow::bail!("OTA: received 0 bytes");
+        return Err(Error::OtaZeroBytes);
     }
 
     info!("OTA: finalizing update ({written} bytes written)");
@@ -137,7 +137,7 @@ pub fn download_and_update(
 
     let status = conn.status();
     if status != 200 {
-        anyhow::bail!("HTTP {status} from firmware URL");
+        return Err(Error::OtaHttpStatus(status));
     }
 
     let content_length: usize = conn
@@ -146,7 +146,7 @@ pub fn download_and_update(
         .unwrap_or(0);
 
     if content_length == 0 {
-        anyhow::bail!("No Content-Length in firmware response");
+        return Err(Error::OtaMissingContentLength);
     }
 
     info!("OTA: firmware size: {content_length} bytes");
@@ -156,8 +156,7 @@ pub fn download_and_update(
 
     perform_ota(
         |buf| {
-            let n =
-                Read::read(&mut conn, buf).map_err(|e| anyhow::anyhow!("download read: {e}"))?;
+            let n = Read::read(&mut conn, buf)?;
             downloaded += n;
             #[allow(clippy::cast_possible_truncation)]
             let pct = (downloaded * 100 / content_length).min(100) as u8;

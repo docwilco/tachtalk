@@ -18,9 +18,9 @@ edition = "2021"
 rust-version = "1.79"
 
 [workspace.dependencies]
-anyhow = "1.0.100"
 clap = { version = "4", features = ["derive"] }
 deku = { version = "0.18", default-features = false, features = ["std"] }
+derive_more = { version = "2", features = ["display", "error", "from"] }
 embedded-svc = "0.28.1"
 enumset = { version = "1", default-features = false }
 esp-idf-hal = "0.45.2"

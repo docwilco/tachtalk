@@ -1,7 +1,14 @@
 //! Web server for test firmware configuration and control
 
-use anyhow::Result;
+use crate::error::Result;
 use embedded_svc::http::Method;
+
+/// Concrete result type used by HTTP handler closures.
+///
+/// The `EspHttpServer::fn_handler` API requires closures that return
+/// `std::result::Result<(), EspIOError>`, not our crate-level `Result<T>`.
+type HandlerResult = std::result::Result<(), EspIOError>;
+
 use embedded_svc::io::Write;
 use esp_idf_svc::http::server::{Configuration, EspHttpServer};
 use log::{debug, error, info, warn};
@@ -11,9 +18,10 @@ use std::net::Ipv4Addr;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
+use esp_idf_svc::io::EspIOError;
 use esp_idf_svc::sys::{
     esp_get_free_heap_size, esp_get_minimum_free_heap_size, lwip_getpeername, lwip_getsockname,
-    lwip_getsockopt, sockaddr, sockaddr_in, AF_INET,
+    lwip_getsockopt, sockaddr, sockaddr_in, EspError, AF_INET, ESP_ERR_INVALID_ARG, ESP_FAIL,
 };
 use std::mem::MaybeUninit;
 
@@ -85,26 +93,30 @@ where
 fn write_json<W: embedded_svc::io::Write>(
     writer: &mut W,
     value: &impl serde::Serialize,
-) -> Result<(), esp_idf_svc::io::EspIOError>
+) -> HandlerResult
 where
     W::Error: std::error::Error + Send + Sync + 'static,
 {
-    // For IO errors, From<serde_json::Error> for io::Error recovers the
-    // original io::Error, which wraps our EspIOError via Error::other.
+    // serde_json wraps IO errors from StdWrite, which in turn boxes our
+    // EspIOError via Error::other.  Unwind that chain to recover the
+    // original EspIOError.  Pure serialization errors (e.g. a Serialize
+    // impl failed) get ErrorKind::InvalidData and are logged + mapped
+    // to ESP_FAIL.
     serde_json::to_writer(StdWrite(writer), value).map_err(|e| {
-        std::io::Error::from(e)
-            .into_inner()
-            .and_then(|inner| inner.downcast::<esp_idf_svc::io::EspIOError>().ok())
-            .map_or_else(
-                || {
-                    esp_idf_svc::io::EspIOError::from(
-                        esp_idf_svc::sys::EspError::from_infallible::<
-                            { esp_idf_svc::sys::ESP_FAIL },
-                        >(),
-                    )
-                },
-                |boxed| *boxed,
-            )
+        let io_err = std::io::Error::from(e);
+        if io_err.kind() == std::io::ErrorKind::Other {
+            // IO error from StdWrite — recover the boxed EspIOError.
+            // StdWrite always wraps EspIOError via Error::other.
+            *io_err
+                .into_inner()
+                .expect("Other-kind io::Error always has inner")
+                .downcast::<EspIOError>()
+                .expect("StdWrite always boxes EspIOError")
+        } else {
+            // Pure serialization error (e.g. a Serialize impl failed)
+            warn!("write_json: serialization failed: {io_err}");
+            EspIOError::from(EspError::from_infallible::<{ ESP_FAIL }>())
+        }
     })
 }
 
@@ -297,44 +309,32 @@ const HTML_INDEX_END: &str = include_str!(concat!(env!("OUT_DIR"), "/index_end.h
 /// Register config-related routes: /, /api/config (GET/POST), /api/config/default, /api/config/check
 fn register_config_routes(server: &mut EspHttpServer<'static>, state: &Arc<State>) -> Result<()> {
     // Serve the main HTML page
-    server.fn_handler(
-        "/",
-        Method::Get,
-        |req| -> Result<(), esp_idf_svc::io::EspIOError> {
-            let mut response = req.into_ok_response()?;
-            response.write_all(HTML_INDEX_START.as_bytes())?;
-            response.write_all(SSE_PORT.to_string().as_bytes())?;
-            response.write_all(HTML_INDEX_END.as_bytes())?;
-            Ok(())
-        },
-    )?;
+    server.fn_handler("/", Method::Get, |req| -> HandlerResult {
+        let mut response = req.into_ok_response()?;
+        response.write_all(HTML_INDEX_START.as_bytes())?;
+        response.write_all(SSE_PORT.to_string().as_bytes())?;
+        response.write_all(HTML_INDEX_END.as_bytes())?;
+        Ok(())
+    })?;
 
     // GET config endpoint
     let state_clone = state.clone();
-    server.fn_handler(
-        "/api/config",
-        Method::Get,
-        move |req| -> Result<(), esp_idf_svc::io::EspIOError> {
-            info!("HTTP: GET /api/config");
-            let cfg_guard = state_clone.config.lock().unwrap();
-            let mut response = req.into_ok_response()?;
-            write_json(&mut response, &*cfg_guard)?;
-            Ok(())
-        },
-    )?;
+    server.fn_handler("/api/config", Method::Get, move |req| -> HandlerResult {
+        info!("HTTP: GET /api/config");
+        let cfg_guard = state_clone.config.lock().unwrap();
+        let mut response = req.into_ok_response()?;
+        write_json(&mut response, &*cfg_guard)?;
+        Ok(())
+    })?;
 
     // GET default config endpoint
-    server.fn_handler(
-        "/api/config/default",
-        Method::Get,
-        |req| -> Result<(), esp_idf_svc::io::EspIOError> {
-            info!("HTTP: GET /api/config/default");
-            let default_config = Config::default();
-            let mut response = req.into_ok_response()?;
-            write_json(&mut response, &default_config)?;
-            Ok(())
-        },
-    )?;
+    server.fn_handler("/api/config/default", Method::Get, |req| -> HandlerResult {
+        info!("HTTP: GET /api/config/default");
+        let default_config = Config::default();
+        let mut response = req.into_ok_response()?;
+        write_json(&mut response, &default_config)?;
+        Ok(())
+    })?;
 
     register_config_write_routes(server, state)?;
 
@@ -351,7 +351,7 @@ fn register_config_write_routes(
     server.fn_handler(
         "/api/config/check",
         Method::Post,
-        move |mut req| -> Result<(), esp_idf_svc::io::EspIOError> {
+        move |mut req| -> HandlerResult {
             debug!("HTTP: POST /api/config/check");
             let reader = StdRead(&mut req).take(MAX_CONFIG_BODY_SIZE);
 
@@ -381,7 +381,7 @@ fn register_config_write_routes(
     server.fn_handler(
         "/api/config",
         Method::Post,
-        move |mut req| -> Result<(), esp_idf_svc::io::EspIOError> {
+        move |mut req| -> HandlerResult {
             info!("HTTP: POST /api/config");
             let reader = StdRead(&mut req).take(MAX_CONFIG_BODY_SIZE);
 
@@ -440,7 +440,7 @@ fn register_test_routes(server: &mut EspHttpServer<'static>, state: &Arc<State>)
     server.fn_handler(
         "/api/test/start",
         Method::Post,
-        move |mut req| -> Result<(), esp_idf_svc::io::EspIOError> {
+        move |mut req| -> HandlerResult {
             info!("HTTP: POST /api/test/start");
 
             // Parse start options from request body
@@ -484,7 +484,7 @@ fn register_test_routes(server: &mut EspHttpServer<'static>, state: &Arc<State>)
     server.fn_handler(
         "/api/test/stop",
         Method::Post,
-        move |req| -> Result<(), esp_idf_svc::io::EspIOError> {
+        move |req| -> HandlerResult {
             info!("HTTP: POST /api/test/stop");
 
             if let Some(tx) = state_clone.test_control_tx.lock().unwrap().as_ref() {
@@ -503,7 +503,7 @@ fn register_test_routes(server: &mut EspHttpServer<'static>, state: &Arc<State>)
     server.fn_handler(
         "/api/test/status",
         Method::Get,
-        move |req| -> Result<(), esp_idf_svc::io::EspIOError> {
+        move |req| -> HandlerResult {
             debug!("HTTP: GET /api/test/status");
 
             let metrics = &state_clone.metrics;
@@ -533,56 +533,52 @@ fn register_test_routes(server: &mut EspHttpServer<'static>, state: &Arc<State>)
 fn register_capture_routes(server: &mut EspHttpServer<'static>, state: &Arc<State>) -> Result<()> {
     // GET capture download endpoint — returns header + raw binary capture data
     let state_clone = state.clone();
-    server.fn_handler(
-        "/api/capture",
-        Method::Get,
-        move |req| -> Result<(), esp_idf_svc::io::EspIOError> {
-            info!("HTTP: GET /api/capture");
+    server.fn_handler("/api/capture", Method::Get, move |req| -> HandlerResult {
+        info!("HTTP: GET /api/capture");
 
-            // Only allow download when test is stopped
-            if state_clone.metrics.test_running.load(Ordering::Relaxed) {
-                warn!("Capture download rejected: test still running");
-                req.into_status_response(409)?;
-                return Ok(());
-            }
+        // Only allow download when test is stopped
+        if state_clone.metrics.test_running.load(Ordering::Relaxed) {
+            warn!("Capture download rejected: test still running");
+            req.into_status_response(409)?;
+            return Ok(());
+        }
 
-            let header = crate::obd2::build_capture_header(&state_clone);
-            let buf_guard = state_clone.capture_buffer.lock().unwrap();
+        let header = crate::obd2::build_capture_header(&state_clone);
+        let buf_guard = state_clone.capture_buffer.lock().unwrap();
 
-            if buf_guard.is_empty() {
-                req.into_status_response(204)?;
-                return Ok(());
-            }
+        if buf_guard.is_empty() {
+            req.into_status_response(204)?;
+            return Ok(());
+        }
 
-            let total_len = header.len() + buf_guard.len();
-            let content_len = total_len.to_string();
-            let mut response = req.into_response(
-                200,
-                Some("OK"),
-                &[
-                    ("Content-Type", "application/octet-stream"),
-                    (
-                        "Content-Disposition",
-                        "attachment; filename=\"capture.ttcap\"",
-                    ),
-                    ("Content-Length", &content_len),
-                ],
-            )?;
-            response.write_all(&header)?;
-            // Write capture data in chunks to avoid holding the lock too long
-            // (but we already hold it, so just write it all)
-            response.write_all(&buf_guard)?;
+        let total_len = header.len() + buf_guard.len();
+        let content_len = total_len.to_string();
+        let mut response = req.into_response(
+            200,
+            Some("OK"),
+            &[
+                ("Content-Type", "application/octet-stream"),
+                (
+                    "Content-Disposition",
+                    "attachment; filename=\"capture.ttcap\"",
+                ),
+                ("Content-Length", &content_len),
+            ],
+        )?;
+        response.write_all(&header)?;
+        // Write capture data in chunks to avoid holding the lock too long
+        // (but we already hold it, so just write it all)
+        response.write_all(&buf_guard)?;
 
-            Ok(())
-        },
-    )?;
+        Ok(())
+    })?;
 
     // POST capture clear endpoint — clears the capture buffer
     let state_clone = state.clone();
     server.fn_handler(
         "/api/capture/clear",
         Method::Post,
-        move |req| -> Result<(), esp_idf_svc::io::EspIOError> {
+        move |req| -> HandlerResult {
             info!("HTTP: POST /api/capture/clear");
 
             // Only allow clear when test is stopped
@@ -624,7 +620,7 @@ fn register_capture_routes(server: &mut EspHttpServer<'static>, state: &Arc<Stat
     server.fn_handler(
         "/api/capture/status",
         Method::Get,
-        move |req| -> Result<(), esp_idf_svc::io::EspIOError> {
+        move |req| -> HandlerResult {
             debug!("HTTP: GET /api/capture/status");
 
             let buf_len = u32::try_from(state_clone.capture_buffer.lock().unwrap().len())
@@ -655,99 +651,91 @@ fn register_capture_routes(server: &mut EspHttpServer<'static>, state: &Arc<Stat
 fn register_network_routes(server: &mut EspHttpServer<'static>, state: &Arc<State>) -> Result<()> {
     // GET wifi scan endpoint
     let state_clone = state.clone();
-    server.fn_handler(
-        "/api/wifi/scan",
-        Method::Get,
-        move |req| -> Result<(), esp_idf_svc::io::EspIOError> {
-            info!("HTTP: GET /api/wifi/scan");
-            let mut wifi_guard = state_clone.wifi.lock().unwrap();
+    server.fn_handler("/api/wifi/scan", Method::Get, move |req| -> HandlerResult {
+        info!("HTTP: GET /api/wifi/scan");
+        let mut wifi_guard = state_clone.wifi.lock().unwrap();
 
-            let networks: Vec<Network> = match wifi_guard.scan() {
-                Ok(aps) => {
-                    debug!("WiFi scan found {} networks", aps.len());
-                    let mut best_by_ssid: HashMap<String, i8> = HashMap::new();
-                    for ap in &aps {
-                        let ssid = ap.ssid.to_string();
-                        if ssid.is_empty() {
-                            continue;
-                        }
-                        best_by_ssid
-                            .entry(ssid)
-                            .and_modify(|rssi| *rssi = (*rssi).max(ap.signal_strength))
-                            .or_insert(ap.signal_strength);
+        let networks: Vec<Network> = match wifi_guard.scan() {
+            Ok(aps) => {
+                debug!("WiFi scan found {} networks", aps.len());
+                let mut best_by_ssid: HashMap<String, i8> = HashMap::new();
+                for ap in &aps {
+                    let ssid = ap.ssid.to_string();
+                    if ssid.is_empty() {
+                        continue;
                     }
-                    let mut networks: Vec<Network> = best_by_ssid
-                        .into_iter()
-                        .map(|(ssid, rssi)| Network { ssid, rssi })
-                        .collect();
-                    networks.sort_by(|a, b| b.rssi.cmp(&a.rssi));
-                    networks
+                    best_by_ssid
+                        .entry(ssid)
+                        .and_modify(|rssi| *rssi = (*rssi).max(ap.signal_strength))
+                        .or_insert(ap.signal_strength);
                 }
-                Err(e) => {
-                    error!("WiFi scan failed: {e:?}");
-                    Vec::new()
-                }
-            };
+                let mut networks: Vec<Network> = best_by_ssid
+                    .into_iter()
+                    .map(|(ssid, rssi)| Network { ssid, rssi })
+                    .collect();
+                networks.sort_by(|a, b| b.rssi.cmp(&a.rssi));
+                networks
+            }
+            Err(e) => {
+                error!("WiFi scan failed: {e:?}");
+                Vec::new()
+            }
+        };
 
-            let mut response = req.into_ok_response()?;
-            write_json(&mut response, &networks)?;
-            Ok(())
-        },
-    )?;
+        let mut response = req.into_ok_response()?;
+        write_json(&mut response, &networks)?;
+        Ok(())
+    })?;
 
     // GET network status endpoint
     let state_clone = state.clone();
-    server.fn_handler(
-        "/api/network",
-        Method::Get,
-        move |req| -> Result<(), esp_idf_svc::io::EspIOError> {
-            info!("HTTP: GET /api/network");
-            let wifi_guard = state_clone.wifi.lock().unwrap();
+    server.fn_handler("/api/network", Method::Get, move |req| -> HandlerResult {
+        info!("HTTP: GET /api/network");
+        let wifi_guard = state_clone.wifi.lock().unwrap();
 
-            let sta_netif = wifi_guard.sta_netif();
-            let ip_info = sta_netif.get_ip_info().ok();
+        let sta_netif = wifi_guard.sta_netif();
+        let ip_info = sta_netif.get_ip_info().ok();
 
-            let mac_bytes = wifi_guard
-                .driver()
-                .get_mac(esp_idf_svc::wifi::WifiDeviceId::Sta)
-                .unwrap_or([0u8; 6]);
-            let mac = format!(
-                "{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
-                mac_bytes[0], mac_bytes[1], mac_bytes[2], mac_bytes[3], mac_bytes[4], mac_bytes[5]
-            );
+        let mac_bytes = wifi_guard
+            .driver()
+            .get_mac(esp_idf_svc::wifi::WifiDeviceId::Sta)
+            .unwrap_or([0u8; 6]);
+        let mac = format!(
+            "{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
+            mac_bytes[0], mac_bytes[1], mac_bytes[2], mac_bytes[3], mac_bytes[4], mac_bytes[5]
+        );
 
-            let (ssid, rssi) = if wifi_guard.is_connected().unwrap_or(false) {
-                let mut ap_info: esp_idf_svc::sys::wifi_ap_record_t = unsafe { std::mem::zeroed() };
-                let result = unsafe { esp_idf_svc::sys::esp_wifi_sta_get_ap_info(&mut ap_info) };
-                if result == esp_idf_svc::sys::ESP_OK {
-                    let ssid_bytes = &ap_info.ssid;
-                    let ssid_len = ssid_bytes
-                        .iter()
-                        .position(|&b| b == 0)
-                        .unwrap_or(ssid_bytes.len());
-                    let ssid = String::from_utf8_lossy(&ssid_bytes[..ssid_len]).to_string();
-                    (Some(ssid), Some(ap_info.rssi))
-                } else {
-                    (None, None)
-                }
+        let (ssid, rssi) = if wifi_guard.is_connected().unwrap_or(false) {
+            let mut ap_info: esp_idf_svc::sys::wifi_ap_record_t = unsafe { std::mem::zeroed() };
+            let result = unsafe { esp_idf_svc::sys::esp_wifi_sta_get_ap_info(&mut ap_info) };
+            if result == esp_idf_svc::sys::ESP_OK {
+                let ssid_bytes = &ap_info.ssid;
+                let ssid_len = ssid_bytes
+                    .iter()
+                    .position(|&b| b == 0)
+                    .unwrap_or(ssid_bytes.len());
+                let ssid = String::from_utf8_lossy(&ssid_bytes[..ssid_len]).to_string();
+                (Some(ssid), Some(ap_info.rssi))
             } else {
                 (None, None)
-            };
+            }
+        } else {
+            (None, None)
+        };
 
-            let status = NetworkStatus {
-                ssid,
-                ip: ip_info
-                    .as_ref()
-                    .map(|i| format!("{}/{}", i.ip, i.subnet.mask.0)),
-                mac,
-                rssi,
-            };
+        let status = NetworkStatus {
+            ssid,
+            ip: ip_info
+                .as_ref()
+                .map(|i| format!("{}/{}", i.ip, i.subnet.mask.0)),
+            mac,
+            rssi,
+        };
 
-            let mut response = req.into_ok_response()?;
-            write_json(&mut response, &status)?;
-            Ok(())
-        },
-    )?;
+        let mut response = req.into_ok_response()?;
+        write_json(&mut response, &status)?;
+        Ok(())
+    })?;
 
     Ok(())
 }
@@ -755,24 +743,20 @@ fn register_network_routes(server: &mut EspHttpServer<'static>, state: &Arc<Stat
 /// Register debug/system routes: `/api/sockets`, `/api/debug_info`, `/api/reboot`
 fn register_debug_routes(server: &mut EspHttpServer<'static>, state: &Arc<State>) -> Result<()> {
     // GET all open sockets endpoint (for debugging)
-    server.fn_handler(
-        "/api/sockets",
-        Method::Get,
-        move |req| -> Result<(), esp_idf_svc::io::EspIOError> {
-            debug!("HTTP: GET /api/sockets");
+    server.fn_handler("/api/sockets", Method::Get, move |req| -> HandlerResult {
+        debug!("HTTP: GET /api/sockets");
 
-            let sockets = enumerate_sockets();
-            let mut response = req.into_ok_response()?;
-            write_json(&mut response, &sockets)?;
-            Ok(())
-        },
-    )?;
+        let sockets = enumerate_sockets();
+        let mut response = req.into_ok_response()?;
+        write_json(&mut response, &sockets)?;
+        Ok(())
+    })?;
 
     // GET debug info endpoint
     server.fn_handler(
         "/api/debug_info",
         Method::Get,
-        move |req| -> Result<(), esp_idf_svc::io::EspIOError> {
+        move |req| -> HandlerResult {
             debug!("HTTP: GET /api/debug_info");
 
             let free_heap = unsafe { esp_get_free_heap_size() };
@@ -791,39 +775,35 @@ fn register_debug_routes(server: &mut EspHttpServer<'static>, state: &Arc<State>
 
     // POST reboot endpoint
     let state_clone = state.clone();
-    server.fn_handler(
-        "/api/reboot",
-        Method::Post,
-        move |req| -> Result<(), esp_idf_svc::io::EspIOError> {
-            info!("HTTP: POST /api/reboot - Device reboot requested");
+    server.fn_handler("/api/reboot", Method::Post, move |req| -> HandlerResult {
+        info!("HTTP: POST /api/reboot - Device reboot requested");
 
-            req.into_ok_response()?;
+        req.into_ok_response()?;
 
-            let state = state_clone.clone();
-            crate::thread_util::spawn_named(
-                c"restart",
-                4096,
-                crate::thread_util::StackMemory::Spiram,
-                move || {
-                    std::thread::sleep(std::time::Duration::from_secs(1));
+        let state = state_clone.clone();
+        crate::thread_util::spawn_named(
+            c"restart",
+            4096,
+            crate::thread_util::StackMemory::Spiram,
+            move || {
+                std::thread::sleep(std::time::Duration::from_secs(1));
 
-                    info!("Stopping WiFi before reboot...");
-                    if let Ok(mut wifi_guard) = state.wifi.lock() {
-                        if let Err(e) = wifi_guard.stop() {
-                            warn!("Failed to stop WiFi: {e:?}");
-                        }
+                info!("Stopping WiFi before reboot...");
+                if let Ok(mut wifi_guard) = state.wifi.lock() {
+                    if let Err(e) = wifi_guard.stop() {
+                        warn!("Failed to stop WiFi: {e:?}");
                     }
+                }
 
-                    info!("Rebooting device now...");
-                    unsafe {
-                        esp_idf_svc::sys::esp_restart();
-                    }
-                },
-            );
+                info!("Rebooting device now...");
+                unsafe {
+                    esp_idf_svc::sys::esp_restart();
+                }
+            },
+        );
 
-            Ok(())
-        },
-    )?;
+        Ok(())
+    })?;
 
     Ok(())
 }
@@ -866,24 +846,20 @@ fn schedule_ota_reboot(state: Arc<State>) {
 /// Register OTA firmware info and direct-upload routes: `/api/ota/info`, `/api/ota/upload`
 fn register_ota_routes(server: &mut EspHttpServer<'static>, state: &Arc<State>) -> Result<()> {
     // GET firmware info (version + variant)
-    server.fn_handler(
-        "/api/ota/info",
-        Method::Get,
-        move |req| -> Result<(), esp_idf_svc::io::EspIOError> {
-            debug!("HTTP: GET /api/ota/info");
-            let info = crate::ota::firmware_info();
-            let mut response = req.into_ok_response()?;
-            write_json(&mut response, &info)?;
-            Ok(())
-        },
-    )?;
+    server.fn_handler("/api/ota/info", Method::Get, move |req| -> HandlerResult {
+        debug!("HTTP: GET /api/ota/info");
+        let info = crate::ota::firmware_info();
+        let mut response = req.into_ok_response()?;
+        write_json(&mut response, &info)?;
+        Ok(())
+    })?;
 
     // POST firmware binary upload for OTA
     let state_clone = state.clone();
     server.fn_handler(
         "/api/ota/upload",
         Method::Post,
-        move |mut req| -> Result<(), esp_idf_svc::io::EspIOError> {
+        move |mut req| -> HandlerResult {
             info!("HTTP: POST /api/ota/upload");
 
             let content_length: usize = req
@@ -901,9 +877,7 @@ fn register_ota_routes(server: &mut EspHttpServer<'static>, state: &Arc<State>) 
 
             let result = crate::ota::perform_ota(
                 |buf| {
-                    let n = req
-                        .read(buf)
-                        .map_err(|e| anyhow::anyhow!("read error: {e}"))?;
+                    let n = req.read(buf)?;
                     Ok(n)
                 },
                 content_length,
@@ -944,7 +918,7 @@ fn register_ota_download_routes(
     server.fn_handler(
         "/api/ota/download",
         Method::Post,
-        move |mut req| -> Result<(), esp_idf_svc::io::EspIOError> {
+        move |mut req| -> HandlerResult {
             info!("HTTP: POST /api/ota/download");
 
             // Reject if OTA already in progress
@@ -978,9 +952,7 @@ fn register_ota_download_routes(
             let body_str = core::str::from_utf8(&body[..total]).unwrap_or("");
             let parsed: OtaDownloadRequest<'_> = serde_json::from_str(body_str).map_err(|e| {
                 warn!("OTA download: invalid JSON: {e}");
-                esp_idf_svc::io::EspIOError::from(esp_idf_svc::sys::EspError::from_infallible::<
-                    { esp_idf_svc::sys::ESP_ERR_INVALID_ARG },
-                >())
+                EspIOError::from(EspError::from_infallible::<{ ESP_ERR_INVALID_ARG }>())
             })?;
 
             let url = parsed.url.to_owned();
@@ -1042,7 +1014,7 @@ fn register_ota_status_route(
     server.fn_handler(
         "/api/ota/status",
         Method::Get,
-        move |req| -> Result<(), esp_idf_svc::io::EspIOError> {
+        move |req| -> HandlerResult {
             let status = state_clone
                 .ota_status
                 .load(std::sync::atomic::Ordering::Relaxed);
@@ -1095,35 +1067,31 @@ fn register_captive_portal(
 
     info!("Captive portal enabled for hostname: {hostname}");
 
-    server.fn_handler(
-        "/*",
-        Method::Get,
-        move |req| -> Result<(), esp_idf_svc::io::EspIOError> {
-            let host = req.header("Host").unwrap_or("");
-            let host_lower = host.to_lowercase();
-            let host_without_port = host_lower.split(':').next().unwrap_or("");
+    server.fn_handler("/*", Method::Get, move |req| -> HandlerResult {
+        let host = req.header("Host").unwrap_or("");
+        let host_lower = host.to_lowercase();
+        let host_without_port = host_lower.split(':').next().unwrap_or("");
 
-            let is_valid_host = valid_hosts.iter().any(|h| h == host_without_port);
+        let is_valid_host = valid_hosts.iter().any(|h| h == host_without_port);
 
-            if is_valid_host {
-                info!("HTTP: GET {} -> 404 (host: {})", req.uri(), host);
-                req.into_status_response(404)?;
-            } else {
-                info!("HTTP: GET {} -> 302 captive (host: {})", req.uri(), host);
-                let mut response = req.into_response(
-                    302,
-                    Some("Found"),
-                    &[
-                        ("Location", &redirect_url),
-                        ("Cache-Control", "no-cache"),
-                        ("Connection", "close"),
-                    ],
-                )?;
-                response.write_all(captive_portal_html.as_bytes())?;
-            }
-            Ok(())
-        },
-    )?;
+        if is_valid_host {
+            info!("HTTP: GET {} -> 404 (host: {})", req.uri(), host);
+            req.into_status_response(404)?;
+        } else {
+            info!("HTTP: GET {} -> 302 captive (host: {})", req.uri(), host);
+            let mut response = req.into_response(
+                302,
+                Some("Found"),
+                &[
+                    ("Location", &redirect_url),
+                    ("Cache-Control", "no-cache"),
+                    ("Connection", "close"),
+                ],
+            )?;
+            response.write_all(captive_portal_html.as_bytes())?;
+        }
+        Ok(())
+    })?;
 
     Ok(())
 }

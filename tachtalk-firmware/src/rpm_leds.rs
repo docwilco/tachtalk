@@ -9,7 +9,7 @@ use std::sync::mpsc::{Receiver, Sender};
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::Result;
+use crate::error::Result;
 use esp_idf_hal::gpio::OutputPin;
 use esp_idf_hal::peripheral::Peripheral;
 use esp_idf_hal::rmt::config::TransmitConfig;

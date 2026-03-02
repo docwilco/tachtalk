@@ -1,4 +1,4 @@
-use anyhow::Result;
+use crate::error::Result;
 use embedded_svc::http::Method;
 use embedded_svc::io::Write;
 use esp_idf_svc::http::server::{Configuration, EspHttpServer};
@@ -9,9 +9,11 @@ use std::net::Ipv4Addr;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
+use esp_idf_svc::io::EspIOError;
 use esp_idf_svc::sys::{
     heap_caps_get_free_size, heap_caps_get_minimum_free_size, lwip_getpeername, lwip_getsockname,
-    lwip_getsockopt, sockaddr, sockaddr_in, AF_INET, MALLOC_CAP_INTERNAL, MALLOC_CAP_SPIRAM,
+    lwip_getsockopt, sockaddr, sockaddr_in, EspError, AF_INET, ESP_ERR_INVALID_ARG, ESP_FAIL,
+    MALLOC_CAP_INTERNAL, MALLOC_CAP_SPIRAM,
 };
 use std::mem::MaybeUninit;
 
@@ -20,6 +22,9 @@ use crate::rpm_leds::RpmTaskMessage;
 use crate::sse_server::SSE_PORT;
 use crate::State;
 use smallvec::SmallVec;
+
+/// Result type for HTTP handler closures (uses `EspIOError`, not our crate error)
+type HandlerResult = std::result::Result<(), EspIOError>;
 
 // Redefine bindgen u32 constants as i32 to match C socket API function signatures
 #[allow(clippy::cast_possible_wrap)]
@@ -85,26 +90,30 @@ where
 fn write_json<W: embedded_svc::io::Write>(
     writer: &mut W,
     value: &impl serde::Serialize,
-) -> Result<(), esp_idf_svc::io::EspIOError>
+) -> HandlerResult
 where
     W::Error: std::error::Error + Send + Sync + 'static,
 {
-    // For IO errors, From<serde_json::Error> for io::Error recovers the
-    // original io::Error, which wraps our EspIOError via Error::other.
+    // serde_json wraps IO errors from StdWrite, which in turn boxes our
+    // EspIOError via Error::other.  Unwind that chain to recover the
+    // original EspIOError.  Pure serialization errors (e.g. a Serialize
+    // impl failed) get ErrorKind::InvalidData and are logged + mapped
+    // to ESP_FAIL.
     serde_json::to_writer(StdWrite(writer), value).map_err(|e| {
-        std::io::Error::from(e)
-            .into_inner()
-            .and_then(|inner| inner.downcast::<esp_idf_svc::io::EspIOError>().ok())
-            .map_or_else(
-                || {
-                    esp_idf_svc::io::EspIOError::from(
-                        esp_idf_svc::sys::EspError::from_infallible::<
-                            { esp_idf_svc::sys::ESP_FAIL },
-                        >(),
-                    )
-                },
-                |boxed| *boxed,
-            )
+        let io_err = std::io::Error::from(e);
+        if io_err.kind() == std::io::ErrorKind::Other {
+            // IO error from StdWrite — recover the boxed EspIOError.
+            // StdWrite always wraps EspIOError via Error::other.
+            *io_err
+                .into_inner()
+                .expect("Other-kind io::Error always has inner")
+                .downcast::<EspIOError>()
+                .expect("StdWrite always boxes EspIOError")
+        } else {
+            // Pure serialization error (e.g. a Serialize impl failed)
+            warn!("write_json: serialization failed: {io_err}");
+            EspIOError::from(EspError::from_infallible::<{ ESP_FAIL }>())
+        }
     })
 }
 
@@ -377,48 +386,36 @@ fn register_config_routes(server: &mut EspHttpServer<'static>, state: &Arc<State
 }
 
 fn register_index_page(server: &mut EspHttpServer<'static>) -> Result<()> {
-    server.fn_handler(
-        "/",
-        Method::Get,
-        |req| -> Result<(), esp_idf_svc::io::EspIOError> {
-            let mut response = req.into_ok_response()?;
-            response.write_all(HTML_INDEX_START.as_bytes())?;
-            response.write_all(SSE_PORT.to_string().as_bytes())?;
-            response.write_all(HTML_INDEX_END.as_bytes())?;
-            Ok(())
-        },
-    )?;
+    server.fn_handler("/", Method::Get, |req| -> HandlerResult {
+        let mut response = req.into_ok_response()?;
+        response.write_all(HTML_INDEX_START.as_bytes())?;
+        response.write_all(SSE_PORT.to_string().as_bytes())?;
+        response.write_all(HTML_INDEX_END.as_bytes())?;
+        Ok(())
+    })?;
     Ok(())
 }
 
 fn register_get_config(server: &mut EspHttpServer<'static>, state: &Arc<State>) -> Result<()> {
     let state_clone = state.clone();
-    server.fn_handler(
-        "/api/config",
-        Method::Get,
-        move |req| -> Result<(), esp_idf_svc::io::EspIOError> {
-            info!("HTTP: GET /api/config");
-            let cfg = state_clone.config.lock().unwrap();
-            let mut response = req.into_ok_response()?;
-            write_json(&mut response, &*cfg)?;
-            Ok(())
-        },
-    )?;
+    server.fn_handler("/api/config", Method::Get, move |req| -> HandlerResult {
+        info!("HTTP: GET /api/config");
+        let cfg = state_clone.config.lock().unwrap();
+        let mut response = req.into_ok_response()?;
+        write_json(&mut response, &*cfg)?;
+        Ok(())
+    })?;
     Ok(())
 }
 
 fn register_get_default_config(server: &mut EspHttpServer<'static>) -> Result<()> {
-    server.fn_handler(
-        "/api/config/default",
-        Method::Get,
-        |req| -> Result<(), esp_idf_svc::io::EspIOError> {
-            info!("HTTP: GET /api/config/default");
-            let default_config = crate::config::Config::default();
-            let mut response = req.into_ok_response()?;
-            write_json(&mut response, &default_config)?;
-            Ok(())
-        },
-    )?;
+    server.fn_handler("/api/config/default", Method::Get, |req| -> HandlerResult {
+        info!("HTTP: GET /api/config/default");
+        let default_config = crate::config::Config::default();
+        let mut response = req.into_ok_response()?;
+        write_json(&mut response, &default_config)?;
+        Ok(())
+    })?;
     Ok(())
 }
 
@@ -430,7 +427,7 @@ fn register_post_config_check(
     server.fn_handler(
         "/api/config/check",
         Method::Post,
-        move |mut req| -> Result<(), esp_idf_svc::io::EspIOError> {
+        move |mut req| -> HandlerResult {
             debug!("HTTP: POST /api/config/check");
             let reader = StdRead(&mut req).take(MAX_CONFIG_BODY_SIZE);
 
@@ -463,7 +460,7 @@ fn register_post_config(server: &mut EspHttpServer<'static>, state: &Arc<State>)
     server.fn_handler(
         "/api/config",
         Method::Post,
-        move |mut req| -> Result<(), esp_idf_svc::io::EspIOError> {
+        move |mut req| -> HandlerResult {
             info!("HTTP: POST /api/config");
             let reader = StdRead(&mut req).take(MAX_CONFIG_BODY_SIZE);
 
@@ -536,7 +533,7 @@ fn register_post_brightness(server: &mut EspHttpServer<'static>, state: &Arc<Sta
     server.fn_handler(
         "/api/brightness",
         Method::Post,
-        move |mut req| -> Result<(), esp_idf_svc::io::EspIOError> {
+        move |mut req| -> HandlerResult {
             debug!("HTTP: POST /api/brightness");
             let mut buf = [0u8; 32];
             let bytes_read = req.read(&mut buf)?;
@@ -579,102 +576,94 @@ fn register_post_brightness(server: &mut EspHttpServer<'static>, state: &Arc<Sta
 fn register_network_routes(server: &mut EspHttpServer<'static>, state: &Arc<State>) -> Result<()> {
     // GET wifi scan endpoint
     let state_clone = state.clone();
-    server.fn_handler(
-        "/api/wifi/scan",
-        Method::Get,
-        move |req| -> Result<(), esp_idf_svc::io::EspIOError> {
-            info!("HTTP: GET /api/wifi/scan");
-            let mut wifi = state_clone.wifi.lock().unwrap();
+    server.fn_handler("/api/wifi/scan", Method::Get, move |req| -> HandlerResult {
+        info!("HTTP: GET /api/wifi/scan");
+        let mut wifi = state_clone.wifi.lock().unwrap();
 
-            let networks: Vec<Network> = match wifi.scan() {
-                Ok(aps) => {
-                    debug!("WiFi scan found {} networks", aps.len());
-                    // Deduplicate by SSID, keeping strongest signal
-                    let mut best_by_ssid: HashMap<String, i8> = HashMap::new();
-                    for ap in &aps {
-                        let ssid = ap.ssid.to_string();
-                        if ssid.is_empty() {
-                            continue;
-                        }
-                        best_by_ssid
-                            .entry(ssid)
-                            .and_modify(|rssi| *rssi = (*rssi).max(ap.signal_strength))
-                            .or_insert(ap.signal_strength);
+        let networks: Vec<Network> = match wifi.scan() {
+            Ok(aps) => {
+                debug!("WiFi scan found {} networks", aps.len());
+                // Deduplicate by SSID, keeping strongest signal
+                let mut best_by_ssid: HashMap<String, i8> = HashMap::new();
+                for ap in &aps {
+                    let ssid = ap.ssid.to_string();
+                    if ssid.is_empty() {
+                        continue;
                     }
-                    // Convert to vec and sort by signal strength (strongest first)
-                    let mut networks: Vec<Network> = best_by_ssid
-                        .into_iter()
-                        .map(|(ssid, rssi)| Network { ssid, rssi })
-                        .collect();
-                    networks.sort_by(|a, b| b.rssi.cmp(&a.rssi));
-                    networks
+                    best_by_ssid
+                        .entry(ssid)
+                        .and_modify(|rssi| *rssi = (*rssi).max(ap.signal_strength))
+                        .or_insert(ap.signal_strength);
                 }
-                Err(e) => {
-                    error!("WiFi scan failed: {e:?}");
-                    Vec::new()
-                }
-            };
+                // Convert to vec and sort by signal strength (strongest first)
+                let mut networks: Vec<Network> = best_by_ssid
+                    .into_iter()
+                    .map(|(ssid, rssi)| Network { ssid, rssi })
+                    .collect();
+                networks.sort_by(|a, b| b.rssi.cmp(&a.rssi));
+                networks
+            }
+            Err(e) => {
+                error!("WiFi scan failed: {e:?}");
+                Vec::new()
+            }
+        };
 
-            let mut response = req.into_ok_response()?;
-            write_json(&mut response, &networks)?;
-            Ok(())
-        },
-    )?;
+        let mut response = req.into_ok_response()?;
+        write_json(&mut response, &networks)?;
+        Ok(())
+    })?;
 
     // GET network status endpoint
     let state_clone = state.clone();
-    server.fn_handler(
-        "/api/network",
-        Method::Get,
-        move |req| -> Result<(), esp_idf_svc::io::EspIOError> {
-            info!("HTTP: GET /api/network");
-            let wifi = state_clone.wifi.lock().unwrap();
+    server.fn_handler("/api/network", Method::Get, move |req| -> HandlerResult {
+        info!("HTTP: GET /api/network");
+        let wifi = state_clone.wifi.lock().unwrap();
 
-            let sta_netif = wifi.sta_netif();
-            let ip_info = sta_netif.get_ip_info().ok();
+        let sta_netif = wifi.sta_netif();
+        let ip_info = sta_netif.get_ip_info().ok();
 
-            let mac_bytes = wifi
-                .driver()
-                .get_mac(esp_idf_svc::wifi::WifiDeviceId::Sta)
-                .unwrap_or([0u8; 6]);
-            let mac = format!(
-                "{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
-                mac_bytes[0], mac_bytes[1], mac_bytes[2], mac_bytes[3], mac_bytes[4], mac_bytes[5]
-            );
+        let mac_bytes = wifi
+            .driver()
+            .get_mac(esp_idf_svc::wifi::WifiDeviceId::Sta)
+            .unwrap_or([0u8; 6]);
+        let mac = format!(
+            "{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
+            mac_bytes[0], mac_bytes[1], mac_bytes[2], mac_bytes[3], mac_bytes[4], mac_bytes[5]
+        );
 
-            // Get SSID and RSSI from current STA connection info
-            let (ssid, rssi) = if wifi.is_connected().unwrap_or(false) {
-                let mut ap_info: esp_idf_svc::sys::wifi_ap_record_t = unsafe { std::mem::zeroed() };
-                let result = unsafe { esp_idf_svc::sys::esp_wifi_sta_get_ap_info(&mut ap_info) };
-                if result == esp_idf_svc::sys::ESP_OK {
-                    let ssid_bytes = &ap_info.ssid;
-                    let ssid_len = ssid_bytes
-                        .iter()
-                        .position(|&b| b == 0)
-                        .unwrap_or(ssid_bytes.len());
-                    let ssid = String::from_utf8_lossy(&ssid_bytes[..ssid_len]).to_string();
-                    (Some(ssid), Some(ap_info.rssi))
-                } else {
-                    (None, None)
-                }
+        // Get SSID and RSSI from current STA connection info
+        let (ssid, rssi) = if wifi.is_connected().unwrap_or(false) {
+            let mut ap_info: esp_idf_svc::sys::wifi_ap_record_t = unsafe { std::mem::zeroed() };
+            let result = unsafe { esp_idf_svc::sys::esp_wifi_sta_get_ap_info(&mut ap_info) };
+            if result == esp_idf_svc::sys::ESP_OK {
+                let ssid_bytes = &ap_info.ssid;
+                let ssid_len = ssid_bytes
+                    .iter()
+                    .position(|&b| b == 0)
+                    .unwrap_or(ssid_bytes.len());
+                let ssid = String::from_utf8_lossy(&ssid_bytes[..ssid_len]).to_string();
+                (Some(ssid), Some(ap_info.rssi))
             } else {
                 (None, None)
-            };
+            }
+        } else {
+            (None, None)
+        };
 
-            let status = NetworkStatus {
-                ssid,
-                ip: ip_info
-                    .as_ref()
-                    .map(|i| format!("{}/{}", i.ip, i.subnet.mask.0)),
-                mac,
-                rssi,
-            };
+        let status = NetworkStatus {
+            ssid,
+            ip: ip_info
+                .as_ref()
+                .map(|i| format!("{}/{}", i.ip, i.subnet.mask.0)),
+            mac,
+            rssi,
+        };
 
-            let mut response = req.into_ok_response()?;
-            write_json(&mut response, &status)?;
-            Ok(())
-        },
-    )?;
+        let mut response = req.into_ok_response()?;
+        write_json(&mut response, &status)?;
+        Ok(())
+    })?;
 
     Ok(())
 }
@@ -683,110 +672,94 @@ fn register_network_routes(server: &mut EspHttpServer<'static>, state: &Arc<Stat
 fn register_status_routes(server: &mut EspHttpServer<'static>, state: &Arc<State>) -> Result<()> {
     // GET connection status endpoint for diagram
     let state_clone = state.clone();
-    server.fn_handler(
-        "/api/status",
-        Method::Get,
-        move |req| -> Result<(), esp_idf_svc::io::EspIOError> {
-            debug!("HTTP: GET /api/status");
+    server.fn_handler("/api/status", Method::Get, move |req| -> HandlerResult {
+        debug!("HTTP: GET /api/status");
 
-            let wifi_connected = state_clone
-                .wifi
-                .lock()
-                .unwrap()
-                .is_connected()
-                .unwrap_or(false);
-            let dongle_tcp_connected = state_clone.dongle_connected.load(Ordering::Relaxed);
-            let obd2_client_count = state_clone.obd2_client_count.load(Ordering::Relaxed);
+        let wifi_connected = state_clone
+            .wifi
+            .lock()
+            .unwrap()
+            .is_connected()
+            .unwrap_or(false);
+        let dongle_tcp_connected = state_clone.dongle_connected.load(Ordering::Relaxed);
+        let obd2_client_count = state_clone.obd2_client_count.load(Ordering::Relaxed);
 
-            let status = ConnectionStatus {
-                wifi_connected,
-                dongle_tcp_connected,
-                obd2_client_count,
-            };
+        let status = ConnectionStatus {
+            wifi_connected,
+            dongle_tcp_connected,
+            obd2_client_count,
+        };
 
-            let mut response = req.into_ok_response()?;
-            write_json(&mut response, &status)?;
-            Ok(())
-        },
-    )?;
+        let mut response = req.into_ok_response()?;
+        write_json(&mut response, &status)?;
+        Ok(())
+    })?;
 
     // GET TCP connection details endpoint
     let state_clone = state.clone();
-    server.fn_handler(
-        "/api/tcp",
-        Method::Get,
-        move |req| -> Result<(), esp_idf_svc::io::EspIOError> {
-            debug!("HTTP: GET /api/tcp");
+    server.fn_handler("/api/tcp", Method::Get, move |req| -> HandlerResult {
+        debug!("HTTP: GET /api/tcp");
 
-            let dongle = state_clone
-                .dongle_tcp_info
-                .lock()
-                .unwrap()
-                .map(|(local, remote)| TcpConnectionInfo {
-                    local: local.to_string(),
-                    remote: remote.to_string(),
-                });
+        let dongle = state_clone
+            .dongle_tcp_info
+            .lock()
+            .unwrap()
+            .map(|(local, remote)| TcpConnectionInfo {
+                local: local.to_string(),
+                remote: remote.to_string(),
+            });
 
-            let clients: Vec<TcpConnectionInfo> = state_clone
-                .client_tcp_info
-                .lock()
-                .unwrap()
-                .iter()
-                .map(|(local, remote)| TcpConnectionInfo {
-                    local: local.to_string(),
-                    remote: remote.to_string(),
-                })
-                .collect();
+        let clients: Vec<TcpConnectionInfo> = state_clone
+            .client_tcp_info
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(local, remote)| TcpConnectionInfo {
+                local: local.to_string(),
+                remote: remote.to_string(),
+            })
+            .collect();
 
-            let status = TcpStatus { dongle, clients };
-            let mut response = req.into_ok_response()?;
-            write_json(&mut response, &status)?;
-            Ok(())
-        },
-    )?;
+        let status = TcpStatus { dongle, clients };
+        let mut response = req.into_ok_response()?;
+        write_json(&mut response, &status)?;
+        Ok(())
+    })?;
 
     // GET RPM endpoint (fallback for non-SSE clients)
     let state_clone = state.clone();
-    server.fn_handler(
-        "/api/rpm",
-        Method::Get,
-        move |req| -> Result<(), esp_idf_svc::io::EspIOError> {
-            debug!("HTTP: GET /api/rpm");
-            let rpm = state_clone.shared_rpm.lock().unwrap();
-            let json = match *rpm {
-                Some(r) => format!(r#"{{"rpm":{r}}}"#),
-                None => r#"{"rpm":null}"#.to_string(),
-            };
-            let mut response = req.into_ok_response()?;
-            response.write_all(json.as_bytes())?;
-            Ok(())
-        },
-    )?;
+    server.fn_handler("/api/rpm", Method::Get, move |req| -> HandlerResult {
+        debug!("HTTP: GET /api/rpm");
+        let rpm = state_clone.shared_rpm.lock().unwrap();
+        let json = match *rpm {
+            Some(r) => format!(r#"{{"rpm":{r}}}"#),
+            None => r#"{"rpm":null}"#.to_string(),
+        };
+        let mut response = req.into_ok_response()?;
+        response.write_all(json.as_bytes())?;
+        Ok(())
+    })?;
 
     // GET polling metrics endpoint
     let state_clone = state.clone();
-    server.fn_handler(
-        "/api/metrics",
-        Method::Get,
-        move |req| -> Result<(), esp_idf_svc::io::EspIOError> {
-            debug!("HTTP: GET /api/metrics");
+    server.fn_handler("/api/metrics", Method::Get, move |req| -> HandlerResult {
+        debug!("HTTP: GET /api/metrics");
 
-            let metrics = &state_clone.polling_metrics;
-            let response_data = PollingMetricsResponse {
-                fast_pid_count: metrics.fast_pid_count.load(Ordering::Relaxed),
-                slow_pid_count: metrics.slow_pid_count.load(Ordering::Relaxed),
-                promotions: metrics.promotions.load(Ordering::Relaxed),
-                demotions: metrics.demotions.load(Ordering::Relaxed),
-                removals: metrics.removals.load(Ordering::Relaxed),
-                dongle_requests_total: metrics.dongle_requests_total.load(Ordering::Relaxed),
-                dongle_requests_per_sec: metrics.dongle_requests_per_sec.load(Ordering::Relaxed),
-            };
+        let metrics = &state_clone.polling_metrics;
+        let response_data = PollingMetricsResponse {
+            fast_pid_count: metrics.fast_pid_count.load(Ordering::Relaxed),
+            slow_pid_count: metrics.slow_pid_count.load(Ordering::Relaxed),
+            promotions: metrics.promotions.load(Ordering::Relaxed),
+            demotions: metrics.demotions.load(Ordering::Relaxed),
+            removals: metrics.removals.load(Ordering::Relaxed),
+            dongle_requests_total: metrics.dongle_requests_total.load(Ordering::Relaxed),
+            dongle_requests_per_sec: metrics.dongle_requests_per_sec.load(Ordering::Relaxed),
+        };
 
-            let mut response = req.into_ok_response()?;
-            write_json(&mut response, &response_data)?;
-            Ok(())
-        },
-    )?;
+        let mut response = req.into_ok_response()?;
+        write_json(&mut response, &response_data)?;
+        Ok(())
+    })?;
 
     Ok(())
 }
@@ -794,25 +767,21 @@ fn register_status_routes(server: &mut EspHttpServer<'static>, state: &Arc<State
 /// Register debug and system routes (sockets, debug info, reboot)
 fn register_debug_routes(server: &mut EspHttpServer<'static>, state: &Arc<State>) -> Result<()> {
     // GET all open sockets endpoint (for debugging FD exhaustion)
-    server.fn_handler(
-        "/api/sockets",
-        Method::Get,
-        move |req| -> Result<(), esp_idf_svc::io::EspIOError> {
-            debug!("HTTP: GET /api/sockets");
+    server.fn_handler("/api/sockets", Method::Get, move |req| -> HandlerResult {
+        debug!("HTTP: GET /api/sockets");
 
-            let sockets = enumerate_sockets();
-            let mut response = req.into_ok_response()?;
-            write_json(&mut response, &sockets)?;
-            Ok(())
-        },
-    )?;
+        let sockets = enumerate_sockets();
+        let mut response = req.into_ok_response()?;
+        write_json(&mut response, &sockets)?;
+        Ok(())
+    })?;
 
     // GET debug info endpoint (AT commands, PIDs, memory stats, etc.)
     let state_clone = state.clone();
     server.fn_handler(
         "/api/debug_info",
         Method::Get,
-        move |req| -> Result<(), esp_idf_svc::io::EspIOError> {
+        move |req| -> HandlerResult {
             debug!("HTTP: GET /api/debug_info");
 
             let at_commands: Vec<String> = state_clone
@@ -858,41 +827,37 @@ fn register_debug_routes(server: &mut EspHttpServer<'static>, state: &Arc<State>
 
     // POST reboot endpoint
     let state_clone = state.clone();
-    server.fn_handler(
-        "/api/reboot",
-        Method::Post,
-        move |req| -> Result<(), esp_idf_svc::io::EspIOError> {
-            info!("HTTP: POST /api/reboot - Device reboot requested");
+    server.fn_handler("/api/reboot", Method::Post, move |req| -> HandlerResult {
+        info!("HTTP: POST /api/reboot - Device reboot requested");
 
-            req.into_ok_response()?;
+        req.into_ok_response()?;
 
-            // Schedule restart after response is sent
-            let state = state_clone.clone();
-            crate::thread_util::spawn_named(
-                c"restart",
-                4096,
-                crate::thread_util::StackMemory::SpiRam,
-                move || {
-                    std::thread::sleep(std::time::Duration::from_secs(1));
+        // Schedule restart after response is sent
+        let state = state_clone.clone();
+        crate::thread_util::spawn_named(
+            c"restart",
+            4096,
+            crate::thread_util::StackMemory::SpiRam,
+            move || {
+                std::thread::sleep(std::time::Duration::from_secs(1));
 
-                    // Stop WiFi before restarting to ensure clean shutdown
-                    info!("Stopping WiFi before reboot...");
-                    if let Ok(mut wifi) = state.wifi.lock() {
-                        if let Err(e) = wifi.stop() {
-                            warn!("Failed to stop WiFi: {e:?}");
-                        }
+                // Stop WiFi before restarting to ensure clean shutdown
+                info!("Stopping WiFi before reboot...");
+                if let Ok(mut wifi) = state.wifi.lock() {
+                    if let Err(e) = wifi.stop() {
+                        warn!("Failed to stop WiFi: {e:?}");
                     }
+                }
 
-                    info!("Rebooting device now...");
-                    unsafe {
-                        esp_idf_svc::sys::esp_restart();
-                    }
-                },
-            );
+                info!("Rebooting device now...");
+                unsafe {
+                    esp_idf_svc::sys::esp_restart();
+                }
+            },
+        );
 
-            Ok(())
-        },
-    )?;
+        Ok(())
+    })?;
 
     Ok(())
 }
@@ -928,39 +893,35 @@ fn register_captive_portal(
 
     info!("Captive portal enabled for hostname: {hostname}");
 
-    server.fn_handler(
-        "/*",
-        Method::Get,
-        move |req| -> Result<(), esp_idf_svc::io::EspIOError> {
-            // Check Host header
-            let host = req.header("Host").unwrap_or("");
-            let host_lower = host.to_lowercase();
-            // Strip port if present
-            let host_without_port = host_lower.split(':').next().unwrap_or("");
+    server.fn_handler("/*", Method::Get, move |req| -> HandlerResult {
+        // Check Host header
+        let host = req.header("Host").unwrap_or("");
+        let host_lower = host.to_lowercase();
+        // Strip port if present
+        let host_without_port = host_lower.split(':').next().unwrap_or("");
 
-            let is_valid_host = valid_hosts.iter().any(|h| h == host_without_port);
+        let is_valid_host = valid_hosts.iter().any(|h| h == host_without_port);
 
-            if is_valid_host {
-                // Valid host but unknown path - return 404
-                info!("HTTP: GET {} -> 404 (host: {})", req.uri(), host);
-                req.into_status_response(404)?;
-            } else {
-                // Wrong host - redirect to captive portal
-                info!("HTTP: GET {} -> 302 captive (host: {})", req.uri(), host);
-                let mut response = req.into_response(
-                    302,
-                    Some("Found"),
-                    &[
-                        ("Location", &redirect_url),
-                        ("Cache-Control", "no-cache"),
-                        ("Connection", "close"),
-                    ],
-                )?;
-                response.write_all(captive_portal_html.as_bytes())?;
-            }
-            Ok(())
-        },
-    )?;
+        if is_valid_host {
+            // Valid host but unknown path - return 404
+            info!("HTTP: GET {} -> 404 (host: {})", req.uri(), host);
+            req.into_status_response(404)?;
+        } else {
+            // Wrong host - redirect to captive portal
+            info!("HTTP: GET {} -> 302 captive (host: {})", req.uri(), host);
+            let mut response = req.into_response(
+                302,
+                Some("Found"),
+                &[
+                    ("Location", &redirect_url),
+                    ("Cache-Control", "no-cache"),
+                    ("Connection", "close"),
+                ],
+            )?;
+            response.write_all(captive_portal_html.as_bytes())?;
+        }
+        Ok(())
+    })?;
 
     Ok(())
 }
@@ -1015,51 +976,47 @@ fn register_capture_data_routes(
 ) -> Result<()> {
     // GET capture download endpoint — returns header + raw binary capture data
     let state_clone = state.clone();
-    server.fn_handler(
-        "/api/capture",
-        Method::Get,
-        move |req| -> Result<(), esp_idf_svc::io::EspIOError> {
-            info!("HTTP: GET /api/capture");
+    server.fn_handler("/api/capture", Method::Get, move |req| -> HandlerResult {
+        info!("HTTP: GET /api/capture");
 
-            let buf_guard = state_clone.capture_buffer.lock().unwrap();
+        let buf_guard = state_clone.capture_buffer.lock().unwrap();
 
-            if buf_guard.is_empty() {
-                req.into_status_response(204)?;
-                return Ok(());
-            }
+        if buf_guard.is_empty() {
+            req.into_status_response(204)?;
+            return Ok(());
+        }
 
-            // Hot path: capture buffer capped at 6 MB by config validation, fits u32
-            #[allow(clippy::cast_possible_truncation)]
-            let buffer_len = buf_guard.len() as u32;
-            let header = crate::obd2::build_capture_header(&state_clone, buffer_len);
+        // Hot path: capture buffer capped at 6 MB by config validation, fits u32
+        #[allow(clippy::cast_possible_truncation)]
+        let buffer_len = buf_guard.len() as u32;
+        let header = crate::obd2::build_capture_header(&state_clone, buffer_len);
 
-            let total_len = header.len() + buf_guard.len();
-            let content_len = total_len.to_string();
-            let mut response = req.into_response(
-                200,
-                Some("OK"),
-                &[
-                    ("Content-Type", "application/octet-stream"),
-                    (
-                        "Content-Disposition",
-                        "attachment; filename=\"capture.ttcap\"",
-                    ),
-                    ("Content-Length", &content_len),
-                ],
-            )?;
-            response.write_all(&header)?;
-            response.write_all(&buf_guard)?;
+        let total_len = header.len() + buf_guard.len();
+        let content_len = total_len.to_string();
+        let mut response = req.into_response(
+            200,
+            Some("OK"),
+            &[
+                ("Content-Type", "application/octet-stream"),
+                (
+                    "Content-Disposition",
+                    "attachment; filename=\"capture.ttcap\"",
+                ),
+                ("Content-Length", &content_len),
+            ],
+        )?;
+        response.write_all(&header)?;
+        response.write_all(&buf_guard)?;
 
-            Ok(())
-        },
-    )?;
+        Ok(())
+    })?;
 
     // POST capture clear endpoint — clears the capture buffer
     let state_clone = state.clone();
     server.fn_handler(
         "/api/capture/clear",
         Method::Post,
-        move |req| -> Result<(), esp_idf_svc::io::EspIOError> {
+        move |req| -> HandlerResult {
             info!("HTTP: POST /api/capture/clear");
 
             {
@@ -1094,7 +1051,7 @@ fn register_capture_control_routes(
     server.fn_handler(
         "/api/capture/status",
         Method::Get,
-        move |req| -> Result<(), esp_idf_svc::io::EspIOError> {
+        move |req| -> HandlerResult {
             debug!("HTTP: GET /api/capture/status");
 
             let buffer_bytes = u32::try_from(state_clone.capture_buffer.lock().unwrap().len())
@@ -1129,7 +1086,7 @@ fn register_capture_control_routes(
     server.fn_handler(
         "/api/capture/start",
         Method::Post,
-        move |req| -> Result<(), esp_idf_svc::io::EspIOError> {
+        move |req| -> HandlerResult {
             info!("HTTP: POST /api/capture/start");
             state_clone.capture_active.store(true, Ordering::Relaxed);
             req.into_ok_response()?;
@@ -1142,7 +1099,7 @@ fn register_capture_control_routes(
     server.fn_handler(
         "/api/capture/stop",
         Method::Post,
-        move |req| -> Result<(), esp_idf_svc::io::EspIOError> {
+        move |req| -> HandlerResult {
             info!("HTTP: POST /api/capture/stop");
             state_clone.capture_active.store(false, Ordering::Relaxed);
             req.into_ok_response()?;
@@ -1156,24 +1113,20 @@ fn register_capture_control_routes(
 /// Register OTA firmware info and direct-upload routes: `/api/ota/info`, `/api/ota/upload`
 fn register_ota_routes(server: &mut EspHttpServer<'static>, state: &Arc<State>) -> Result<()> {
     // GET firmware info (version + variant)
-    server.fn_handler(
-        "/api/ota/info",
-        Method::Get,
-        move |req| -> Result<(), esp_idf_svc::io::EspIOError> {
-            debug!("HTTP: GET /api/ota/info");
-            let info = crate::ota::firmware_info();
-            let mut response = req.into_ok_response()?;
-            write_json(&mut response, &info)?;
-            Ok(())
-        },
-    )?;
+    server.fn_handler("/api/ota/info", Method::Get, move |req| -> HandlerResult {
+        debug!("HTTP: GET /api/ota/info");
+        let info = crate::ota::firmware_info();
+        let mut response = req.into_ok_response()?;
+        write_json(&mut response, &info)?;
+        Ok(())
+    })?;
 
     // POST firmware binary upload for OTA
     let state_clone = state.clone();
     server.fn_handler(
         "/api/ota/upload",
         Method::Post,
-        move |mut req| -> Result<(), esp_idf_svc::io::EspIOError> {
+        move |mut req| -> HandlerResult {
             info!("HTTP: POST /api/ota/upload");
 
             let content_length: usize = req
@@ -1191,9 +1144,7 @@ fn register_ota_routes(server: &mut EspHttpServer<'static>, state: &Arc<State>) 
 
             let result = crate::ota::perform_ota(
                 |buf| {
-                    let n = req
-                        .read(buf)
-                        .map_err(|e| anyhow::anyhow!("read error: {e}"))?;
+                    let n = req.read(buf)?;
                     Ok(n)
                 },
                 content_length,
@@ -1234,7 +1185,7 @@ fn register_ota_download_routes(
     server.fn_handler(
         "/api/ota/download",
         Method::Post,
-        move |mut req| -> Result<(), esp_idf_svc::io::EspIOError> {
+        move |mut req| -> HandlerResult {
             info!("HTTP: POST /api/ota/download");
 
             // Reject if OTA already in progress
@@ -1268,9 +1219,7 @@ fn register_ota_download_routes(
             let body_str = core::str::from_utf8(&body[..total]).unwrap_or("");
             let parsed: OtaDownloadRequest<'_> = serde_json::from_str(body_str).map_err(|e| {
                 warn!("OTA download: invalid JSON: {e}");
-                esp_idf_svc::io::EspIOError::from(esp_idf_svc::sys::EspError::from_infallible::<
-                    { esp_idf_svc::sys::ESP_ERR_INVALID_ARG },
-                >())
+                EspIOError::from(EspError::from_infallible::<{ ESP_ERR_INVALID_ARG }>())
             })?;
 
             let url = parsed.url.to_owned();
@@ -1332,7 +1281,7 @@ fn register_ota_status_route(
     server.fn_handler(
         "/api/ota/status",
         Method::Get,
-        move |req| -> Result<(), esp_idf_svc::io::EspIOError> {
+        move |req| -> HandlerResult {
             let status = state_clone
                 .ota_status
                 .load(std::sync::atomic::Ordering::Relaxed);

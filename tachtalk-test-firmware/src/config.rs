@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Result};
+use crate::error::{Error, Result};
 use esp_idf_svc::nvs::{EspNvs, EspNvsPartition, NvsDefault};
 use esp_idf_svc::sys::{esp_mac_type_t_ESP_MAC_WIFI_STA, esp_read_mac};
 use log::{debug, info, warn, LevelFilter};
@@ -492,9 +492,7 @@ impl Config {
     pub fn load() -> Result<Self> {
         debug!("Loading config from NVS");
         let nvs_guard = NVS.lock().unwrap();
-        let nvs = nvs_guard
-            .as_ref()
-            .ok_or_else(|| anyhow!("NVS not initialized"))?;
+        let nvs = nvs_guard.as_ref().ok_or(Error::NvsNotInitialized)?;
 
         // Get the blob length first
         let len = nvs.blob_len(NVS_CONFIG_KEY)?;
@@ -509,16 +507,14 @@ impl Config {
             );
             Ok(config)
         } else {
-            Err(anyhow!("No config found in NVS"))
+            Err(Error::NvsConfigNotFound)
         }
     }
 
     pub fn save(&self) -> Result<()> {
         debug!("Saving config to NVS");
         let mut nvs_guard = NVS.lock().unwrap();
-        let nvs = nvs_guard
-            .as_mut()
-            .ok_or_else(|| anyhow!("NVS not initialized"))?;
+        let nvs = nvs_guard.as_mut().ok_or(Error::NvsNotInitialized)?;
 
         let json = serde_json::to_vec(self)?;
         debug!("Config JSON size: {} bytes", json.len());

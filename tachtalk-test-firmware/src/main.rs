@@ -1,4 +1,4 @@
-use anyhow::Result;
+use crate::error::Result;
 use esp_idf_hal::delay::FreeRtos;
 use esp_idf_hal::prelude::*;
 use esp_idf_svc::eventloop::EspSystemEventLoop;
@@ -25,6 +25,7 @@ use std::sync::{Arc, Mutex};
 mod config;
 mod cpu_metrics;
 mod dns;
+mod error;
 mod obd2;
 mod ota;
 mod sse_server;
@@ -168,7 +169,7 @@ fn create_sta_netif(config: &Config) -> Result<EspNetif> {
             .ip
             .ip
             .parse()
-            .map_err(|_| anyhow::anyhow!("Invalid static IP: {}", config.ip.ip))?;
+            .map_err(|_| crate::error::Error::InvalidStaticIp(config.ip.ip.clone()))?;
         let mask = config.ip.prefix_len;
 
         info!("STA netif: Static IP {ip}/{mask} (no gateway)");
