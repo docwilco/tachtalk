@@ -11,6 +11,8 @@
         "ESP_IDF_VERSION": "v5.3",
         "MCU": "esp32s3",
         "ESP_IDF_SYS_ROOT_CRATE": "tachtalk-firmware",
-        "ESP_IDF_SDKCONFIG_DEFAULTS": "/home/drwilco/tachtalk/tachtalk-firmware/sdkconfig.defaults"
+        "ESP_IDF_SDKCONFIG_DEFAULTS": "/home/drwilco/tachtalk/tachtalk-firmware/sdkconfig.defaults",
+        "ESP_IDF_GLOB_0_BASE": "/home/drwilco/tachtalk/tachtalk-firmware",
+        "ESP_IDF_GLOB_0_0": "partitions.csv"
     }
 }
