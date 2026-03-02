@@ -1,17 +1,19 @@
 # TODO
 
 ## Web Server
-- [ ] Handle larger HTTP requests in a streaming manner (currently limited to 8KB buffer)
+- [x] Handle larger HTTP requests in config POST endpoints in a streaming manner (currently limited to 8KB buffer in main firmware, 4KB in test firmware). OTA upload already streams correctly.
 
 ## Features
-- [ ] Multi-zone LED support / patterns
-- [ ] Alternative display modes (progress bar, etc.)
-- [ ] Support for additional OBD2 parameters (coolant temp, speed, etc.)
-- [ ] Over-the-air (OTA) updates
-- [ ] Data logging capability
+- [x] Multi-zone LED support / patterns
+- [x] Alternative display modes (progress bar, etc.)
+- [x] Support for additional OBD2 parameters (coolant temp, speed, etc.)
+- [x] Over-the-air (OTA) updates
+- [x] Data logging capability
 - [ ] Bluetooth configuration option
+- [ ] Port capture dissection display from test firmware to main firmware Web UI (main firmware has capture status/controls but not record-level content viewing)
 
 ## OBD2 Proxy
+- [ ] Pipelined dongle queries — port pipelining strategy from test firmware Mode 4 to the main firmware's dongle task for higher query throughput
 - [ ] Properly parse client commands into mode, PIDs, and optional response count — currently `wire_command_to_pid` only extracts the first PID and ignores both multi-PID requests (e.g., `010C0D05`) and the trailing response count hint (e.g., `010C 2`). Needs a `ParsedClientCommand { mode, pids, max_responses }` struct so that: (a) multi-PID requests return combined responses, (b) response count limits how many ECU lines are returned, (c) `normalize_obd_command` produces correct cache keys.
 - [ ] Store ECU CAN IDs with cached responses (currently `CachedResponse` is `SmallVec<[PidData; 1]>` — data only, ECU IDs are parsed transiently for learning but discarded before caching)
 - [ ] Support client-side framing (ATH1/ATH0) — currently `format_cached_for_client` always emits bare `41{PID}{DATA}` without CAN headers, regardless of client ATH state. Requires ECU ID storage first.
@@ -25,7 +27,7 @@
 - [ ] Upgrade to ESP-IDF 5.4
 - [ ] Switch PCNT encoder to event-based using `add_watch_step()` (requires ESP-IDF 5.4)
 - [ ] Investigate moving more allocations to PSRAM (N16R8 has 8MB). Currently only the capture buffer in test firmware is large enough to auto-place in PSRAM (`CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=4096`). Consider web server request buffers, JSON serialization buffers, WiFi scan results, etc.
-- [ ] Use deku crate (or similar) for binary capture file encoding/decoding
+- [x] Use deku crate (or similar) for binary capture file encoding/decoding
 
 ## Test Firmware (`tachtalk-test-firmware`)
 
@@ -61,7 +63,7 @@ Stripped-down firmware for benchmarking OBD2 query strategies.
 - [x] **Web server**: Test start/stop/status endpoints, config CRUD, WiFi scan
 - [x] **Capture file header**: Generate 64-byte header (magic `TachTalk`, version, record count, etc.)
 - [x] **Capture endpoints**: `GET /capture` (download binary), `POST /capture/clear`, `GET /capture/status`
-- [ ] **Decode capture file**: Binary crate to print human-readable summary of capture contents (timestamps, types, data)
+- [x] **Decode capture file**: Binary crate to print human-readable summary of capture contents (timestamps, types, data)
 - [ ] **On-device testing**: Flash and validate against real OBD2 dongle
 
 ### Capture File Header (64 bytes)

@@ -4,6 +4,7 @@ use embedded_svc::io::Write;
 use esp_idf_svc::http::server::{Configuration, EspHttpServer};
 use log::{debug, error, info, warn};
 use std::collections::HashMap;
+use std::io::Read as _;
 use std::net::Ipv4Addr;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -39,6 +40,73 @@ const CONFIG_LWIP_MAX_SOCKETS: i32 = esp_idf_svc::sys::CONFIG_LWIP_MAX_SOCKETS a
 const SIZE_OF_I32: u32 = std::mem::size_of::<i32>() as u32;
 #[allow(clippy::cast_possible_truncation)]
 const SIZE_OF_SOCKADDR_IN: u32 = std::mem::size_of::<sockaddr_in>() as u32;
+
+/// Maximum config request body size (16 KB).
+const MAX_CONFIG_BODY_SIZE: u64 = 16384;
+
+/// Adapter that wraps an `embedded_io::Read` as a `std::io::Read`.
+///
+/// Allows passing ESP-IDF HTTP request readers to APIs that expect
+/// `std::io::Read`, such as `serde_json::from_reader`.
+struct StdRead<R>(R);
+
+impl<R: embedded_svc::io::Read> std::io::Read for StdRead<R>
+where
+    R::Error: std::error::Error + Send + Sync + 'static,
+{
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.0.read(buf).map_err(std::io::Error::other)
+    }
+}
+
+/// Adapter that wraps an `embedded_io::Write` as a `std::io::Write`.
+///
+/// Allows passing ESP-IDF HTTP response writers to APIs that expect
+/// `std::io::Write`, such as `serde_json::to_writer`.
+struct StdWrite<W>(W);
+
+impl<W: embedded_svc::io::Write> std::io::Write for StdWrite<W>
+where
+    W::Error: std::error::Error + Send + Sync + 'static,
+{
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.write(buf).map_err(std::io::Error::other)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.0.flush().map_err(std::io::Error::other)
+    }
+}
+
+/// Serialize `value` as JSON directly into an `embedded_io::Write` writer.
+///
+/// Avoids the intermediate `String` allocation of `serde_json::to_string`.
+/// Recovers the original write error from the `serde_json` error chain.
+fn write_json<W: embedded_svc::io::Write>(
+    writer: &mut W,
+    value: &impl serde::Serialize,
+) -> Result<(), esp_idf_svc::io::EspIOError>
+where
+    W::Error: std::error::Error + Send + Sync + 'static,
+{
+    // For IO errors, From<serde_json::Error> for io::Error recovers the
+    // original io::Error, which wraps our EspIOError via Error::other.
+    serde_json::to_writer(StdWrite(writer), value).map_err(|e| {
+        std::io::Error::from(e)
+            .into_inner()
+            .and_then(|inner| inner.downcast::<esp_idf_svc::io::EspIOError>().ok())
+            .map_or_else(
+                || {
+                    esp_idf_svc::io::EspIOError::from(
+                        esp_idf_svc::sys::EspError::from_infallible::<
+                            { esp_idf_svc::sys::ESP_FAIL },
+                        >(),
+                    )
+                },
+                |boxed| *boxed,
+            )
+    })
+}
 
 /// Check if a config change would require a device restart
 /// Returns (GPIOs to reset before restart, `needs_restart`)
@@ -331,10 +399,8 @@ fn register_get_config(server: &mut EspHttpServer<'static>, state: &Arc<State>) 
         move |req| -> Result<(), esp_idf_svc::io::EspIOError> {
             info!("HTTP: GET /api/config");
             let cfg = state_clone.config.lock().unwrap();
-            let json = serde_json::to_string(&*cfg).unwrap();
-
             let mut response = req.into_ok_response()?;
-            response.write_all(json.as_bytes())?;
+            write_json(&mut response, &*cfg)?;
             Ok(())
         },
     )?;
@@ -348,10 +414,8 @@ fn register_get_default_config(server: &mut EspHttpServer<'static>) -> Result<()
         |req| -> Result<(), esp_idf_svc::io::EspIOError> {
             info!("HTTP: GET /api/config/default");
             let default_config = crate::config::Config::default();
-            let json = serde_json::to_string(&default_config).unwrap();
-
             let mut response = req.into_ok_response()?;
-            response.write_all(json.as_bytes())?;
+            write_json(&mut response, &default_config)?;
             Ok(())
         },
     )?;
@@ -368,11 +432,9 @@ fn register_post_config_check(
         Method::Post,
         move |mut req| -> Result<(), esp_idf_svc::io::EspIOError> {
             debug!("HTTP: POST /api/config/check");
-            let mut buf = vec![0u8; 8192];
-            let bytes_read = req.read(&mut buf)?;
+            let reader = StdRead(&mut req).take(MAX_CONFIG_BODY_SIZE);
 
-            if let Ok(mut new_config) =
-                serde_json::from_slice::<crate::config::Config>(&buf[..bytes_read])
+            if let Ok(mut new_config) = serde_json::from_reader::<_, crate::config::Config>(reader)
             {
                 new_config.validate();
                 let (_, needs_restart) = {
@@ -403,11 +465,9 @@ fn register_post_config(server: &mut EspHttpServer<'static>, state: &Arc<State>)
         Method::Post,
         move |mut req| -> Result<(), esp_idf_svc::io::EspIOError> {
             info!("HTTP: POST /api/config");
-            let mut buf = vec![0u8; 8192];
-            let bytes_read = req.read(&mut buf)?;
+            let reader = StdRead(&mut req).take(MAX_CONFIG_BODY_SIZE);
 
-            if let Ok(mut new_config) =
-                serde_json::from_slice::<crate::config::Config>(&buf[..bytes_read])
+            if let Ok(mut new_config) = serde_json::from_reader::<_, crate::config::Config>(reader)
             {
                 // Validate/clamp values to safe ranges
                 new_config.validate();
@@ -555,10 +615,8 @@ fn register_network_routes(server: &mut EspHttpServer<'static>, state: &Arc<Stat
                 }
             };
 
-            let json = serde_json::to_string(&networks).unwrap_or_else(|_| "[]".to_string());
-
             let mut response = req.into_ok_response()?;
-            response.write_all(json.as_bytes())?;
+            write_json(&mut response, &networks)?;
             Ok(())
         },
     )?;
@@ -612,10 +670,8 @@ fn register_network_routes(server: &mut EspHttpServer<'static>, state: &Arc<Stat
                 rssi,
             };
 
-            let json = serde_json::to_string(&status).unwrap_or_else(|_| "{}".to_string());
-
             let mut response = req.into_ok_response()?;
-            response.write_all(json.as_bytes())?;
+            write_json(&mut response, &status)?;
             Ok(())
         },
     )?;
@@ -648,10 +704,8 @@ fn register_status_routes(server: &mut EspHttpServer<'static>, state: &Arc<State
                 obd2_client_count,
             };
 
-            let json = serde_json::to_string(&status).unwrap_or_else(|_| "{}".to_string());
-
             let mut response = req.into_ok_response()?;
-            response.write_all(json.as_bytes())?;
+            write_json(&mut response, &status)?;
             Ok(())
         },
     )?;
@@ -685,10 +739,8 @@ fn register_status_routes(server: &mut EspHttpServer<'static>, state: &Arc<State
                 .collect();
 
             let status = TcpStatus { dongle, clients };
-            let json = serde_json::to_string(&status).unwrap_or_else(|_| "{}".to_string());
-
             let mut response = req.into_ok_response()?;
-            response.write_all(json.as_bytes())?;
+            write_json(&mut response, &status)?;
             Ok(())
         },
     )?;
@@ -730,10 +782,8 @@ fn register_status_routes(server: &mut EspHttpServer<'static>, state: &Arc<State
                 dongle_requests_per_sec: metrics.dongle_requests_per_sec.load(Ordering::Relaxed),
             };
 
-            let json = serde_json::to_string(&response_data)
-                .unwrap_or_else(|_| r#"{"error":"serialization failed"}"#.to_string());
             let mut response = req.into_ok_response()?;
-            response.write_all(json.as_bytes())?;
+            write_json(&mut response, &response_data)?;
             Ok(())
         },
     )?;
@@ -751,10 +801,8 @@ fn register_debug_routes(server: &mut EspHttpServer<'static>, state: &Arc<State>
             debug!("HTTP: GET /api/sockets");
 
             let sockets = enumerate_sockets();
-            let json = serde_json::to_string(&sockets).unwrap_or_else(|_| "[]".to_string());
-
             let mut response = req.into_ok_response()?;
-            response.write_all(json.as_bytes())?;
+            write_json(&mut response, &sockets)?;
             Ok(())
         },
     )?;
@@ -788,14 +836,10 @@ fn register_debug_routes(server: &mut EspHttpServer<'static>, state: &Arc<State>
                 .unwrap_or_default();
 
             // SAFETY: These are simple C functions that return a usize
-            let internal_free =
-                unsafe { heap_caps_get_free_size(MALLOC_CAP_INTERNAL) };
-            let internal_min_free =
-                unsafe { heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL) };
-            let spiram_free =
-                unsafe { heap_caps_get_free_size(MALLOC_CAP_SPIRAM) };
-            let spiram_min_free =
-                unsafe { heap_caps_get_minimum_free_size(MALLOC_CAP_SPIRAM) };
+            let internal_free = unsafe { heap_caps_get_free_size(MALLOC_CAP_INTERNAL) };
+            let internal_min_free = unsafe { heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL) };
+            let spiram_free = unsafe { heap_caps_get_free_size(MALLOC_CAP_SPIRAM) };
+            let spiram_min_free = unsafe { heap_caps_get_minimum_free_size(MALLOC_CAP_SPIRAM) };
 
             let info = DebugInfo {
                 at_commands,
@@ -806,12 +850,8 @@ fn register_debug_routes(server: &mut EspHttpServer<'static>, state: &Arc<State>
                 spiram_min_free,
             };
 
-            let json = serde_json::to_string(&info).unwrap_or_else(|_| {
-                r#"{"at_commands":[],"internal_free":0,"internal_min_free":0,"spiram_free":0,"spiram_min_free":0}"#.to_string()
-            });
-
             let mut response = req.into_ok_response()?;
-            response.write_all(json.as_bytes())?;
+            write_json(&mut response, &info)?;
             Ok(())
         },
     )?;
@@ -1078,9 +1118,8 @@ fn register_capture_control_routes(
                 capture_active,
             };
 
-            let json = serde_json::to_string(&status).unwrap_or_else(|_| "{}".to_string());
             let mut response = req.into_ok_response()?;
-            response.write_all(json.as_bytes())?;
+            write_json(&mut response, &status)?;
             Ok(())
         },
     )?;
@@ -1123,9 +1162,8 @@ fn register_ota_routes(server: &mut EspHttpServer<'static>, state: &Arc<State>) 
         move |req| -> Result<(), esp_idf_svc::io::EspIOError> {
             debug!("HTTP: GET /api/ota/info");
             let info = crate::ota::firmware_info();
-            let json = serde_json::to_string(&info).unwrap_or_default();
             let mut response = req.into_ok_response()?;
-            response.write_all(json.as_bytes())?;
+            write_json(&mut response, &info)?;
             Ok(())
         },
     )?;
