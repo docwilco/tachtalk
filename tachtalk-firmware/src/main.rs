@@ -15,6 +15,7 @@ use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
+mod auth;
 mod config;
 mod controls;
 mod cpu_metrics;
@@ -125,6 +126,8 @@ pub struct State {
     pub capture_buffer: Mutex<Vec<u8>>,
     /// Runtime capture toggle (independent of config, toggled via API)
     pub capture_active: AtomicBool,
+    /// Session store for web authentication
+    pub sessions: auth::SessionStore,
 }
 
 impl State {
@@ -161,6 +164,7 @@ impl State {
             ota_error: Mutex::default(),
             capture_buffer: Mutex::default(),
             capture_active: AtomicBool::new(capture_enabled),
+            sessions: auth::SessionStore::default(),
         }
     }
 }

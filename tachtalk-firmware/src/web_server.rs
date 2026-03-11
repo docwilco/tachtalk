@@ -1,3 +1,4 @@
+use crate::auth;
 use crate::error::Result;
 use embedded_svc::http::Method;
 use embedded_svc::io::Write;
@@ -389,6 +390,223 @@ struct PollingMetricsResponse {
 const HTML_INDEX_START: &str = include_str!(concat!(env!("OUT_DIR"), "/index_start.html"));
 const HTML_INDEX_END: &str = include_str!(concat!(env!("OUT_DIR"), "/index_end.html"));
 
+/// Check if the request is authenticated.
+///
+/// Returns `true` if no admin password is configured (open access) or if the
+/// request carries a valid session cookie.
+fn is_authenticated(cookie_header: Option<&str>, state: &State) -> bool {
+    let cfg = state.config.lock().unwrap();
+    if cfg.admin_password_hash.is_none() {
+        return true;
+    }
+    drop(cfg);
+
+    if let Some(cookie) = cookie_header {
+        if let Some(token) = auth::extract_session_token(cookie) {
+            return state.sessions.contains(&token);
+        }
+    }
+    false
+}
+
+/// Send a 401 Unauthorized JSON response. Returns `Ok(())` so callers can
+/// use `return respond_unauthorized(req)` to bail out early.
+fn respond_unauthorized(
+    req: esp_idf_svc::http::server::Request<&mut esp_idf_svc::http::server::EspHttpConnection>,
+) -> HandlerResult {
+    let mut response = req.into_response(
+        401,
+        Some("Unauthorized"),
+        &[("Content-Type", "application/json")],
+    )?;
+    response.write_all(b"{\"error\":\"unauthorized\"}")?;
+    Ok(())
+}
+
+/// Register authentication routes
+fn register_auth_routes(server: &mut EspHttpServer<'static>, state: &Arc<State>) -> Result<()> {
+    register_auth_status(server, state)?;
+    register_auth_login(server, state)?;
+    register_auth_logout(server, state)?;
+    register_auth_set_password(server, state)?;
+    Ok(())
+}
+
+/// GET /api/auth/status — public, returns whether auth is required and current state
+fn register_auth_status(server: &mut EspHttpServer<'static>, state: &Arc<State>) -> Result<()> {
+    let state_clone = state.clone();
+    server.fn_handler(
+        "/api/auth/status",
+        Method::Get,
+        move |req| -> HandlerResult {
+            debug!("HTTP: GET /api/auth/status");
+            let password_set = state_clone
+                .config
+                .lock()
+                .unwrap()
+                .admin_password_hash
+                .is_some();
+            let authenticated = is_authenticated(req.header("Cookie"), &state_clone);
+            let mut response = req.into_ok_response()?;
+            let body =
+                format!("{{\"password_set\":{password_set},\"authenticated\":{authenticated}}}");
+            response.write_all(body.as_bytes())?;
+            Ok(())
+        },
+    )?;
+    Ok(())
+}
+
+/// JSON body for login and set-password requests
+#[derive(serde::Deserialize)]
+struct PasswordRequest {
+    password: String,
+}
+
+/// POST /api/auth/login — verify password, issue session cookie
+fn register_auth_login(server: &mut EspHttpServer<'static>, state: &Arc<State>) -> Result<()> {
+    let state_clone = state.clone();
+    server.fn_handler(
+        "/api/auth/login",
+        Method::Post,
+        move |mut req| -> HandlerResult {
+            info!("HTTP: POST /api/auth/login");
+            let reader = StdRead(&mut req).take(MAX_CONFIG_BODY_SIZE);
+            let Ok(body) = serde_json::from_reader::<_, PasswordRequest>(reader) else {
+                warn!("Invalid login JSON");
+                req.into_status_response(400)?;
+                return Ok(());
+            };
+
+            let cfg = state_clone.config.lock().unwrap();
+            let Some(ref stored_hash) = cfg.admin_password_hash else {
+                // No password set — nothing to log in to
+                req.into_status_response(400)?;
+                return Ok(());
+            };
+
+            if !auth::verify_password(&body.password, stored_hash) {
+                warn!("Failed login attempt");
+                let mut response = req.into_response(
+                    401,
+                    Some("Unauthorized"),
+                    &[("Content-Type", "application/json")],
+                )?;
+                response.write_all(b"{\"error\":\"invalid_password\"}")?;
+                return Ok(());
+            }
+            drop(cfg);
+
+            let token = auth::generate_session_token();
+            state_clone.sessions.insert(token);
+            let cookie = auth::session_cookie(&token);
+
+            let mut response = req.into_response(
+                200,
+                Some("OK"),
+                &[
+                    ("Content-Type", "application/json"),
+                    ("Set-Cookie", &cookie),
+                ],
+            )?;
+            response.write_all(b"{\"authenticated\":true}")?;
+            Ok(())
+        },
+    )?;
+    Ok(())
+}
+
+/// POST /api/auth/logout — clear session
+fn register_auth_logout(server: &mut EspHttpServer<'static>, state: &Arc<State>) -> Result<()> {
+    let state_clone = state.clone();
+    server.fn_handler(
+        "/api/auth/logout",
+        Method::Post,
+        move |req| -> HandlerResult {
+            info!("HTTP: POST /api/auth/logout");
+            if let Some(cookie) = req.header("Cookie") {
+                if let Some(token) = auth::extract_session_token(cookie) {
+                    state_clone.sessions.remove(&token);
+                }
+            }
+            let clear = auth::clear_session_cookie();
+            let mut response = req.into_response(
+                200,
+                Some("OK"),
+                &[("Content-Type", "application/json"), ("Set-Cookie", &clear)],
+            )?;
+            response.write_all(b"{\"authenticated\":false}")?;
+            Ok(())
+        },
+    )?;
+    Ok(())
+}
+
+/// POST /api/auth/set-password — set or change the admin password (admin-only)
+fn register_auth_set_password(
+    server: &mut EspHttpServer<'static>,
+    state: &Arc<State>,
+) -> Result<()> {
+    let state_clone = state.clone();
+    server.fn_handler(
+        "/api/auth/set-password",
+        Method::Post,
+        move |mut req| -> HandlerResult {
+            info!("HTTP: POST /api/auth/set-password");
+            if !is_authenticated(req.header("Cookie"), &state_clone) {
+                return respond_unauthorized(req);
+            }
+
+            let reader = StdRead(&mut req).take(MAX_CONFIG_BODY_SIZE);
+            let Ok(body) = serde_json::from_reader::<_, PasswordRequest>(reader) else {
+                warn!("Invalid set-password JSON");
+                req.into_status_response(400)?;
+                return Ok(());
+            };
+
+            if body.password.is_empty() {
+                // Clear the password (disable auth)
+                let mut cfg = state_clone.config.lock().unwrap();
+                cfg.admin_password_hash = None;
+                if let Err(e) = cfg.save() {
+                    warn!("Failed to save config after clearing password: {e}");
+                }
+                drop(cfg);
+                // Invalidate all sessions since auth is now disabled
+                state_clone.sessions.clear();
+                req.into_ok_response()?;
+                return Ok(());
+            }
+
+            let hash = match auth::hash_password(&body.password) {
+                Ok(h) => h,
+                Err(e) => {
+                    warn!("Password hashing failed: {e}");
+                    req.into_status_response(500)?;
+                    return Ok(());
+                }
+            };
+
+            {
+                let mut cfg = state_clone.config.lock().unwrap();
+                cfg.admin_password_hash = Some(hash);
+                if let Err(e) = cfg.save() {
+                    warn!("Failed to save config after setting password: {e}");
+                }
+            }
+
+            // Issue a new session for the user who just set the password
+            let token = auth::generate_session_token();
+            state_clone.sessions.insert(token);
+            let cookie = auth::session_cookie(&token);
+
+            req.into_response(200, Some("OK"), &[("Set-Cookie", &cookie)])?;
+            Ok(())
+        },
+    )?;
+    Ok(())
+}
+
 /// Register configuration-related routes (GET/POST config, brightness)
 fn register_config_routes(server: &mut EspHttpServer<'static>, state: &Arc<State>) -> Result<()> {
     register_index_page(server)?;
@@ -415,9 +633,26 @@ fn register_get_config(server: &mut EspHttpServer<'static>, state: &Arc<State>) 
     let state_clone = state.clone();
     server.fn_handler("/api/config", Method::Get, move |req| -> HandlerResult {
         info!("HTTP: GET /api/config");
+        let authenticated = is_authenticated(req.header("Cookie"), &state_clone);
         let cfg = state_clone.config.lock().unwrap();
         let mut response = req.into_ok_response()?;
-        write_json(&mut response, &*cfg)?;
+        if authenticated {
+            // Authenticated: send full config, but always strip the password hash
+            let mut redacted = cfg.clone();
+            redacted.admin_password_hash = None;
+            write_json(&mut response, &redacted)?;
+        } else {
+            // Unauthenticated: also redact WiFi and AP passwords
+            let mut redacted = cfg.clone();
+            redacted.admin_password_hash = None;
+            if redacted.wifi.password.is_some() {
+                redacted.wifi.password = Some("********".into());
+            }
+            if redacted.ap_password.is_some() {
+                redacted.ap_password = Some("********".into());
+            }
+            write_json(&mut response, &redacted)?;
+        }
         Ok(())
     })?;
     Ok(())
@@ -444,6 +679,9 @@ fn register_post_config_check(
         Method::Post,
         move |mut req| -> HandlerResult {
             debug!("HTTP: POST /api/config/check");
+            if !is_authenticated(req.header("Cookie"), &state_clone) {
+                return respond_unauthorized(req);
+            }
             let reader = StdRead(&mut req).take(MAX_CONFIG_BODY_SIZE);
 
             if let Ok(mut new_config) = serde_json::from_reader::<_, crate::config::Config>(reader)
@@ -477,6 +715,9 @@ fn register_post_config(server: &mut EspHttpServer<'static>, state: &Arc<State>)
         Method::Post,
         move |mut req| -> HandlerResult {
             info!("HTTP: POST /api/config");
+            if !is_authenticated(req.header("Cookie"), &state_clone) {
+                return respond_unauthorized(req);
+            }
             let reader = StdRead(&mut req).take(MAX_CONFIG_BODY_SIZE);
 
             if let Ok(mut new_config) = serde_json::from_reader::<_, crate::config::Config>(reader)
@@ -550,6 +791,9 @@ fn register_post_brightness(server: &mut EspHttpServer<'static>, state: &Arc<Sta
         Method::Post,
         move |mut req| -> HandlerResult {
             debug!("HTTP: POST /api/brightness");
+            if !is_authenticated(req.header("Cookie"), &state_clone) {
+                return respond_unauthorized(req);
+            }
             let reader = StdRead(&mut req);
 
             if let Ok(brightness_req) = serde_json::from_reader::<_, BrightnessRequest>(reader) {
@@ -780,8 +1024,12 @@ fn register_status_routes(server: &mut EspHttpServer<'static>, state: &Arc<State
 /// Register debug and system routes (sockets, debug info, reboot)
 fn register_debug_routes(server: &mut EspHttpServer<'static>, state: &Arc<State>) -> Result<()> {
     // GET all open sockets endpoint (for debugging FD exhaustion)
+    let state_clone = state.clone();
     server.fn_handler("/api/sockets", Method::Get, move |req| -> HandlerResult {
         debug!("HTTP: GET /api/sockets");
+        if !is_authenticated(req.header("Cookie"), &state_clone) {
+            return respond_unauthorized(req);
+        }
 
         let sockets = enumerate_sockets();
         let mut response = req.into_ok_response()?;
@@ -796,6 +1044,9 @@ fn register_debug_routes(server: &mut EspHttpServer<'static>, state: &Arc<State>
         Method::Get,
         move |req| -> HandlerResult {
             debug!("HTTP: GET /api/debug_info");
+            if !is_authenticated(req.header("Cookie"), &state_clone) {
+                return respond_unauthorized(req);
+            }
 
             let at_commands: Vec<String> = state_clone
                 .at_command_log
@@ -842,6 +1093,9 @@ fn register_debug_routes(server: &mut EspHttpServer<'static>, state: &Arc<State>
     let state_clone = state.clone();
     server.fn_handler("/api/reboot", Method::Post, move |req| -> HandlerResult {
         info!("HTTP: POST /api/reboot - Device reboot requested");
+        if !is_authenticated(req.header("Cookie"), &state_clone) {
+            return respond_unauthorized(req);
+        }
 
         req.into_ok_response()?;
 
@@ -991,6 +1245,9 @@ fn register_capture_data_routes(
     let state_clone = state.clone();
     server.fn_handler("/api/capture", Method::Get, move |req| -> HandlerResult {
         info!("HTTP: GET /api/capture");
+        if !is_authenticated(req.header("Cookie"), &state_clone) {
+            return respond_unauthorized(req);
+        }
 
         let buf_guard = state_clone.capture_buffer.lock().unwrap();
 
@@ -1031,6 +1288,9 @@ fn register_capture_data_routes(
         Method::Post,
         move |req| -> HandlerResult {
             info!("HTTP: POST /api/capture/clear");
+            if !is_authenticated(req.header("Cookie"), &state_clone) {
+                return respond_unauthorized(req);
+            }
 
             {
                 let mut buf_guard = state_clone.capture_buffer.lock().unwrap();
@@ -1101,6 +1361,9 @@ fn register_capture_control_routes(
         Method::Post,
         move |req| -> HandlerResult {
             info!("HTTP: POST /api/capture/start");
+            if !is_authenticated(req.header("Cookie"), &state_clone) {
+                return respond_unauthorized(req);
+            }
             state_clone.capture_active.store(true, Ordering::Relaxed);
             req.into_ok_response()?;
             Ok(())
@@ -1114,6 +1377,9 @@ fn register_capture_control_routes(
         Method::Post,
         move |req| -> HandlerResult {
             info!("HTTP: POST /api/capture/stop");
+            if !is_authenticated(req.header("Cookie"), &state_clone) {
+                return respond_unauthorized(req);
+            }
             state_clone.capture_active.store(false, Ordering::Relaxed);
             req.into_ok_response()?;
             Ok(())
@@ -1141,6 +1407,9 @@ fn register_ota_routes(server: &mut EspHttpServer<'static>, state: &Arc<State>) 
         Method::Post,
         move |mut req| -> HandlerResult {
             info!("HTTP: POST /api/ota/upload");
+            if !is_authenticated(req.header("Cookie"), &state_clone) {
+                return respond_unauthorized(req);
+            }
 
             let content_length: usize = req
                 .header("Content-Length")
@@ -1200,6 +1469,9 @@ fn register_ota_download_routes(
         Method::Post,
         move |mut req| -> HandlerResult {
             info!("HTTP: POST /api/ota/download");
+            if !is_authenticated(req.header("Cookie"), &state_clone) {
+                return respond_unauthorized(req);
+            }
 
             // Reject if OTA already in progress
             let current = state_clone.ota_status.load(Ordering::Relaxed);
@@ -1326,6 +1598,7 @@ pub fn start_server(
     };
     let mut server = EspHttpServer::new(&server_config)?;
 
+    register_auth_routes(&mut server, state)?;
     register_config_routes(&mut server, state)?;
     register_network_routes(&mut server, state)?;
     register_status_routes(&mut server, state)?;

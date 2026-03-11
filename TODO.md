@@ -3,6 +3,9 @@
 ## Web Server
 - [x] Handle larger HTTP requests in config POST endpoints in a streaming manner (currently limited to 8KB buffer in main firmware, 4KB in test firmware). OTA upload already streams correctly.
 
+## Security
+- [ ] Review session management — current `SessionStore` uses in-memory `Vec<[u8; 16]>` with FIFO eviction (max 5). Consider: session expiry/TTL, binding sessions to client IP, clearing all sessions on password change, and whether `MAX_SESSIONS=5` is appropriate for the use case.
+
 ## Features
 - [x] Multi-zone LED support / patterns
 - [x] Alternative display modes (progress bar, etc.)

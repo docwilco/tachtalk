@@ -461,6 +461,10 @@ pub struct Config {
     /// Turn off RGB LEDs after this many ms without an RPM update (0 = disabled)
     #[serde(default = "default_rpm_stale_timeout_ms")]
     pub rpm_stale_timeout_ms: u16,
+    /// PBKDF2-HMAC-SHA256 hash of the admin password (`iterations:salt_hex:hash_hex`)
+    /// When `None`, the device is unlocked — all endpoints are accessible without auth.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admin_password_hash: Option<String>,
 }
 
 const fn default_led_gpio() -> u8 {
@@ -680,6 +684,7 @@ impl Default for Config {
             status_led_green_pin: default_status_led_green_pin(),
             status_led_flicker_ms: default_status_led_flicker_ms(),
             rpm_stale_timeout_ms: default_rpm_stale_timeout_ms(),
+            admin_password_hash: None,
         }
     }
 }
