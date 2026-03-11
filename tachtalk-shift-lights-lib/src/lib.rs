@@ -30,13 +30,13 @@ pub struct LedRule {
     pub end_led: usize,
     /// Colors for the LEDs - multiple colors create a gradient
     #[serde(default = "default_colors")]
-    pub colors: SmallVec<[RGB8; MAX_INLINE_COLORS]>,
+    pub colors: SmallVec<RGB8, MAX_INLINE_COLORS>,
     pub blink: bool,
     #[serde(default = "default_blink_ms")]
     pub blink_ms: u32,
 }
 
-fn default_colors() -> SmallVec<[RGB8; MAX_INLINE_COLORS]> {
+fn default_colors() -> SmallVec<RGB8, MAX_INLINE_COLORS> {
     smallvec::smallvec![RGB8::new(255, 0, 0)]
 }
 
@@ -72,7 +72,7 @@ pub struct BakedLedRule {
     blink_ms: u32,
     /// Pre-computed RGB color for each LED position in the range.
     /// Index 0 corresponds to `start`, index 1 to the next LED toward `end`, etc.
-    gradient: SmallVec<[RGB8; 16]>,
+    gradient: SmallVec<RGB8, 16>,
 }
 
 /// Collection of baked LED rules, ready for per-frame rendering.
@@ -209,7 +209,7 @@ pub fn compute_led_state(rpm: u32, baked: &BakedLedRules, timestamp_ms: u64) -> 
 ///   pos 4: blue      (end of segment 1)
 /// ```
 #[allow(clippy::cast_precision_loss)]
-fn precompute_gradient_colors(colors: &[RGB8], total_positions: usize) -> SmallVec<[RGB8; 16]> {
+fn precompute_gradient_colors(colors: &[RGB8], total_positions: usize) -> SmallVec<RGB8, 16> {
     if total_positions == 0 {
         return SmallVec::new();
     }
@@ -290,7 +290,7 @@ fn lerp_u8(a: u8, b: u8, t: f32) -> u8 {
 /// for mirror effects. When `rpm_upper` is set, computes proportional lighting.
 ///
 /// Uses the pre-clamped `start`, `end`, and `led_count` from the baked rule.
-fn compute_leds_to_light(rpm: u32, rule: &BakedLedRule) -> SmallVec<[usize; 16]> {
+fn compute_leds_to_light(rpm: u32, rule: &BakedLedRule) -> SmallVec<usize, 16> {
     let start = rule.start;
     let end = rule.end;
     let led_count = rule.led_count;

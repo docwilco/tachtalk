@@ -15,7 +15,7 @@
 ## OBD2 Proxy
 - [ ] Pipelined dongle queries — port pipelining strategy from test firmware Mode 4 to the main firmware's dongle task for higher query throughput
 - [ ] Properly parse client commands into mode, PIDs, and optional response count — currently `wire_command_to_pid` only extracts the first PID and ignores both multi-PID requests (e.g., `010C0D05`) and the trailing response count hint (e.g., `010C 2`). Needs a `ParsedClientCommand { mode, pids, max_responses }` struct so that: (a) multi-PID requests return combined responses, (b) response count limits how many ECU lines are returned, (c) `normalize_obd_command` produces correct cache keys.
-- [ ] Store ECU CAN IDs with cached responses (currently `CachedResponse` is `SmallVec<[PidData; 1]>` — data only, ECU IDs are parsed transiently for learning but discarded before caching)
+- [ ] Store ECU CAN IDs with cached responses (currently `CachedResponse` is `SmallVec<PidData, 1>` — data only, ECU IDs are parsed transiently for learning but discarded before caching)
 - [ ] Support client-side framing (ATH1/ATH0) — currently `format_cached_for_client` always emits bare `41{PID}{DATA}` without CAN headers, regardless of client ATH state. Requires ECU ID storage first.
 - [ ] Support 29-bit extended CAN IDs — currently `ecu_id` in `ParsedLine` is `u16` (11-bit only) and `parse_response_framed` hardcodes a 3 hex char CAN ID prefix. Needs widening to `u32` and detection from protocol or line length.
 
@@ -24,7 +24,7 @@
 - [ ] Rewrite `parse_response_framed` and `parse_response_to_cache` to operate on `&[u8]` directly instead of converting through `String`/`str`. Both currently allocate intermediate `String`s for hex parsing. `parse_response_framed` does `String::from_utf8_lossy` → `.split('\r')` → `.replace(' ', "")` → hex parse; `parse_response_to_cache` does `.filter` → `.map` → `collect::<String>` → chunk hex pairs. Can split on `b'\r'`, skip `b' '` in place, and decode hex pairs with a small inline helper — avoids all intermediate allocations.
 
 ## Infrastructure
-- [ ] Upgrade to ESP-IDF 5.4
+- [x] Upgrade to ESP-IDF 5.4
 - [ ] Switch PCNT encoder to event-based using `add_watch_step()` (requires ESP-IDF 5.4)
 - [ ] Investigate moving more allocations to PSRAM (N16R8 has 8MB). Currently only the capture buffer in test firmware is large enough to auto-place in PSRAM (`CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=4096`). Consider web server request buffers, JSON serialization buffers, WiFi scan results, etc.
 - [x] Use deku crate (or similar) for binary capture file encoding/decoding

@@ -120,7 +120,7 @@ where
 /// Check if a config change would require a device restart
 /// Returns (GPIOs to reset before restart, `needs_restart`)
 #[allow(clippy::similar_names)]
-fn check_restart_needed(current: &Config, new: &Config) -> (SmallVec<[u8; 4]>, bool) {
+fn check_restart_needed(current: &Config, new: &Config) -> (SmallVec<u8, 4>, bool) {
     let led_changed = current.led_gpio != new.led_gpio;
     let encoder_a_changed = current.encoder_pin_a != new.encoder_pin_a;
     let encoder_b_changed = current.encoder_pin_b != new.encoder_pin_b;

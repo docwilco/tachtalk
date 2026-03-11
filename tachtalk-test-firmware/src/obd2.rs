@@ -48,7 +48,7 @@ impl Default for AtomicDongleTcpState {
 }
 
 /// Type alias for small OBD2 command/response buffers
-pub type Obd2Buffer = SmallVec<[u8; 32]>;
+pub type Obd2Buffer = SmallVec<u8, 32>;
 
 /// Fixed fast:slow polling ratio
 const FAST_SLOW_RATIO: u32 = 6;
@@ -62,8 +62,8 @@ struct TestConfig {
     dongle_ip: String,
     dongle_port: u16,
     timeout: Duration,
-    fast_pids: SmallVec<[u8; 8]>,
-    slow_pids: SmallVec<[u8; 8]>,
+    fast_pids: SmallVec<u8, 8>,
+    slow_pids: SmallVec<u8, 8>,
     listen_port: u16,
     capture: CaptureConfig,
 }
@@ -252,8 +252,8 @@ struct RepeatLayer {
     base: Base,
     enabled: bool,
     /// Repeat command bytes (empty = bare CR per ELM327 spec, `b"1"` = WiFi dongle convention).
-    repeat_string: SmallVec<[u8; 2]>,
-    last_command: Option<SmallVec<[u8; 16]>>,
+    repeat_string: SmallVec<u8, 2>,
+    last_command: Option<SmallVec<u8, 16>>,
     supports_repeat: Option<bool>,
     /// Whether the last `send()` used the repeat string (for pipelined mode).
     last_was_repeat: bool,
@@ -345,9 +345,9 @@ impl RepeatLayer {
 /// A single parsed response line, optionally with ECU CAN ID.
 struct ParsedLine {
     /// 3-char CAN ID when framing is enabled (e.g., `b"7E8"`).
-    ecu_id: Option<SmallVec<[u8; 3]>>,
+    ecu_id: Option<SmallVec<u8, 3>>,
     /// OBD data bytes after the PCI byte (when framing on) or raw line bytes.
-    data: SmallVec<[u8; 8]>,
+    data: SmallVec<u8, 8>,
 }
 
 /// Handles `ATH1`/`ATH0` init and response line parsing.
@@ -381,14 +381,14 @@ impl FramingLayer {
     }
 
     /// Read a response and parse it into structured lines.
-    fn recv(&mut self) -> Result<(Obd2Buffer, SmallVec<[ParsedLine; 4]>), String> {
+    fn recv(&mut self) -> Result<(Obd2Buffer, SmallVec<ParsedLine, 4>), String> {
         let response = self.repeat.recv()?;
         let parsed = self.parse_response(&response);
         Ok((response, parsed))
     }
 
     /// Parse a raw response buffer into individual lines.
-    fn parse_response(&self, response: &[u8]) -> SmallVec<[ParsedLine; 4]> {
+    fn parse_response(&self, response: &[u8]) -> SmallVec<ParsedLine, 4> {
         let response_str = String::from_utf8_lossy(response);
         let mut lines = SmallVec::new();
 
@@ -406,7 +406,7 @@ impl FramingLayer {
                 // but ATH1 with ATS0 still uses spaces between CAN ID and rest
                 // Actually with ATS0, there are no spaces at all: "7E806410C1AF8"
                 // So we need to handle: first 3 chars = CAN ID, next 2 = PCI hex byte, rest = data
-                let bytes: SmallVec<[u8; 16]> = trimmed.as_bytes().into();
+                let bytes: SmallVec<u8, 16> = trimmed.as_bytes().into();
                 if bytes.len() < 5 {
                     // Too short for framing format
                     lines.push(ParsedLine {
@@ -416,7 +416,7 @@ impl FramingLayer {
                     continue;
                 }
 
-                let ecu_id: SmallVec<[u8; 3]> = bytes[..3].into();
+                let ecu_id: SmallVec<u8, 3> = bytes[..3].into();
 
                 // Parse PCI byte (2 hex chars after CAN ID)
                 let pci_str = std::str::from_utf8(&bytes[3..5]).unwrap_or("00");
@@ -433,7 +433,7 @@ impl FramingLayer {
                 }
 
                 // Parse the data hex bytes
-                let mut data: SmallVec<[u8; 8]> = SmallVec::new();
+                let mut data: SmallVec<u8, 8> = SmallVec::new();
                 let mut i = 0;
                 while i + 1 < data_hex.len() {
                     if let Ok(b) = u8::from_str_radix(
@@ -452,7 +452,7 @@ impl FramingLayer {
             } else {
                 // Framing off: raw hex line, parse bytes
                 let hex_str = trimmed.replace(' ', "");
-                let mut data: SmallVec<[u8; 8]> = SmallVec::new();
+                let mut data: SmallVec<u8, 8> = SmallVec::new();
                 let bytes = hex_str.as_bytes();
                 let mut i = 0;
                 while i + 1 < bytes.len() {
@@ -487,7 +487,7 @@ struct CountLayer {
     framing: FramingLayer,
     mode: QueryMode,
     /// Learned ECU counts keyed by command string.
-    response_counts: HashMap<SmallVec<[u8; 16]>, u8>,
+    response_counts: HashMap<SmallVec<u8, 16>, u8>,
     /// PID → data-byte-count lookup table.
     /// Initialized from the static SAE J1979 table; updated at runtime when
     /// single-PID query responses reveal lengths for vendor-specific PIDs.
@@ -495,7 +495,7 @@ struct CountLayer {
     /// Number of PIDs in the current query (set by [`QueryBuilder`] before each call).
     pid_count: usize,
     /// Queue of original command keys for in-flight pipelined requests.
-    pending_commands: VecDeque<SmallVec<[u8; 16]>>,
+    pending_commands: VecDeque<SmallVec<u8, 16>>,
 }
 
 impl CountLayer {
@@ -513,22 +513,19 @@ impl CountLayer {
     /// Execute a command, learning ECU count if in `AdaptiveCount` mode.
     ///
     /// Returns the raw response and parsed lines.
-    fn execute(
-        &mut self,
-        command: &[u8],
-    ) -> Result<(Obd2Buffer, SmallVec<[ParsedLine; 4]>), String> {
-        let cmd_key: SmallVec<[u8; 16]> = command.into();
+    fn execute(&mut self, command: &[u8]) -> Result<(Obd2Buffer, SmallVec<ParsedLine, 4>), String> {
+        let cmd_key: SmallVec<u8, 16> = command.into();
 
-        let actual_command: SmallVec<[u8; 20]> = match self.mode {
+        let actual_command: SmallVec<u8, 20> = match self.mode {
             QueryMode::NoCount => command.into(),
             QueryMode::AlwaysOne => {
-                let mut cmd: SmallVec<[u8; 20]> = command.into();
+                let mut cmd: SmallVec<u8, 20> = command.into();
                 cmd.extend_from_slice(b" 1");
                 cmd
             }
             QueryMode::AdaptiveCount => {
                 if let Some(&count) = self.response_counts.get(&cmd_key) {
-                    let mut cmd: SmallVec<[u8; 20]> = command.into();
+                    let mut cmd: SmallVec<u8, 20> = command.into();
                     cmd.push(b' ');
                     // count is always 1-9 for OBD, single ASCII digit
                     cmd.push(b'0' + count);
@@ -564,18 +561,18 @@ impl CountLayer {
     }
 
     /// Build the actual command (with count suffix) from the original command.
-    fn build_actual_command(&self, command: &[u8]) -> SmallVec<[u8; 20]> {
-        let cmd_key: SmallVec<[u8; 16]> = command.into();
+    fn build_actual_command(&self, command: &[u8]) -> SmallVec<u8, 20> {
+        let cmd_key: SmallVec<u8, 16> = command.into();
         match self.mode {
             QueryMode::NoCount => command.into(),
             QueryMode::AlwaysOne => {
-                let mut cmd: SmallVec<[u8; 20]> = command.into();
+                let mut cmd: SmallVec<u8, 20> = command.into();
                 cmd.extend_from_slice(b" 1");
                 cmd
             }
             QueryMode::AdaptiveCount => {
                 if let Some(&count) = self.response_counts.get(&cmd_key) {
-                    let mut cmd: SmallVec<[u8; 20]> = command.into();
+                    let mut cmd: SmallVec<u8, 20> = command.into();
                     cmd.push(b' ');
                     cmd.push(b'0' + count);
                     cmd
@@ -598,7 +595,7 @@ impl CountLayer {
     }
 
     /// Read a response, learn ECU count if needed, return raw + parsed.
-    fn recv(&mut self) -> Result<(Obd2Buffer, SmallVec<[ParsedLine; 4]>), String> {
+    fn recv(&mut self) -> Result<(Obd2Buffer, SmallVec<ParsedLine, 4>), String> {
         let (response, parsed) = self.framing.recv()?;
 
         if let Some(cmd_key) = self.pending_commands.pop_front() {
@@ -675,7 +672,7 @@ impl CountLayer {
     fn count_ecus(&self, parsed: &[ParsedLine]) -> u8 {
         if self.framing.enabled {
             // Framing on: count unique CAN IDs
-            let mut seen: SmallVec<[&[u8]; 4]> = SmallVec::new();
+            let mut seen: SmallVec<&[u8], 4> = SmallVec::new();
             for line in parsed {
                 if let Some(ref id) = line.ecu_id {
                     if !seen.contains(&id.as_slice()) {
@@ -760,7 +757,7 @@ impl CountLayer {
     fn extract_pid_values(
         parsed: &[ParsedLine],
         pid_lengths: &PidDataLengths,
-    ) -> HashMap<u8, SmallVec<[u8; 4]>> {
+    ) -> HashMap<u8, SmallVec<u8, 4>> {
         let mut map = HashMap::new();
 
         for line in parsed {
@@ -787,7 +784,7 @@ impl CountLayer {
                     break;
                 }
 
-                let value: SmallVec<[u8; 4]> = SmallVec::from_slice(&data[pos..pos + data_len]);
+                let value: SmallVec<u8, 4> = SmallVec::from_slice_copy(&data[pos..pos + data_len]);
                 pos += data_len;
                 map.insert(pid, value);
             }
@@ -806,8 +803,8 @@ impl CountLayer {
 /// All PIDs are Mode 01 — stored as raw PID bytes (e.g. `0x0C` for RPM).
 struct QueryBuilder {
     count: CountLayer,
-    fast_pids: SmallVec<[u8; 8]>,
-    slow_pids: SmallVec<[u8; 8]>,
+    fast_pids: SmallVec<u8, 8>,
+    slow_pids: SmallVec<u8, 8>,
     use_multi_pid: bool,
 }
 
@@ -815,8 +812,8 @@ impl QueryBuilder {
     /// Create a new `QueryBuilder`, validating PID data lengths for multi-PID mode.
     fn new(
         count: CountLayer,
-        fast_pids: SmallVec<[u8; 8]>,
-        slow_pids: SmallVec<[u8; 8]>,
+        fast_pids: SmallVec<u8, 8>,
+        slow_pids: SmallVec<u8, 8>,
         use_multi_pid: bool,
     ) -> Result<Self, String> {
         if use_multi_pid {
@@ -840,12 +837,12 @@ impl QueryBuilder {
     ///
     /// Returns `(command_bytes, pid_count)`. All PIDs are Mode 01.
     /// Single: `[0x0C]` → `b"010C"`. Multi: `[0x0C, 0x49]` → `b"010C49"`.
-    fn build_command(pids: &[u8]) -> (SmallVec<[u8; 16]>, usize) {
+    fn build_command(pids: &[u8]) -> (SmallVec<u8, 16>, usize) {
         if pids.is_empty() {
             return (SmallVec::new(), 0);
         }
 
-        let mut cmd: SmallVec<[u8; 16]> = SmallVec::new();
+        let mut cmd: SmallVec<u8, 16> = SmallVec::new();
         // Service byte prefix
         cmd.extend_from_slice(b"01");
         for &pid in pids {
@@ -965,12 +962,12 @@ impl QueryBuilder {
         fast_index: &mut usize,
         slow_index: &mut usize,
         fast_count: &mut u32,
-    ) -> (SmallVec<[u8; 16]>, SmallVec<[u8; 8]>) {
+    ) -> (SmallVec<u8, 16>, SmallVec<u8, 8>) {
         if self.use_multi_pid {
             let use_slow = *fast_count >= FAST_SLOW_RATIO && !self.slow_pids.is_empty();
             if use_slow {
                 *fast_count = 0;
-                let all_pids: SmallVec<[u8; 8]> = self
+                let all_pids: SmallVec<u8, 8> = self
                     .fast_pids
                     .iter()
                     .chain(self.slow_pids.iter())
@@ -981,7 +978,7 @@ impl QueryBuilder {
                 (cmd, all_pids)
             } else {
                 *fast_count += 1;
-                let fast_copy: SmallVec<[u8; 8]> = self.fast_pids.clone();
+                let fast_copy: SmallVec<u8, 8> = self.fast_pids.clone();
                 let (cmd, pid_count) = Self::build_command(&fast_copy);
                 self.count.pid_count = pid_count;
                 (cmd, fast_copy)
@@ -1006,7 +1003,7 @@ impl QueryBuilder {
 
             self.count.pid_count = 1;
             let (cmd, _) = Self::build_command(&[pid]);
-            (cmd, SmallVec::from_slice(&[pid]))
+            (cmd, SmallVec::from_slice_copy(&[pid]))
         }
     }
 
@@ -1031,7 +1028,7 @@ impl QueryBuilder {
         }
 
         // In-flight queue: tracks queried PIDs for each pending command.
-        let mut in_flight: VecDeque<SmallVec<[u8; 8]>> = VecDeque::with_capacity(2);
+        let mut in_flight: VecDeque<SmallVec<u8, 8>> = VecDeque::with_capacity(2);
 
         // Send first two commands to prime the pipeline
         let (cmd1, pids1) = self.next_command(&mut fast_index, &mut slow_index, &mut fast_count);
@@ -1276,13 +1273,13 @@ fn run_test(ctx: &TestContext, start_options: StartOptions) {
             .fast_pids
             .iter()
             .map(|p| format!("0x{p:02X}"))
-            .collect::<SmallVec<[String; 4]>>()
+            .collect::<SmallVec<String, 4>>()
             .join(", "),
         config
             .slow_pids
             .iter()
             .map(|p| format!("0x{p:02X}"))
-            .collect::<SmallVec<[String; 4]>>()
+            .collect::<SmallVec<String, 4>>()
             .join(", "),
     );
     info!(

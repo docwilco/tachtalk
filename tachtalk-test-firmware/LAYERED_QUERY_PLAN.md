@@ -320,8 +320,8 @@ impl Base {
 struct RepeatLayer {
     base: Base,
     enabled: bool,
-    repeat_string: SmallVec<[u8; 2]>,  // e.g., b"" for bare CR, b"1" for WiFi dongle convention
-    last_command: Option<SmallVec<[u8; 16]>>,  // last command bytes sent
+    repeat_string: SmallVec<u8, 2>,  // e.g., b"" for bare CR, b"1" for WiFi dongle convention
+    last_command: Option<SmallVec<u8, 16>>,  // last command bytes sent
     supports_repeat: Option<bool>,
     last_was_repeat: bool,  // tracks whether send() used repeat, for recv() to handle `?`
 }
@@ -341,16 +341,16 @@ struct FramingLayer {
 }
 
 struct ParsedLine {
-    ecu_id: Option<SmallVec<[u8; 3]>>,  // e.g., b"7E8" — 3 ASCII bytes, stack-allocated
-    data: SmallVec<[u8; 8]>,            // OBD data bytes after PCI — fits single CAN frame
+    ecu_id: Option<SmallVec<u8, 3>>,  // e.g., b"7E8" — 3 ASCII bytes, stack-allocated
+    data: SmallVec<u8, 8>,            // OBD data bytes after PCI — fits single CAN frame
 }
 ```
 
 - `FramingLayer::init(&mut self)`: sends `ATH1` if enabled, `ATH0` if disabled, through the layer stack. This is the **only** layer that sends AT commands after the general init. Called after Base's `connect_and_init` and layer stack construction.
 - `FramingLayer::execute(&mut self, command: &[u8]) -> Result<Obd2Buffer, String>` — delegates to `self.repeat`, returns raw response.
 - `FramingLayer::send(&mut self, command: &[u8]) -> Result<(), String>` — delegates to `self.repeat.send()`.
-- `FramingLayer::recv(&mut self) -> Result<(Obd2Buffer, SmallVec<[ParsedLine; 4]>), String>` — calls `self.repeat.recv()`, then `parse_response()`, returns both raw and parsed.
-- `FramingLayer::parse_response(&self, response: &[u8]) -> SmallVec<[ParsedLine; 4]>` — splits response into lines, for each:
+- `FramingLayer::recv(&mut self) -> Result<(Obd2Buffer, SmallVec<ParsedLine, 4>), String>` — calls `self.repeat.recv()`, then `parse_response()`, returns both raw and parsed.
+- `FramingLayer::parse_response(&self, response: &[u8]) -> SmallVec<ParsedLine, 4>` — splits response into lines, for each:
   - **Enabled**: extracts 3-char CAN ID, PCI byte, remaining data. Verifies PCI byte matches actual data length; logs warning on mismatch.
   - **Disabled**: returns `ParsedLine { ecu_id: None, data: raw_line_bytes }`.
 
@@ -360,31 +360,31 @@ struct ParsedLine {
 struct CountLayer {
     framing: FramingLayer,
     mode: QueryMode,  // NoCount, AlwaysOne, or AdaptiveCount
-    response_counts: HashMap<SmallVec<[u8; 16]>, u8>,  // command → learned ECU count
-    pending_commands: VecDeque<SmallVec<[u8; 16]>>,  // queued command keys for pipelined recv correlation
+    response_counts: HashMap<SmallVec<u8, 16>, u8>,  // command → learned ECU count
+    pending_commands: VecDeque<SmallVec<u8, 16>>,  // queued command keys for pipelined recv correlation
     pid_count: usize,       // set by Query Builder before each call
-    pid_data_lengths: SmallVec<[u8; 6]>,  // response data byte count for each queried PID, in query order
+    pid_data_lengths: SmallVec<u8, 6>,  // response data byte count for each queried PID, in query order
 }
 ```
 
-- `CountLayer::execute(&mut self, command: &[u8]) -> Result<(Obd2Buffer, SmallVec<[ParsedLine; 4]>), String>`: synchronous send+recv with ECU count learning.
+- `CountLayer::execute(&mut self, command: &[u8]) -> Result<(Obd2Buffer, SmallVec<ParsedLine, 4>), String>`: synchronous send+recv with ECU count learning.
 
 - `CountLayer::send(&mut self, command: &[u8]) -> Result<(), String>`: builds actual command (with count suffix), pushes original command key into `pending_commands: VecDeque`, delegates to `framing.send()`.
-- `CountLayer::recv(&mut self) -> Result<(Obd2Buffer, SmallVec<[ParsedLine; 4]>), String>`: pops command key from `pending_commands`, learns ECU count if `AdaptiveCount`, returns raw + parsed.
+- `CountLayer::recv(&mut self) -> Result<(Obd2Buffer, SmallVec<ParsedLine, 4>), String>`: pops command key from `pending_commands`, learns ECU count if `AdaptiveCount`, returns raw + parsed.
 
 ### Step 8: Implement Query Builder layer in `src/obd2.rs`
 
 ```rust
 struct QueryBuilder {
     count: CountLayer,
-    fast_pids: SmallVec<[u8; 4]>,   // e.g., [0x0C, 0x49] — PID bytes only
-    slow_pids: SmallVec<[u8; 4]>,   // e.g., [0x05]
+    fast_pids: SmallVec<u8, 4>,   // e.g., [0x0C, 0x49] — PID bytes only
+    slow_pids: SmallVec<u8, 4>,   // e.g., [0x05]
     use_multi_pid: bool,
 }
 ```
 
 - `QueryBuilder::new(...)`: validates all PIDs share the same service byte (first 2 chars). Returns error if not. Looks up `pid_data_length()` for each PID and stores in `CountLayer::pid_data_lengths`. Returns error for PIDs with data length 0 (unknown) when `use_multi_pid` is true.
-- `QueryBuilder::build_command(&self, pids: &[u8]) -> (SmallVec<[u8; 16]>, usize)`:
+- `QueryBuilder::build_command(&self, pids: &[u8]) -> (SmallVec<u8, 16>, usize)`:
   - **Single mode**: takes one PID, returns `("010C", 1)`.
   - **Multi mode**: concatenates PID bytes after shared service byte, returns `("010C49", 2)`.
 - `QueryBuilder::next_command(...)`: selects PIDs via the 6:1 fast:slow ratio, calls `build_command`, updates `count.pid_count`.

@@ -61,7 +61,7 @@ const RPM_PID: u8 = 0x0C;
 
 /// Type alias for small OBD2 wire-format buffers (ASCII hex commands/responses).
 /// 20 bytes on 32-bit; 16 inline bytes covers multi-PID commands without heap.
-type Obd2Buffer = SmallVec<[u8; 16]>;
+type Obd2Buffer = SmallVec<u8, 16>;
 
 /// OBD2 PID byte. Mode is always 0x01 for this application.
 type Pid = u8;
@@ -69,13 +69,13 @@ type Pid = u8;
 /// Data bytes for a single ECU response (excluding mode/PID prefix).
 /// Max 8 bytes inline covers all Mode 01 PIDs (longest is 6 bytes).
 /// Size: 12 bytes on 32-bit.
-type PidData = SmallVec<[u8; 8]>;
+type PidData = SmallVec<u8, 8>;
 
 /// Cached OBD2 response: one data entry per ECU. Most PIDs get exactly 1.
-type CachedResponse = SmallVec<[PidData; 1]>;
+type CachedResponse = SmallVec<PidData, 1>;
 
 /// A group of PIDs sharing the same learned ECU count, for multi-PID batching.
-type PidGroup = SmallVec<[Pid; 8]>;
+type PidGroup = SmallVec<Pid, 8>;
 
 // ============================================================================
 // PID/Wire Conversion Helpers
@@ -83,7 +83,7 @@ type PidGroup = SmallVec<[Pid; 8]>;
 
 /// Convert a PID to wire-format Mode 01 command (e.g., `0x0C` → `b"010C"`).
 fn pid_to_wire_command(pid: Pid) -> Obd2Buffer {
-    // Always 4 bytes ("01XX"), fits inline in SmallVec<[u8; 16]>
+    // Always 4 bytes ("01XX"), fits inline in SmallVec<u8, 16>
     let mut buf = Obd2Buffer::new();
     write!(buf, "01{pid:02X}").unwrap();
     buf
@@ -96,7 +96,7 @@ fn pid_to_wire_command(pid: Pid) -> Obd2Buffer {
 /// (callers group by count before calling this).
 fn build_multi_pid_wire_command(pids: &[Pid], response_count: u8) -> Obd2Buffer {
     // Maximum 6 PIDs: "01" + 6×"XX" + " N" = 16 bytes, fits inline
-    // in SmallVec<[u8; 16]>
+    // in SmallVec<u8, 16>
     let mut cmd = Obd2Buffer::new();
     cmd.extend_from_slice(b"01");
     for &pid in pids {
@@ -315,7 +315,7 @@ struct ParsedLine {
 ///
 /// When `framing_enabled` is false (ATH0), expects format like:
 /// `41 0C 1A F8\r41 0C 1B 00\r>`
-fn parse_response_framed(response: &[u8], framing_enabled: bool) -> SmallVec<[ParsedLine; 4]> {
+fn parse_response_framed(response: &[u8], framing_enabled: bool) -> SmallVec<ParsedLine, 4> {
     let response_str = String::from_utf8_lossy(response);
     let mut lines = SmallVec::new();
 
@@ -331,7 +331,7 @@ fn parse_response_framed(response: &[u8], framing_enabled: bool) -> SmallVec<[Pa
             // Framing on: expect `{3-char CAN ID}{PCI byte}{OBD data...}`
             // With ATS0 (spaces off), format is `7E80341 0C1AF8`
             // First 3 chars = CAN ID, next 2 = PCI hex byte, rest = data
-            let bytes: SmallVec<[u8; 24]> = trimmed.replace(' ', "").into_bytes().into();
+            let bytes: SmallVec<u8, 24> = trimmed.replace(' ', "").into_bytes().into();
             if bytes.len() < 5 {
                 // Too short for framing format, return as-is
                 lines.push(ParsedLine {
@@ -425,7 +425,7 @@ fn count_ecus_per_pid(
 
     if framing_enabled {
         // Group by (CAN ID, PID) to count unique ECUs per PID
-        let mut seen_per_pid: HashMap<u8, SmallVec<[u16; 4]>> = HashMap::new();
+        let mut seen_per_pid: HashMap<u8, SmallVec<u16, 4>> = HashMap::new();
         for line in parsed {
             if let Some(ecu_id) = line.ecu_id {
                 for pid in extract_pids_from_response(&line.data, pid_lengths) {
@@ -514,7 +514,7 @@ fn parse_response_to_cache(
             .filter(|b| b.is_ascii_hexdigit())
             .map(|&b| b as char)
             .collect();
-        let bytes: SmallVec<[u8; 12]> = hex_str
+        let bytes: SmallVec<u8, 12> = hex_str
             .as_bytes()
             .chunks(2)
             .filter_map(|chunk| {
@@ -1130,7 +1130,7 @@ impl PollingState {
     fn partition_pids_by_ecu_count(
         &self,
         dongle: &DongleState,
-    ) -> SmallVec<[(Option<u8>, PidGroup); 4]> {
+    ) -> SmallVec<(Option<u8>, PidGroup), 4> {
         let mut groups: HashMap<Option<u8>, PidGroup> = HashMap::new();
 
         for &pid in self.fast_pids.iter().chain(self.slow_pids.iter()) {

@@ -49,7 +49,7 @@ fn run_sse_server(rx: &Receiver<SseMessage>, state: &Arc<State>) -> std::io::Res
 
     info!("SSE server started on port {SSE_PORT}");
 
-    let mut clients: SmallVec<[TcpStream; MAX_SSE_CLIENTS]> = SmallVec::new();
+    let mut clients: SmallVec<TcpStream, MAX_SSE_CLIENTS> = SmallVec::new();
     let mut current_rpm: Option<u32> = None;
     let mut last_heartbeat = Instant::now();
     let mut last_metrics = Instant::now();

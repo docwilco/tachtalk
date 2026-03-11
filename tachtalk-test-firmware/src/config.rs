@@ -365,19 +365,19 @@ impl TestConfig {
     /// Assumes all PIDs are Mode 01. Strips the leading `01` service byte and parses
     /// the remaining two hex digits as a `u8`. Silently skips entries that are too
     /// short or contain invalid hex.
-    pub fn get_fast_pids(&self) -> SmallVec<[u8; 8]> {
+    pub fn get_fast_pids(&self) -> SmallVec<u8, 8> {
         Self::parse_pid_list(&self.fast_pids)
     }
 
     /// Parse slow PIDs from comma-separated string (e.g. `"0105"` → `[0x05]`).
     ///
     /// See [`Self::get_fast_pids`] for format details.
-    pub fn get_slow_pids(&self) -> SmallVec<[u8; 8]> {
+    pub fn get_slow_pids(&self) -> SmallVec<u8, 8> {
         Self::parse_pid_list(&self.slow_pids)
     }
 
     /// Parse a comma-separated PID string into a list of PID bytes.
-    fn parse_pid_list(s: &str) -> SmallVec<[u8; 8]> {
+    fn parse_pid_list(s: &str) -> SmallVec<u8, 8> {
         s.split(',')
             .filter_map(|entry| {
                 let trimmed = entry.trim();
