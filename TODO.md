@@ -10,7 +10,7 @@
 - [x] Over-the-air (OTA) updates
 - [x] Data logging capability
 - [ ] Bluetooth configuration option
-- [ ] Port capture dissection display from test firmware to main firmware Web UI (main firmware has capture status/controls but not record-level content viewing)
+- [x] Port capture dissection display from test firmware to main firmware Web UI (main firmware has capture status/controls but not record-level content viewing)
 
 ## OBD2 Proxy
 - [ ] Pipelined dongle queries — port pipelining strategy from test firmware Mode 4 to the main firmware's dongle task for higher query throughput

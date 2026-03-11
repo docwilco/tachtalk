@@ -526,6 +526,120 @@
             cursor: not-allowed;
             pointer-events: none;
         }
+        /* Capture Decoder */
+        #decodeSection {
+            border-left-color: #aa44ff;
+            background-color: #2a2a3a;
+        }
+        .decode-header-card {
+            display: grid;
+            grid-template-columns: auto 1fr;
+            gap: 4px 16px;
+            padding: 12px;
+            background-color: #333;
+            border-radius: 5px;
+            font-size: 14px;
+            margin-bottom: 15px;
+        }
+        .decode-header-card dt {
+            color: #888;
+            font-size: 12px;
+            line-height: 22px;
+        }
+        .decode-header-card dd {
+            margin: 0;
+            font-family: monospace;
+            line-height: 22px;
+        }
+        .decode-controls {
+            display: flex;
+            align-items: center;
+            gap: 15px;
+            margin-bottom: 10px;
+            flex-wrap: wrap;
+        }
+        .decode-controls label {
+            width: auto;
+            font-weight: normal;
+            font-size: 14px;
+        }
+        .decode-controls select {
+            width: auto;
+        }
+        .decode-record-count {
+            color: #888;
+            font-size: 13px;
+            margin-left: auto;
+        }
+        .flag-badge {
+            display: inline-block;
+            padding: 2px 8px;
+            border-radius: 3px;
+            font-size: 12px;
+            font-weight: bold;
+        }
+        .flag-overflow {
+            background-color: #5a1a1a;
+            color: #ff4444;
+            border: 1px solid #ff4444;
+        }
+        .flag-ntp {
+            background-color: #1a3a1a;
+            color: #44ff44;
+            border: 1px solid #44ff44;
+        }
+        .decode-col-header {
+            display: flex;
+            font-weight: bold;
+            font-size: 13px;
+            color: #888;
+            border-bottom: 2px solid #555;
+            padding: 6px 0;
+            font-family: monospace;
+            background-color: #2a2a2a;
+            border-radius: 5px 5px 0 0;
+        }
+        .decode-scroll-container {
+            height: 60vh;
+            overflow-y: auto;
+            position: relative;
+            background-color: #222;
+            border-radius: 0 0 5px 5px;
+        }
+        .decode-row {
+            display: flex;
+            position: absolute;
+            left: 0;
+            right: 0;
+            height: 28px;
+            line-height: 28px;
+            font-family: monospace;
+            font-size: 13px;
+            border-bottom: 1px solid #2a2a2a;
+        }
+        .decode-row:hover {
+            background-color: #3a3a4a;
+        }
+        .decode-row.rt-tx { background-color: rgba(0, 100, 255, 0.08); }
+        .decode-row.rt-rx { background-color: rgba(0, 200, 0, 0.08); }
+        .decode-row.rt-connect { background-color: rgba(255, 170, 0, 0.08); }
+        .decode-row.rt-disconnect { background-color: rgba(255, 68, 68, 0.08); }
+        .dc-num { width: 60px; text-align: right; padding-right: 8px; flex-shrink: 0; color: #666; }
+        .dc-time { width: 90px; text-align: right; padding-right: 8px; flex-shrink: 0; }
+        .dc-type { width: 100px; text-align: center; flex-shrink: 0; }
+        .dc-bytes { width: 55px; text-align: right; padding-right: 8px; flex-shrink: 0; color: #888; }
+        .dc-data { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; padding-left: 8px; }
+        .type-badge {
+            display: inline-block;
+            padding: 1px 6px;
+            border-radius: 3px;
+            font-size: 11px;
+            font-weight: bold;
+        }
+        .type-badge.rt-tx { background-color: #1a3a6a; color: #4488ff; }
+        .type-badge.rt-rx { background-color: #1a4a1a; color: #44cc44; }
+        .type-badge.rt-connect { background-color: #4a3a1a; color: #ffaa00; }
+        .type-badge.rt-disconnect { background-color: #4a1a1a; color: #ff4444; }
         .debug-section {
             background-color: #2a2a3a;
             padding: 10px 15px;
@@ -795,6 +909,7 @@
                     <button id="startCaptureBtn" onclick="startCapture()" class="btn">Start</button>
                     <button id="stopCaptureBtn" onclick="stopCapture()" style="display: none;">Stop</button>
                     <a id="downloadCaptureBtn" class="btn disabled" href="/api/capture">Download</a>
+                    <button id="decodeCaptureBtn" onclick="decodeCapture()" disabled>Decode</button>
                     <button id="clearCaptureBtn" onclick="clearCapture()" class="danger" disabled>Clear</button>
                 </div>
                 <h3>AT Commands Received</h3>
@@ -803,6 +918,38 @@
                 <div id="pids" class="pids">Loading...</div>
             </div>
         </details>
+
+        <!-- Capture Decoder Output -->
+        <div id="decodeSection" class="debug-section" style="display: none;">
+            <div style="display: flex; align-items: center; justify-content: space-between;">
+                <h2 style="margin-top: 0;">📼 Capture Decoder</h2>
+                <button onclick="closeDecoder()" style="padding: 5px 10px; font-size: 16px;">✕</button>
+            </div>
+            <div id="decodeHeaderInfo"></div>
+            <div class="decode-controls">
+                <label>Filter:
+                    <select id="decodeFilter" onchange="applyDecodeFilter()">
+                        <option value="all">All</option>
+                        <option value="0">TX</option>
+                        <option value="1">RX</option>
+                        <option value="2">CONNECT</option>
+                        <option value="3">DISCONNECT</option>
+                    </select>
+                </label>
+                <label><input type="checkbox" id="hexToggle" onchange="toggleDecodeHex()"> Hex</label>
+                <span id="decodeRecordCount" class="decode-record-count"></span>
+            </div>
+            <div class="decode-col-header">
+                <div class="dc-num">#</div>
+                <div class="dc-time">Time (ms)</div>
+                <div class="dc-type">Type</div>
+                <div class="dc-bytes">Bytes</div>
+                <div class="dc-data">Data</div>
+            </div>
+            <div id="decodeScrollContainer" class="decode-scroll-container">
+                <div id="decodeSpacer" style="position: relative;"></div>
+            </div>
+        </div>
         
         <details class="debug-section">
             <summary>📝 Raw Config JSON</summary>
@@ -2139,6 +2286,7 @@
                 dlBtn.classList.add('disabled');
                 dlBtn.removeAttribute('download');
             }
+            document.getElementById('decodeCaptureBtn').disabled = !hasData;
             document.getElementById('clearCaptureBtn').disabled = !hasData;
             
             // Show overflow warning
@@ -2205,6 +2353,235 @@
                 showStatus('Stop error: ' + e, true);
             }
         }
+
+        // === Capture Decoder ===
+        const CAPTURE_MAGIC = 'TachTalk';
+        const CAPTURE_HDR_SIZE = 64;
+        const REC_HDR_SIZE = 7;
+        const FL_OVERFLOW = 0x0001;
+        const FL_NTP_SYNCED = 0x0002;
+        const REC_TYPES = {
+            0: { label: 'TX', cls: 'rt-tx' },
+            1: { label: 'RX', cls: 'rt-rx' },
+            2: { label: 'CONNECT', cls: 'rt-connect' },
+            3: { label: 'DISCONNECT', cls: 'rt-disconnect' },
+        };
+        const ROW_H = 28;
+        const OVERSCAN = 15;
+
+        let decAllRecords = [];
+        let decFiltered = [];
+        let decHex = false;
+        let decRafPending = false;
+
+        function u64LE(dv, o) {
+            return dv.getUint32(o, true) + dv.getUint32(o + 4, true) * 0x100000000;
+        }
+
+        function nullStr(dv, o, n) {
+            let s = '';
+            for (let i = 0; i < n; i++) {
+                const b = dv.getUint8(o + i);
+                if (b === 0) break;
+                s += String.fromCharCode(b);
+            }
+            return s;
+        }
+
+        function parseCaptureHdr(dv) {
+            let magic = '';
+            for (let i = 0; i < 8; i++) magic += String.fromCharCode(dv.getUint8(i));
+            if (magic !== CAPTURE_MAGIC)
+                throw new Error('Invalid capture file: bad magic "' + magic + '"');
+            return {
+                version: dv.getUint16(8, true),
+                headerSize: dv.getUint16(10, true),
+                recordCount: dv.getUint32(12, true),
+                dataLength: dv.getUint32(16, true),
+                captureStartMs: u64LE(dv, 20),
+                dongleIp: dv.getUint8(28) + '.' + dv.getUint8(29) + '.' +
+                          dv.getUint8(30) + '.' + dv.getUint8(31),
+                donglePort: dv.getUint16(32, true),
+                flags: dv.getUint16(34, true),
+                firmware: nullStr(dv, 36, 16),
+            };
+        }
+
+        function parseCaptureRecs(buf, hdrSize) {
+            const dv = new DataView(buf);
+            const recs = [];
+            let off = hdrSize;
+            const end = buf.byteLength;
+            let idx = 1;
+            while (off + REC_HDR_SIZE <= end) {
+                const ts = dv.getUint32(off, true);
+                const rt = dv.getUint8(off + 4);
+                const dl = dv.getUint16(off + 5, true);
+                off += REC_HDR_SIZE;
+                if (off + dl > end) break;
+                recs.push({ index: idx++, timestampMs: ts, recordType: rt,
+                            data: new Uint8Array(buf, off, dl) });
+                off += dl;
+            }
+            return recs;
+        }
+
+        function fmtText(data) {
+            if (!data.length) return '(no data)';
+            let s = '';
+            for (const b of data) {
+                if (b === 0x0d) s += '\\r';
+                else if (b === 0x0a) s += '\\n';
+                else if (b === 0x09) s += '\\t';
+                else if (b >= 0x20 && b <= 0x7e) s += String.fromCharCode(b);
+                else s += '\\x' + b.toString(16).padStart(2, '0');
+            }
+            return s;
+        }
+
+        function fmtHex(data) {
+            if (!data.length) return '(no data)';
+            return Array.from(data, b => b.toString(16).padStart(2, '0')).join(' ');
+        }
+
+        function escH(s) {
+            return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+        }
+
+        function escA(s) {
+            return s.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+        }
+
+        async function decodeCapture() {
+            try {
+                const resp = await fetch('/api/capture');
+                if (resp.status === 204) { showStatus('No capture data', true); return; }
+                if (!resp.ok) { showStatus('Fetch failed: ' + resp.statusText, true); return; }
+
+                const buf = await resp.arrayBuffer();
+                if (buf.byteLength < CAPTURE_HDR_SIZE) {
+                    showStatus('Capture file too small', true);
+                    return;
+                }
+
+                const dv = new DataView(buf);
+                const hdr = parseCaptureHdr(dv);
+                if (hdr.version !== 1) {
+                    showStatus('Unsupported capture version: ' + hdr.version, true);
+                    return;
+                }
+
+                decAllRecords = parseCaptureRecs(buf, hdr.headerSize);
+                renderDecodeHdr(hdr, buf.byteLength);
+
+                document.getElementById('decodeFilter').value = 'all';
+                decHex = false;
+                document.getElementById('hexToggle').checked = false;
+                applyDecodeFilter();
+
+                document.getElementById('decodeSection').style.display = 'block';
+                document.getElementById('decodeSection').scrollIntoView({ behavior: 'smooth' });
+            } catch (e) {
+                showStatus('Decode error: ' + e.message, true);
+            }
+        }
+
+        function renderDecodeHdr(hdr, fileSize) {
+            const flags = [];
+            if (hdr.flags & FL_OVERFLOW)
+                flags.push('<span class="flag-badge flag-overflow">OVERFLOW</span>');
+            if (hdr.flags & FL_NTP_SYNCED)
+                flags.push('<span class="flag-badge flag-ntp">NTP SYNCED</span>');
+
+            let startStr = '(no NTP)';
+            if (hdr.captureStartMs > 0) {
+                const d = new Date(hdr.captureStartMs);
+                startStr = d.toISOString().replace('T', ' ').replace('Z', ' UTC');
+            }
+
+            document.getElementById('decodeHeaderInfo').innerHTML =
+                '<dl class="decode-header-card">' +
+                '<dt>File Size</dt><dd>' + fileSize.toLocaleString() + ' bytes</dd>' +
+                '<dt>Format Version</dt><dd>' + hdr.version + '</dd>' +
+                '<dt>Records</dt><dd>' + hdr.recordCount.toLocaleString() + '</dd>' +
+                '<dt>Data Length</dt><dd>' + hdr.dataLength.toLocaleString() + ' bytes</dd>' +
+                '<dt>Firmware</dt><dd>' + escH(hdr.firmware || '(unknown)') + '</dd>' +
+                '<dt>Dongle</dt><dd>' + hdr.dongleIp + ':' + hdr.donglePort + '</dd>' +
+                '<dt>Capture Start</dt><dd>' + startStr + '</dd>' +
+                '<dt>Flags</dt><dd>' + (flags.length ? flags.join(' ') : '(none)') + '</dd>' +
+                '</dl>';
+        }
+
+        function applyDecodeFilter() {
+            const v = document.getElementById('decodeFilter').value;
+            if (v === 'all') {
+                decFiltered = decAllRecords;
+            } else {
+                const t = parseInt(v, 10);
+                decFiltered = decAllRecords.filter(r => r.recordType === t);
+            }
+            document.getElementById('decodeRecordCount').textContent =
+                decFiltered.length.toLocaleString() + ' of ' +
+                decAllRecords.length.toLocaleString() + ' records';
+            document.getElementById('decodeSpacer').style.height =
+                (decFiltered.length * ROW_H) + 'px';
+            document.getElementById('decodeScrollContainer').scrollTop = 0;
+            renderDecodeVisible();
+        }
+
+        function toggleDecodeHex() {
+            decHex = document.getElementById('hexToggle').checked;
+            renderDecodeVisible();
+        }
+
+        function renderDecodeVisible() {
+            const ctr = document.getElementById('decodeScrollContainer');
+            const spacer = document.getElementById('decodeSpacer');
+            const st = ctr.scrollTop;
+            const vh = ctr.clientHeight;
+
+            const first = Math.floor(st / ROW_H);
+            const count = Math.ceil(vh / ROW_H);
+            const start = Math.max(0, first - OVERSCAN);
+            const end = Math.min(decFiltered.length, first + count + OVERSCAN);
+
+            let html = '';
+            for (let i = start; i < end; i++) {
+                const r = decFiltered[i];
+                const rt = REC_TYPES[r.recordType] || { label: '?', cls: '' };
+                const d = decHex ? fmtHex(r.data) : fmtText(r.data);
+                html += '<div class="decode-row ' + rt.cls +
+                    '" style="top:' + (i * ROW_H) + 'px">' +
+                    '<div class="dc-num">' + r.index + '</div>' +
+                    '<div class="dc-time">' + r.timestampMs + '</div>' +
+                    '<div class="dc-type"><span class="type-badge ' + rt.cls +
+                    '">' + rt.label + '</span></div>' +
+                    '<div class="dc-bytes">' + r.data.length + '</div>' +
+                    '<div class="dc-data" title="' + escA(d) + '">' +
+                    escH(d) + '</div></div>';
+            }
+            spacer.innerHTML = html;
+        }
+
+        function onDecodeScroll() {
+            if (!decRafPending) {
+                decRafPending = true;
+                requestAnimationFrame(() => {
+                    decRafPending = false;
+                    renderDecodeVisible();
+                });
+            }
+        }
+
+        function closeDecoder() {
+            document.getElementById('decodeSection').style.display = 'none';
+            decAllRecords = [];
+            decFiltered = [];
+            document.getElementById('decodeSpacer').innerHTML = '';
+        }
+
+        // Event listener for decode scroll
+        document.getElementById('decodeScrollContainer').addEventListener('scroll', onDecodeScroll);
 
         function formatBytes(bytes) {
             if (bytes < 1024) return bytes + ' B';
