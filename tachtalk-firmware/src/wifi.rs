@@ -32,8 +32,8 @@ pub enum WifiStaState {
     /// Not associated at L2
     #[default]
     Disconnected = 0,
-    /// L2 associated, awaiting IP from DHCP / static config
-    AwaitingIp = 1,
+    /// Connecting (scanning, associating, or awaiting IP)
+    Connecting = 1,
     /// Fully connected with a valid IP address
     Connected = 2,
 }
@@ -179,25 +179,26 @@ pub fn init_wifi(
 enum StaConnectionState {
     /// Not connected at L2 (WiFi association)
     Disconnected,
-    /// L2 connected, waiting for IP (DHCP or static IP being applied)
-    AwaitingIp,
+    /// Connecting (L2 associated but waiting for IP)
+    Connecting,
     /// Fully connected with a valid IP address
     Connected(Ipv4Addr),
+}
+
+impl From<&StaConnectionState> for WifiStaState {
+    fn from(cs: &StaConnectionState) -> Self {
+        match cs {
+            StaConnectionState::Disconnected => Self::Disconnected,
+            StaConnectionState::Connecting => Self::Connecting,
+            StaConnectionState::Connected(_) => Self::Connected,
+        }
+    }
 }
 
 /// Background task to manage WiFi STA connection.
 ///
 /// Always runs in Mixed mode (AP + STA) - AP is never disabled.
 pub fn wifi_connection_manager(state: &Arc<State>) {
-    /// Map `StaConnectionState` to `WifiStaState` for the status LED enum.
-    fn to_led_state(cs: &StaConnectionState) -> WifiStaState {
-        match cs {
-            StaConnectionState::Disconnected => WifiStaState::Disconnected,
-            StaConnectionState::AwaitingIp => WifiStaState::AwaitingIp,
-            StaConnectionState::Connected(_) => WifiStaState::Connected,
-        }
-    }
-
     /// Update the `wifi_sta_state` atomic and send a status LED message on change.
     fn update_wifi_state(state: &State, new: WifiStaState, prev: &mut WifiStaState) {
         if new != *prev {
@@ -220,6 +221,15 @@ pub fn wifi_connection_manager(state: &Arc<State>) {
     let mut prev_led_state = WifiStaState::Disconnected;
     let mut was_connected = false;
 
+    // Send Connecting immediately so the LED starts blinking right away.
+    // Without this, the LED would remain off until a state change occurs.
+    if !sta_ssid.is_empty() {
+        let _ = state
+            .status_led_tx
+            .send(StatusLedMessage::WifiState(WifiStaState::Connecting));
+        prev_led_state = WifiStaState::Connecting;
+    }
+
     loop {
         watchdog.feed();
 
@@ -235,10 +245,10 @@ pub fn wifi_connection_manager(state: &Arc<State>) {
             if l2_connected {
                 match wifi_guard.sta_netif().get_ip_info() {
                     Ok(info) if !info.ip.is_unspecified() => StaConnectionState::Connected(info.ip),
-                    Ok(_) => StaConnectionState::AwaitingIp,
+                    Ok(_) => StaConnectionState::Connecting,
                     Err(e) => {
                         error!("Failed to get STA IP info: {e}");
-                        StaConnectionState::AwaitingIp
+                        StaConnectionState::Connecting
                     }
                 }
             } else {
@@ -246,7 +256,7 @@ pub fn wifi_connection_manager(state: &Arc<State>) {
             }
         };
 
-        let led_state = to_led_state(&connection_state);
+        let led_state = WifiStaState::from(&connection_state);
         update_wifi_state(state, led_state, &mut prev_led_state);
 
         match connection_state {
@@ -258,7 +268,7 @@ pub fn wifi_connection_manager(state: &Arc<State>) {
                 }
                 FreeRtos::delay_ms(1000);
             }
-            StaConnectionState::AwaitingIp => {
+            StaConnectionState::Connecting => {
                 // L2 connected but waiting for IP - don't call connect(), just wait
                 FreeRtos::delay_ms(1000);
             }
@@ -290,7 +300,7 @@ pub fn wifi_connection_manager(state: &Arc<State>) {
                             // Re-evaluate state for the LED on L2 connect
                             let new_state = match wifi_guard.sta_netif().get_ip_info() {
                                 Ok(info) if !info.ip.is_unspecified() => WifiStaState::Connected,
-                                _ => WifiStaState::AwaitingIp,
+                                _ => WifiStaState::Connecting,
                             };
                             update_wifi_state(state, new_state, &mut prev_led_state);
                             break;

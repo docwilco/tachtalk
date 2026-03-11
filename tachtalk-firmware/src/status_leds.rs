@@ -261,7 +261,7 @@ impl LedTaskState {
             });
         };
 
-        if self.wifi == WifiStaState::AwaitingIp {
+        if self.wifi == WifiStaState::Connecting {
             consider(self.wifi_blink_deadline);
         }
         if let Some(t) = self.yellow_activity_deadline {
@@ -279,7 +279,7 @@ impl LedTaskState {
 
     /// Advance blink / flicker / chase timers based on the current time.
     fn update_timers(&mut self, now: Instant) {
-        if self.wifi == WifiStaState::AwaitingIp && now >= self.wifi_blink_deadline {
+        if self.wifi == WifiStaState::Connecting && now >= self.wifi_blink_deadline {
             self.wifi_blink_on = !self.wifi_blink_on;
             self.wifi_blink_deadline = now + Duration::from_millis(WIFI_BLINK_MS);
         }
@@ -312,7 +312,7 @@ impl LedTaskState {
             // Red: WiFi STA state
             let red_on = match self.wifi {
                 WifiStaState::Disconnected => false,
-                WifiStaState::AwaitingIp => self.wifi_blink_on,
+                WifiStaState::Connecting => self.wifi_blink_on,
                 WifiStaState::Connected => true,
             };
             controller.set_red(red_on);
