@@ -5,20 +5,34 @@
 //! received data to the inactive OTA partition and rebooting into the new image.
 
 use crate::error::{Error, Result};
+use crate::status_leds::{StatusLedMessage, StatusLedSender};
+use atomic_enum::atomic_enum;
 use esp_idf_svc::ota::EspOta;
 use log::info;
 use std::sync::atomic::{AtomicU8, Ordering};
 
-/// OTA status: idle (no operation in progress)
-pub const OTA_STATUS_IDLE: u8 = 0;
-/// OTA status: downloading firmware from remote URL
-pub const OTA_STATUS_DOWNLOADING: u8 = 1;
-/// OTA status: writing firmware to flash
-pub const OTA_STATUS_FLASHING: u8 = 2;
-/// OTA status: complete, about to reboot
-pub const OTA_STATUS_DONE: u8 = 3;
-/// OTA status: error occurred (see `ota_error` for details)
-pub const OTA_STATUS_ERROR: u8 = 255;
+/// OTA update status.
+#[atomic_enum]
+#[derive(Default, PartialEq, Eq)]
+pub enum OtaState {
+    /// Idle (no operation in progress)
+    #[default]
+    Idle = 0,
+    /// Downloading firmware from remote URL
+    Downloading = 1,
+    /// Writing firmware to flash
+    Flashing = 2,
+    /// Complete, about to reboot
+    Done = 3,
+    /// Error occurred (see `ota_error` for details)
+    Error = 255,
+}
+
+impl Default for AtomicOtaState {
+    fn default() -> Self {
+        Self::new(OtaState::default())
+    }
+}
 
 /// Firmware version from git describe (e.g. "v0.1.0" or "v0.1.0-test3").
 pub const VERSION: &str = env!("GIT_VERSION");
@@ -109,15 +123,17 @@ where
 /// via the provided atomic status/progress fields.
 pub fn download_and_update(
     url: &str,
-    ota_status: &AtomicU8,
+    ota_status: &AtomicOtaState,
     ota_progress: &AtomicU8,
+    status_led_tx: &StatusLedSender,
 ) -> Result<()> {
     use embedded_svc::io::Read;
     use esp_idf_svc::http::client::{
         Configuration as HttpConfig, EspHttpConnection, FollowRedirectsPolicy,
     };
 
-    ota_status.store(OTA_STATUS_DOWNLOADING, Ordering::Relaxed);
+    ota_status.store(OtaState::Downloading, Ordering::Relaxed);
+    let _ = status_led_tx.send(StatusLedMessage::OtaStatus(OtaState::Downloading));
     ota_progress.store(0, Ordering::Relaxed);
 
     info!("OTA: downloading from {url}");
@@ -150,7 +166,8 @@ pub fn download_and_update(
     }
 
     info!("OTA: firmware size: {content_length} bytes");
-    ota_status.store(OTA_STATUS_FLASHING, Ordering::Relaxed);
+    ota_status.store(OtaState::Flashing, Ordering::Relaxed);
+    let _ = status_led_tx.send(StatusLedMessage::OtaStatus(OtaState::Flashing));
 
     let mut downloaded: usize = 0;
 
@@ -166,7 +183,8 @@ pub fn download_and_update(
         content_length,
     )?;
 
-    ota_status.store(OTA_STATUS_DONE, Ordering::Relaxed);
+    ota_status.store(OtaState::Done, Ordering::Relaxed);
+    let _ = status_led_tx.send(StatusLedMessage::OtaStatus(OtaState::Done));
     ota_progress.store(100, Ordering::Relaxed);
     info!("OTA: download and flash complete");
     Ok(())

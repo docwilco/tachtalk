@@ -417,6 +417,34 @@ pub struct Config {
     /// Dump socket info to serial console every 5 seconds
     #[serde(default)]
     pub dump_socket_info: bool,
+    /// Status LED red (WiFi) GPIO pin - set to 0 to disable
+    #[serde(default = "default_status_led_red_pin")]
+    pub status_led_red_pin: u8,
+    /// Status LED yellow (dongle) GPIO pin - set to 0 to disable
+    #[serde(default = "default_status_led_yellow_pin")]
+    pub status_led_yellow_pin: u8,
+    /// Status LED green (test running) GPIO pin - set to 0 to disable
+    #[serde(default = "default_status_led_green_pin")]
+    pub status_led_green_pin: u8,
+    /// Status LED activity timeout in ms (LED returns to solid-on after this long without activity)
+    #[serde(default = "default_status_led_flicker_ms")]
+    pub status_led_flicker_ms: u16,
+}
+
+const fn default_status_led_red_pin() -> u8 {
+    9
+}
+
+const fn default_status_led_yellow_pin() -> u8 {
+    10
+}
+
+const fn default_status_led_green_pin() -> u8 {
+    11
+}
+
+const fn default_status_led_flicker_ms() -> u16 {
+    50
 }
 
 fn default_ap_ip() -> Ipv4Addr {
@@ -440,6 +468,10 @@ impl Default for Config {
             log_level: LogLevel::default(),
             dump_cpu_metrics: false,
             dump_socket_info: false,
+            status_led_red_pin: default_status_led_red_pin(),
+            status_led_yellow_pin: default_status_led_yellow_pin(),
+            status_led_green_pin: default_status_led_green_pin(),
+            status_led_flicker_ms: default_status_led_flicker_ms(),
         }
     }
 }

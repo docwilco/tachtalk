@@ -446,10 +446,45 @@ pub struct Config {
     /// Profile switch button pin - set to 0 to disable button
     #[serde(default)]
     pub button_pin: u8,
+    /// Status LED red (WiFi) GPIO pin - set to 0 to disable
+    #[serde(default = "default_status_led_red_pin")]
+    pub status_led_red_pin: u8,
+    /// Status LED yellow (dongle) GPIO pin - set to 0 to disable
+    #[serde(default = "default_status_led_yellow_pin")]
+    pub status_led_yellow_pin: u8,
+    /// Status LED green (clients) GPIO pin - set to 0 to disable
+    #[serde(default = "default_status_led_green_pin")]
+    pub status_led_green_pin: u8,
+    /// Status LED activity timeout in ms (LED returns to solid-on after this long without activity)
+    #[serde(default = "default_status_led_flicker_ms")]
+    pub status_led_flicker_ms: u16,
+    /// Turn off RGB LEDs after this many ms without an RPM update (0 = disabled)
+    #[serde(default = "default_rpm_stale_timeout_ms")]
+    pub rpm_stale_timeout_ms: u16,
 }
 
 const fn default_led_gpio() -> u8 {
     48
+}
+
+const fn default_status_led_red_pin() -> u8 {
+    9
+}
+
+const fn default_status_led_yellow_pin() -> u8 {
+    10
+}
+
+const fn default_status_led_green_pin() -> u8 {
+    11
+}
+
+const fn default_status_led_flicker_ms() -> u16 {
+    200
+}
+
+const fn default_rpm_stale_timeout_ms() -> u16 {
+    1000
 }
 
 const fn default_brightness() -> u8 {
@@ -640,6 +675,11 @@ impl Default for Config {
             encoder_pin_a: 0, // Disabled by default
             encoder_pin_b: 0,
             button_pin: 0, // Disabled by default
+            status_led_red_pin: default_status_led_red_pin(),
+            status_led_yellow_pin: default_status_led_yellow_pin(),
+            status_led_green_pin: default_status_led_green_pin(),
+            status_led_flicker_ms: default_status_led_flicker_ms(),
+            rpm_stale_timeout_ms: default_rpm_stale_timeout_ms(),
         }
     }
 }

@@ -141,7 +141,8 @@ fn build_metrics_message(state: &State) -> String {
     let requests_per_sec = metrics.requests_per_sec.load(Ordering::Relaxed);
     let total_requests = metrics.total_requests.load(Ordering::Relaxed);
     let total_errors = metrics.total_errors.load(Ordering::Relaxed);
-    let dongle_connected = state.dongle_connected.load(Ordering::Relaxed);
+    let dongle_connected =
+        state.dongle_tcp_state.load(Ordering::Relaxed) != crate::obd2::DongleTcpState::Disconnected;
 
     // Mode 5 specific
     let bytes_captured = metrics.bytes_captured.load(Ordering::Relaxed);

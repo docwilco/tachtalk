@@ -25,8 +25,33 @@ use tachtalk_elm327_lib::ClientState;
 
 use crate::config::{PidDataLengths, SlowPollMode, MODE01_PID_DATA_LENGTHS};
 use crate::rpm_leds::RpmTaskMessage;
+use crate::status_leds::StatusLedMessage;
 use crate::watchdog::WatchdogHandle;
 use crate::State;
+use atomic_enum::atomic_enum;
+
+// ---------------------------------------------------------------------------
+// DongleTcpState (shared across tasks)
+// ---------------------------------------------------------------------------
+
+/// OBD2 dongle TCP connection state, stored atomically on [`State`](crate::State).
+#[atomic_enum]
+#[derive(Default, PartialEq, Eq)]
+pub enum DongleTcpState {
+    /// No TCP connection
+    #[default]
+    Disconnected = 0,
+    /// TCP connected, running AT init commands / querying supported PIDs
+    Initializing = 1,
+    /// Fully initialized and processing requests
+    Ready = 2,
+}
+
+impl Default for AtomicDongleTcpState {
+    fn default() -> Self {
+        Self::new(DongleTcpState::default())
+    }
+}
 
 const RECONNECT_DELAY: Duration = Duration::from_secs(1);
 /// Maintenance interval for checking promotion/demotion/removal
@@ -1229,6 +1254,7 @@ impl PollingState {
                 .polling_metrics
                 .dongle_requests_total
                 .fetch_add(1, Ordering::Relaxed);
+            let _ = state.status_led_tx.send(StatusLedMessage::DongleActivity);
         } else {
             // RPM is always in fast queue, so we should always poll something
             debug_assert!(
@@ -1255,6 +1281,7 @@ impl PollingState {
                         .polling_metrics
                         .dongle_requests_total
                         .fetch_add(1, Ordering::Relaxed);
+                    let _ = state.status_led_tx.send(StatusLedMessage::DongleActivity);
                 }
             }
             self.last_slow_poll = Instant::now();
@@ -1320,6 +1347,7 @@ impl PollingState {
                                     .polling_metrics
                                     .dongle_requests_total
                                     .fetch_add(1, Ordering::Relaxed);
+                                let _ = state.status_led_tx.send(StatusLedMessage::DongleActivity);
                                 return requests;
                             }
                         }
@@ -1329,6 +1357,7 @@ impl PollingState {
                             .polling_metrics
                             .dongle_requests_total
                             .fetch_add(1, Ordering::Relaxed);
+                        let _ = state.status_led_tx.send(StatusLedMessage::DongleActivity);
                     }
                 }
                 // Unknown ECU count or data length: query individually to learn
@@ -1345,6 +1374,7 @@ impl PollingState {
                             .polling_metrics
                             .dongle_requests_total
                             .fetch_add(1, Ordering::Relaxed);
+                        let _ = state.status_led_tx.send(StatusLedMessage::DongleActivity);
                     }
                 }
             }
@@ -1451,10 +1481,20 @@ fn try_reconnect(
             try_connect(dongle_ip, dongle_port, timeout, watchdog, state)
         {
             *connection = Some(dongle_state);
-            state.dongle_connected.store(true, Ordering::Relaxed);
+            state
+                .dongle_tcp_state
+                .store(DongleTcpState::Ready, Ordering::Relaxed);
+            let _ = state
+                .status_led_tx
+                .send(StatusLedMessage::DongleState(DongleTcpState::Ready));
             *state.dongle_tcp_info.lock().unwrap() = Some((local_addr, remote_addr));
         } else {
-            state.dongle_connected.store(false, Ordering::Relaxed);
+            state
+                .dongle_tcp_state
+                .store(DongleTcpState::Disconnected, Ordering::Relaxed);
+            let _ = state
+                .status_led_tx
+                .send(StatusLedMessage::DongleState(DongleTcpState::Disconnected));
             *state.dongle_tcp_info.lock().unwrap() = None;
             *state.supported_pids.lock().unwrap() = SupportedPidsCache::default();
         }
@@ -1482,7 +1522,12 @@ fn handle_dongle_result(
         Err(DongleError::Disconnected | DongleError::IoError(_)) => {
             warn!("Dongle connection lost, will reconnect");
             *connection = None;
-            state.dongle_connected.store(false, Ordering::Relaxed);
+            state
+                .dongle_tcp_state
+                .store(DongleTcpState::Disconnected, Ordering::Relaxed);
+            let _ = state
+                .status_led_tx
+                .send(StatusLedMessage::DongleState(DongleTcpState::Disconnected));
             *state.dongle_tcp_info.lock().unwrap() = None;
             // Clear stale capability data so a reconnect to a different vehicle
             // doesn't serve outdated supported-PID responses.
@@ -1867,6 +1912,14 @@ fn try_connect(
     let local_addr = stream.local_addr().ok()?;
     let remote_addr = stream.peer_addr().ok()?;
 
+    // Signal that TCP is connected and we're starting initialization
+    state
+        .dongle_tcp_state
+        .store(DongleTcpState::Initializing, Ordering::Relaxed);
+    let _ = state
+        .status_led_tx
+        .send(StatusLedMessage::DongleState(DongleTcpState::Initializing));
+
     watchdog.feed();
 
     if let Err(e) = stream.set_read_timeout(Some(timeout)) {
@@ -1967,7 +2020,11 @@ struct ClientCountGuard<'a> {
 
 impl Drop for ClientCountGuard<'_> {
     fn drop(&mut self) {
-        self.state.obd2_client_count.fetch_sub(1, Ordering::Relaxed);
+        let count = self.state.obd2_client_count.fetch_sub(1, Ordering::Relaxed) - 1;
+        let _ = self
+            .state
+            .status_led_tx
+            .send(StatusLedMessage::ClientCount(count));
         self.state
             .client_tcp_info
             .lock()
@@ -2044,7 +2101,10 @@ impl Obd2Proxy {
         // Track connection info
         let tcp_info = (local, peer);
         state.client_tcp_info.lock().unwrap().push(tcp_info);
-        state.obd2_client_count.fetch_add(1, Ordering::Relaxed);
+        let count = state.obd2_client_count.fetch_add(1, Ordering::Relaxed) + 1;
+        let _ = state
+            .status_led_tx
+            .send(StatusLedMessage::ClientCount(count));
 
         let _guard = ClientCountGuard {
             state,
@@ -2131,6 +2191,9 @@ impl Obd2Proxy {
             writer.write_all(response.as_bytes())?;
             return Ok(());
         }
+
+        // Signal client activity for status LED (non-AT OBD2 command)
+        let _ = state.status_led_tx.send(StatusLedMessage::ClientActivity);
 
         // If capability queries haven't completed yet, reject OBD2 commands.
         // Clients will see "UNABLE TO CONNECT" and should retry, which is the

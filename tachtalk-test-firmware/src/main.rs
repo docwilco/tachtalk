@@ -6,21 +6,16 @@ use thread_util::StackMemory::{Internal, Spiram};
 
 /// Firmware variant identifier for OTA: "regular" or "test"
 pub const FIRMWARE_VARIANT: &str = "test";
-use esp_idf_svc::ipv4::{
-    self, ClientConfiguration as IpClientConfiguration, ClientSettings as IpClientSettings,
-    Configuration as IpConfiguration, Ipv4Addr, Mask, Subnet,
-};
+use esp_idf_svc::ipv4::Ipv4Addr;
 use esp_idf_svc::mdns::EspMdns;
-use esp_idf_svc::netif::{EspNetif, NetifConfiguration, NetifStack};
 use esp_idf_svc::nvs::EspDefaultNvsPartition;
-use esp_idf_svc::wifi::{
-    AccessPointConfiguration, AuthMethod, ClientConfiguration, Configuration, EspWifi, WifiDriver,
-};
-use log::{debug, error, info, warn};
+use esp_idf_svc::wifi::EspWifi;
+use log::{error, info, warn};
 use smallvec::SmallVec;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 mod config;
 mod cpu_metrics;
@@ -29,13 +24,19 @@ mod error;
 mod obd2;
 mod ota;
 mod sse_server;
+pub mod status_leds;
 mod thread_util;
 mod watchdog;
 mod web_server;
+mod wifi;
 
-use crate::watchdog::WatchdogHandle;
 use config::Config;
+use obd2::{AtomicDongleTcpState, DongleTcpState};
+use ota::AtomicOtaState;
+use ota::OtaState;
 use sse_server::{sse_server_task, SseSender};
+use status_leds::{StatusLedController, StatusLedMessage, StatusLedSender};
+use wifi::{init_wifi, wifi_connection_manager, AtomicWifiStaState, WifiStaState};
 
 /// Test metrics shared across tasks
 pub struct TestMetrics {
@@ -111,18 +112,22 @@ pub struct State {
     /// Test metrics
     pub metrics: TestMetrics,
     /// Whether we have an active TCP connection to the OBD2 dongle
-    pub dongle_connected: AtomicBool,
+    pub dongle_tcp_state: AtomicDongleTcpState,
+    /// WiFi STA connection state (for status LED and web UI)
+    pub wifi_sta_state: AtomicWifiStaState,
+    /// Channel sender for the status LED task
+    pub status_led_tx: StatusLedSender,
     /// Control channel for the test task
     pub test_control_tx: Mutex<Option<std::sync::mpsc::Sender<TestControlMessage>>>,
     /// Mode 5 capture buffer (shared so web server can read/clear it)
     pub capture_buffer: Mutex<Vec<u8>>,
     /// Last PID values (or errors) keyed by Mode 01 PID byte.
     pub pid_values: Mutex<HashMap<u8, PidValue>>,
-    /// OTA download status: 0=idle, 1=downloading, 2=flashing, 3=done, 255=error
-    pub ota_status: AtomicU8,
+    /// OTA download status
+    pub ota_status: AtomicOtaState,
     /// OTA progress percentage (0-100)
     pub ota_progress: AtomicU8,
-    /// OTA error message (set when `ota_status` == 255)
+    /// OTA error message (set when `ota_status` == `OtaState::Error`)
     pub ota_error: Mutex<String>,
 }
 
@@ -135,6 +140,7 @@ impl State {
         ap_ssid: String,
         sse_tx: SseSender,
         test_control_tx: std::sync::mpsc::Sender<TestControlMessage>,
+        status_led_tx: StatusLedSender,
     ) -> Self {
         Self {
             config: Mutex::new(config),
@@ -142,11 +148,13 @@ impl State {
             ap_ssid,
             sse_tx,
             metrics: TestMetrics::default(),
-            dongle_connected: AtomicBool::new(false),
+            dongle_tcp_state: AtomicDongleTcpState::new(DongleTcpState::default()),
+            wifi_sta_state: AtomicWifiStaState::new(WifiStaState::default()),
+            status_led_tx,
             test_control_tx: Mutex::new(Some(test_control_tx)),
             capture_buffer: Mutex::default(),
             pid_values: Mutex::default(),
-            ota_status: AtomicU8::new(0),
+            ota_status: AtomicOtaState::new(OtaState::default()),
             ota_progress: AtomicU8::new(0),
             ota_error: Mutex::default(),
         }
@@ -157,54 +165,6 @@ impl State {
 pub enum TestControlMessage {
     Start(crate::config::StartOptions),
     Stop,
-}
-
-/// Create STA network interface with static IP or DHCP based on config
-fn create_sta_netif(config: &Config) -> Result<EspNetif> {
-    if config.ip.use_dhcp {
-        info!("STA netif: DHCP mode");
-        Ok(EspNetif::new(NetifStack::Sta)?)
-    } else {
-        let ip: Ipv4Addr = config
-            .ip
-            .ip
-            .parse()
-            .map_err(|_| crate::error::Error::InvalidStaticIp(config.ip.ip.clone()))?;
-        let mask = config.ip.prefix_len;
-
-        info!("STA netif: Static IP {ip}/{mask} (no gateway)");
-
-        let mut sta_config = NetifConfiguration::wifi_default_client();
-        sta_config.ip_configuration = Some(IpConfiguration::Client(IpClientConfiguration::Fixed(
-            IpClientSettings {
-                ip,
-                subnet: Subnet {
-                    gateway: Ipv4Addr::UNSPECIFIED,
-                    mask: Mask(mask),
-                },
-                dns: None,
-                secondary_dns: None,
-            },
-        )));
-        Ok(EspNetif::new_with_conf(&sta_config)?)
-    }
-}
-
-/// Create AP network interface with captive portal DNS configuration
-fn create_ap_netif(ap_ip: Ipv4Addr, ap_prefix_len: u8) -> Result<EspNetif> {
-    let ap_router_config = ipv4::RouterConfiguration {
-        subnet: ipv4::Subnet {
-            gateway: ap_ip,
-            mask: ipv4::Mask(ap_prefix_len),
-        },
-        dhcp_enabled: true,
-        dns: Some(ap_ip),
-        secondary_dns: Some(ap_ip),
-    };
-
-    let mut ap_netif_config = NetifConfiguration::wifi_default_router();
-    ap_netif_config.ip_configuration = Some(ipv4::Configuration::Router(ap_router_config));
-    Ok(EspNetif::new_with_conf(&ap_netif_config)?)
 }
 
 /// Initialize mDNS for local discovery (tachtalk-test.local)
@@ -224,45 +184,6 @@ fn setup_mdns() -> Option<EspMdns> {
     }
 }
 
-/// Start WiFi in Mixed mode (AP + STA)
-fn start_wifi(
-    config: &Config,
-    mut wifi: EspWifi<'static>,
-    ap_ssid: &str,
-    ap_password: Option<&str>,
-    ap_auth_method: AuthMethod,
-) -> Result<EspWifi<'static>> {
-    let sta_ssid = config.wifi.ssid.clone();
-    let sta_password = config.wifi.password.clone().unwrap_or_default();
-    let sta_auth_method = if sta_password.is_empty() {
-        AuthMethod::None
-    } else {
-        AuthMethod::WPA2Personal
-    };
-
-    let ap_pw = ap_password.unwrap_or("");
-
-    info!("Starting WiFi in Mixed mode: AP '{ap_ssid}' + STA '{sta_ssid}'");
-    wifi.set_configuration(&Configuration::Mixed(
-        ClientConfiguration {
-            ssid: sta_ssid.as_str().try_into().unwrap_or_default(),
-            password: sta_password.as_str().try_into().unwrap_or_default(),
-            auth_method: sta_auth_method,
-            ..Default::default()
-        },
-        AccessPointConfiguration {
-            ssid: ap_ssid.try_into().unwrap(),
-            password: ap_pw.try_into().unwrap_or_default(),
-            auth_method: ap_auth_method,
-            channel: 0,
-            ..Default::default()
-        },
-    ))?;
-    wifi.start()?;
-
-    Ok(wifi)
-}
-
 /// Initialize logging and load configuration from NVS
 fn init_logging_and_config(nvs: EspDefaultNvsPartition) -> Result<Config> {
     config::init_nvs(nvs)?;
@@ -278,50 +199,17 @@ fn init_logging_and_config(nvs: EspDefaultNvsPartition) -> Result<Config> {
     Ok(config)
 }
 
-/// Initialize WiFi driver and network interfaces
-fn init_wifi(
-    config: &Config,
-    modem: esp_idf_hal::modem::Modem,
-    sys_loop: EspSystemEventLoop,
-    nvs: EspDefaultNvsPartition,
-) -> Result<(EspWifi<'static>, String)> {
-    info!("Initializing WiFi...");
-
-    let wifi_driver = WifiDriver::new(modem, sys_loop, Some(nvs))?;
-    let sta_netif = create_sta_netif(config)?;
-    let ap_netif = create_ap_netif(config.ap_ip, config.ap_prefix_len)?;
-    let wifi = EspWifi::wrap_all(wifi_driver, sta_netif, ap_netif)?;
-
-    let ap_ssid = config.ap_ssid.clone();
-
-    let ap_password = config.ap_password.clone();
-    let ap_auth_method = match &ap_password {
-        Some(pw) if !pw.is_empty() => AuthMethod::WPA2Personal,
-        _ => AuthMethod::None,
-    };
-
-    let wifi = start_wifi(
-        config,
-        wifi,
-        &ap_ssid,
-        ap_password.as_deref(),
-        ap_auth_method,
-    )?;
-
-    let ap_ip_info = wifi.ap_netif().get_ip_info()?;
-    info!(
-        "AP started - connect to '{ap_ssid}' and navigate to http://{}",
-        ap_ip_info.ip
-    );
-
-    Ok((wifi, ap_ssid))
-}
-
 /// Spawn all background tasks
+#[allow(clippy::too_many_arguments)]
 fn spawn_background_tasks(
     state: &Arc<State>,
     sse_rx: std::sync::mpsc::Receiver<sse_server::SseMessage>,
     test_control_rx: std::sync::mpsc::Receiver<TestControlMessage>,
+    status_led_rx: std::sync::mpsc::Receiver<StatusLedMessage>,
+    status_led_red_pin: u8,
+    status_led_yellow_pin: u8,
+    status_led_green_pin: u8,
+    status_led_flicker_ms: u16,
     ap_hostname: String,
     ap_ip: Ipv4Addr,
 ) {
@@ -359,6 +247,20 @@ fn spawn_background_tasks(
         let state = state.clone();
         thread_util::spawn_named(c"wifi_mgr", 8192, Spiram, move || {
             wifi_connection_manager(&state);
+        });
+    }
+
+    // Start status LED task
+    {
+        let mut status_led_controller = StatusLedController::new(
+            status_led_red_pin,
+            status_led_yellow_pin,
+            status_led_green_pin,
+        );
+        let flicker_duration = Duration::from_millis(u64::from(status_led_flicker_ms));
+        thread_util::spawn_named(c"status_led", 3072, Internal, move || {
+            status_led_controller.boot_animation(Duration::from_millis(250));
+            status_leds::status_led_task(status_led_controller, &status_led_rx, flicker_duration);
         });
     }
 }
@@ -477,11 +379,36 @@ fn main() -> Result<()> {
     // Create channels
     let (sse_tx, sse_rx) = std::sync::mpsc::channel();
     let (test_control_tx, test_control_rx) = std::sync::mpsc::channel();
+    let (status_led_tx, status_led_rx) = std::sync::mpsc::channel();
+
+    // Read status LED config before moving config into State
+    let status_led_red_pin = config.status_led_red_pin;
+    let status_led_yellow_pin = config.status_led_yellow_pin;
+    let status_led_green_pin = config.status_led_green_pin;
+    let status_led_flicker_ms = config.status_led_flicker_ms;
 
     // Create central State struct
-    let state = Arc::new(State::new(config, wifi, ap_ssid, sse_tx, test_control_tx));
+    let state = Arc::new(State::new(
+        config,
+        wifi,
+        ap_ssid,
+        sse_tx,
+        test_control_tx,
+        status_led_tx,
+    ));
 
-    spawn_background_tasks(&state, sse_rx, test_control_rx, ap_hostname, ap_ip);
+    spawn_background_tasks(
+        &state,
+        sse_rx,
+        test_control_rx,
+        status_led_rx,
+        status_led_red_pin,
+        status_led_yellow_pin,
+        status_led_green_pin,
+        status_led_flicker_ms,
+        ap_hostname,
+        ap_ip,
+    );
 
     // Start mDNS for local discovery
     let _mdns = setup_mdns();
@@ -518,94 +445,6 @@ fn main() -> Result<()> {
                 metrics.total_requests.load(Ordering::Relaxed),
                 metrics.total_errors.load(Ordering::Relaxed),
             );
-        }
-    }
-}
-
-/// Connection state for WiFi station interface
-enum StaConnectionState {
-    Disconnected,
-    AwaitingIp,
-    Connected(Ipv4Addr),
-}
-
-/// Background task to manage WiFi STA connection
-fn wifi_connection_manager(state: &Arc<State>) {
-    let watchdog = WatchdogHandle::register(c"wifi_manager");
-
-    let sta_ssid = {
-        let cfg_guard = state.config.lock().unwrap();
-        cfg_guard.wifi.ssid.clone()
-    };
-
-    let mut was_connected = false;
-
-    loop {
-        watchdog.feed();
-
-        let connection_state = {
-            let wifi_guard = state.wifi.lock().unwrap();
-            let l2_connected = match wifi_guard.is_connected() {
-                Ok(connected) => connected,
-                Err(e) => {
-                    error!("Failed to check WiFi connection status: {e}");
-                    false
-                }
-            };
-            if l2_connected {
-                match wifi_guard.sta_netif().get_ip_info() {
-                    Ok(info) if !info.ip.is_unspecified() => StaConnectionState::Connected(info.ip),
-                    Ok(_) => StaConnectionState::AwaitingIp,
-                    Err(e) => {
-                        error!("Failed to get STA IP info: {e}");
-                        StaConnectionState::AwaitingIp
-                    }
-                }
-            } else {
-                StaConnectionState::Disconnected
-            }
-        };
-
-        match connection_state {
-            StaConnectionState::Connected(ip) => {
-                if !was_connected {
-                    info!("WiFi STA connected to '{sta_ssid}' with IP: {ip}");
-                    was_connected = true;
-                }
-                FreeRtos::delay_ms(1000);
-            }
-            StaConnectionState::AwaitingIp => {
-                FreeRtos::delay_ms(1000);
-            }
-            StaConnectionState::Disconnected => {
-                if was_connected {
-                    warn!("WiFi STA disconnected from '{sta_ssid}'");
-                    was_connected = false;
-                }
-
-                debug!("Attempting to connect to '{sta_ssid}'...");
-
-                {
-                    let mut wifi_guard = state.wifi.lock().unwrap();
-                    if let Err(e) = wifi_guard.connect() {
-                        debug!("STA connection initiation failed: {e:?}");
-                    }
-                }
-
-                for _ in 0..15 {
-                    watchdog.feed();
-                    FreeRtos::delay_ms(1000);
-
-                    let wifi_guard = state.wifi.lock().unwrap();
-                    match wifi_guard.is_connected() {
-                        Ok(true) => break,
-                        Ok(false) => {}
-                        Err(e) => {
-                            error!("Failed to check WiFi connection status: {e}");
-                        }
-                    }
-                }
-            }
         }
     }
 }

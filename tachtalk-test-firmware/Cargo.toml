@@ -19,6 +19,7 @@ esp-idf-hal.workspace = true
 esp-idf-svc.workspace = true
 esp-idf-sys.workspace = true
 log.workspace = true
+atomic_enum.workspace = true
 oneshot.workspace = true
 serde.workspace = true
 serde_json.workspace = true

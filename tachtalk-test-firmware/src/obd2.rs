@@ -12,8 +12,10 @@
 use crate::config::{
     CaptureOverflow, PidDataLengths, QueryMode, StartOptions, MODE01_PID_DATA_LENGTHS,
 };
+use crate::status_leds::StatusLedMessage;
 use crate::watchdog::WatchdogHandle;
 use crate::{State, TestControlMessage};
+use atomic_enum::atomic_enum;
 use log::{debug, error, info, warn};
 use smallvec::SmallVec;
 use std::collections::{HashMap, VecDeque};
@@ -25,6 +27,25 @@ use std::time::{Duration, Instant};
 use tachtalk_capture_format::{
     CaptureHeader, RecordType, FLAG_OVERFLOW, HEADER_SIZE, RECORD_HEADER_SIZE,
 };
+
+/// OBD2 dongle TCP connection state, stored atomically on [`State`](crate::State).
+#[atomic_enum]
+#[derive(Default, PartialEq, Eq)]
+pub enum DongleTcpState {
+    /// No TCP connection
+    #[default]
+    Disconnected = 0,
+    /// TCP connected, running AT init commands / querying supported PIDs
+    Initializing = 1,
+    /// Fully initialized and processing requests
+    Ready = 2,
+}
+
+impl Default for AtomicDongleTcpState {
+    fn default() -> Self {
+        Self::new(DongleTcpState::default())
+    }
+}
 
 /// Type alias for small OBD2 command/response buffers
 pub type Obd2Buffer = SmallVec<[u8; 32]>;
@@ -905,6 +926,11 @@ impl QueryBuilder {
                         .metrics
                         .total_requests
                         .fetch_add(1, Ordering::Relaxed);
+                    let _ = ctx
+                        .state
+                        .status_led_tx
+                        .send(StatusLedMessage::DongleActivity);
+                    let _ = ctx.state.status_led_tx.send(StatusLedMessage::TestActivity);
                     requests_this_second += 1;
 
                     update_pid_values(ctx.state, &parsed, &queried_pids, &self.count.pid_lengths);
@@ -917,7 +943,13 @@ impl QueryBuilder {
                         .fetch_add(1, Ordering::Relaxed);
 
                     if e.contains("Disconnect") {
-                        ctx.state.dongle_connected.store(false, Ordering::Relaxed);
+                        ctx.state
+                            .dongle_tcp_state
+                            .store(DongleTcpState::Disconnected, Ordering::Relaxed);
+                        let _ = ctx
+                            .state
+                            .status_led_tx
+                            .send(StatusLedMessage::DongleState(DongleTcpState::Disconnected));
                         return Err(e);
                     }
                 }
@@ -1048,6 +1080,11 @@ impl QueryBuilder {
                         .metrics
                         .total_requests
                         .fetch_add(1, Ordering::Relaxed);
+                    let _ = ctx
+                        .state
+                        .status_led_tx
+                        .send(StatusLedMessage::DongleActivity);
+                    let _ = ctx.state.status_led_tx.send(StatusLedMessage::TestActivity);
                     requests_this_second += 1;
 
                     update_pid_values(ctx.state, &parsed, &queried_pids, &self.count.pid_lengths);
@@ -1065,7 +1102,13 @@ impl QueryBuilder {
                             .fetch_add(1, Ordering::Relaxed);
 
                         if e.contains("Disconnect") {
-                            ctx.state.dongle_connected.store(false, Ordering::Relaxed);
+                            ctx.state
+                                .dongle_tcp_state
+                                .store(DongleTcpState::Disconnected, Ordering::Relaxed);
+                            let _ = ctx
+                                .state
+                                .status_led_tx
+                                .send(StatusLedMessage::DongleState(DongleTcpState::Disconnected));
                             return Err(e);
                         }
                     }
@@ -1218,6 +1261,10 @@ fn run_test(ctx: &TestContext, start_options: StartOptions) {
         .metrics
         .test_running
         .store(true, Ordering::Relaxed);
+    let _ = ctx
+        .state
+        .status_led_tx
+        .send(StatusLedMessage::TestRunning(true));
 
     info!(
         "Starting test with mode {:?}",
@@ -1257,7 +1304,17 @@ fn run_test(ctx: &TestContext, start_options: StartOptions) {
         .metrics
         .test_running
         .store(false, Ordering::Relaxed);
-    ctx.state.dongle_connected.store(false, Ordering::Relaxed);
+    let _ = ctx
+        .state
+        .status_led_tx
+        .send(StatusLedMessage::TestRunning(false));
+    ctx.state
+        .dongle_tcp_state
+        .store(DongleTcpState::Disconnected, Ordering::Relaxed);
+    let _ = ctx
+        .state
+        .status_led_tx
+        .send(StatusLedMessage::DongleState(DongleTcpState::Disconnected));
 
     match result {
         Ok(()) => info!("Test completed normally"),
@@ -1281,13 +1338,26 @@ fn run_polling_test(ctx: &TestContext, config: &TestConfig) -> Result<(), String
     };
 
     // Layer 1: Base — connect and general AT init
+    let _ = ctx
+        .state
+        .status_led_tx
+        .send(StatusLedMessage::DongleState(DongleTcpState::Initializing));
+    ctx.state
+        .dongle_tcp_state
+        .store(DongleTcpState::Initializing, Ordering::Relaxed);
     let base = Base::connect_and_init(
         &config.dongle_ip,
         config.dongle_port,
         config.timeout,
         capture_state,
     )?;
-    ctx.state.dongle_connected.store(true, Ordering::Relaxed);
+    ctx.state
+        .dongle_tcp_state
+        .store(DongleTcpState::Ready, Ordering::Relaxed);
+    let _ = ctx
+        .state
+        .status_led_tx
+        .send(StatusLedMessage::DongleState(DongleTcpState::Ready));
 
     // Layer 2: Repeat
     let repeat = RepeatLayer::new(
@@ -1436,9 +1506,22 @@ fn handle_capture_client(
     // Connect to dongle
     let dongle_addr = config.dongle_addr();
     let mut stop_requested = false;
+    ctx.state
+        .dongle_tcp_state
+        .store(DongleTcpState::Initializing, Ordering::Relaxed);
+    let _ = ctx
+        .state
+        .status_led_tx
+        .send(StatusLedMessage::DongleState(DongleTcpState::Initializing));
     match TcpStream::connect(&dongle_addr) {
         Ok(dongle_stream) => {
-            ctx.state.dongle_connected.store(true, Ordering::Relaxed);
+            ctx.state
+                .dongle_tcp_state
+                .store(DongleTcpState::Ready, Ordering::Relaxed);
+            let _ = ctx
+                .state
+                .status_led_tx
+                .send(StatusLedMessage::DongleState(DongleTcpState::Ready));
             info!("Connected to dongle at {dongle_addr}");
 
             let result = proxy_loop(
@@ -1450,7 +1533,13 @@ fn handle_capture_client(
                 bytes_this_second,
             );
 
-            ctx.state.dongle_connected.store(false, Ordering::Relaxed);
+            ctx.state
+                .dongle_tcp_state
+                .store(DongleTcpState::Disconnected, Ordering::Relaxed);
+            let _ = ctx
+                .state
+                .status_led_tx
+                .send(StatusLedMessage::DongleState(DongleTcpState::Disconnected));
 
             match result {
                 Ok(stopped) => stop_requested = stopped,
@@ -1594,6 +1683,11 @@ fn proxy_loop(
                     .metrics
                     .total_requests
                     .fetch_add(1, Ordering::Relaxed);
+                let _ = ctx
+                    .state
+                    .status_led_tx
+                    .send(StatusLedMessage::DongleActivity);
+                let _ = ctx.state.status_led_tx.send(StatusLedMessage::TestActivity);
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
             Err(e) => return Err(format!("Client read error: {e}")),

@@ -125,6 +125,9 @@ fn check_restart_needed(current: &Config, new: &Config) -> (SmallVec<[u8; 4]>, b
     let encoder_a_changed = current.encoder_pin_a != new.encoder_pin_a;
     let encoder_b_changed = current.encoder_pin_b != new.encoder_pin_b;
     let button_changed = current.button_pin != new.button_pin;
+    let status_red_changed = current.status_led_red_pin != new.status_led_red_pin;
+    let status_yellow_changed = current.status_led_yellow_pin != new.status_led_yellow_pin;
+    let status_green_changed = current.status_led_green_pin != new.status_led_green_pin;
     let wifi_changed =
         current.wifi.ssid != new.wifi.ssid || current.wifi.password != new.wifi.password;
     let ip_changed = current.ip.use_dhcp != new.ip.use_dhcp
@@ -149,11 +152,23 @@ fn check_restart_needed(current: &Config, new: &Config) -> (SmallVec<[u8; 4]>, b
     if button_changed && current.button_pin != 0 {
         gpios_to_reset.push(current.button_pin);
     }
+    if status_red_changed && current.status_led_red_pin != 0 {
+        gpios_to_reset.push(current.status_led_red_pin);
+    }
+    if status_yellow_changed && current.status_led_yellow_pin != 0 {
+        gpios_to_reset.push(current.status_led_yellow_pin);
+    }
+    if status_green_changed && current.status_led_green_pin != 0 {
+        gpios_to_reset.push(current.status_led_green_pin);
+    }
 
     let needs_restart = led_changed
         || encoder_a_changed
         || encoder_b_changed
         || button_changed
+        || status_red_changed
+        || status_yellow_changed
+        || status_green_changed
         || wifi_changed
         || ip_changed
         || ap_changed;
@@ -678,7 +693,8 @@ fn register_status_routes(server: &mut EspHttpServer<'static>, state: &Arc<State
             .unwrap()
             .is_connected()
             .unwrap_or(false);
-        let dongle_tcp_connected = state_clone.dongle_connected.load(Ordering::Relaxed);
+        let dongle_tcp_connected = state_clone.dongle_tcp_state.load(Ordering::Relaxed)
+            != crate::obd2::DongleTcpState::Disconnected;
         let obd2_client_count = state_clone.obd2_client_count.load(Ordering::Relaxed);
 
         let status = ConnectionStatus {
@@ -1186,10 +1202,8 @@ fn register_ota_download_routes(
             info!("HTTP: POST /api/ota/download");
 
             // Reject if OTA already in progress
-            let current = state_clone
-                .ota_status
-                .load(std::sync::atomic::Ordering::Relaxed);
-            if current != crate::ota::OTA_STATUS_IDLE && current != crate::ota::OTA_STATUS_ERROR {
+            let current = state_clone.ota_status.load(Ordering::Relaxed);
+            if current != crate::ota::OtaState::Idle && current != crate::ota::OtaState::Error {
                 let mut response = req.into_response(
                     409,
                     Some("Conflict"),
@@ -1209,10 +1223,9 @@ fn register_ota_download_routes(
             info!("OTA download: url={url}");
 
             // Reset status
-            state_clone.ota_status.store(
-                crate::ota::OTA_STATUS_DOWNLOADING,
-                std::sync::atomic::Ordering::Relaxed,
-            );
+            state_clone
+                .ota_status
+                .store(crate::ota::OtaState::Updating, Ordering::Relaxed);
             state_clone
                 .ota_progress
                 .store(0, std::sync::atomic::Ordering::Relaxed);
@@ -1230,6 +1243,7 @@ fn register_ota_download_routes(
                     &url,
                     &state.ota_status,
                     &state.ota_progress,
+                    &state.status_led_tx,
                 ) {
                     Ok(()) => {
                         info!("OTA download: success, rebooting");
@@ -1238,9 +1252,13 @@ fn register_ota_download_routes(
                     Err(e) => {
                         error!("OTA download failed: {e:?}");
                         *state.ota_error.lock().unwrap() = format!("{e}");
-                        state.ota_status.store(
-                            crate::ota::OTA_STATUS_ERROR,
-                            std::sync::atomic::Ordering::Relaxed,
+                        state
+                            .ota_status
+                            .store(crate::ota::OtaState::Error, Ordering::Relaxed);
+                        let _ = state.status_led_tx.send(
+                            crate::status_leds::StatusLedMessage::OtaStatus(
+                                crate::ota::OtaState::Error,
+                            ),
                         );
                     }
                 },
@@ -1265,18 +1283,19 @@ fn register_ota_status_route(
         "/api/ota/status",
         Method::Get,
         move |req| -> HandlerResult {
-            let status = state_clone
-                .ota_status
-                .load(std::sync::atomic::Ordering::Relaxed);
+            let status = state_clone.ota_status.load(Ordering::Relaxed);
             let progress = state_clone
                 .ota_progress
                 .load(std::sync::atomic::Ordering::Relaxed);
-            let json = if status == crate::ota::OTA_STATUS_ERROR {
+            let status_u8 = status as u8;
+            let json = if status == crate::ota::OtaState::Error {
                 let error = state_clone.ota_error.lock().unwrap();
                 let escaped = error.replace('\\', "\\\\").replace('"', "\\\"");
-                format!("{{\"status\":{status},\"progress\":{progress},\"error\":\"{escaped}\"}}")
+                format!(
+                    "{{\"status\":{status_u8},\"progress\":{progress},\"error\":\"{escaped}\"}}"
+                )
             } else {
-                format!("{{\"status\":{status},\"progress\":{progress}}}")
+                format!("{{\"status\":{status_u8},\"progress\":{progress}}}")
             };
             let mut response = req.into_ok_response()?;
             response.write_all(json.as_bytes())?;
@@ -1302,6 +1321,7 @@ pub fn start_server(
         max_open_sockets: 6,
         session_timeout: core::time::Duration::from_secs(2),
         lru_purge_enable: true,
+        stack_size: 10240,
         ..Default::default()
     };
     let mut server = EspHttpServer::new(&server_config)?;

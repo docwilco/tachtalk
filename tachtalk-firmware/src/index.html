@@ -819,6 +819,7 @@
         
         <div class="wifi-config">
             <h2>📶 WiFi Configuration</h2>
+            <small style="color: #888; display: block; margin-bottom: 10px;">Changes require reboot to take effect</small>
             <div class="form-group">
                 <label>SSID:</label>
                 <input type="text" id="wifiSsid" placeholder="Your WiFi network name">
@@ -1003,6 +1004,11 @@
                 <small style="color: #888;">(requires restart)</small>
             </div>
             <div class="form-group">
+                <label>RPM Stale Timeout (ms):</label>
+                <input type="number" id="rpmStaleTimeoutMs" value="1000" min="0" max="65535">
+                <small style="color: #888;">Turn off shift LEDs after this long without RPM data (0 = disabled)</small>
+            </div>
+            <div class="form-group">
                 <label>Encoder Pin A:</label>
                 <input type="number" id="encoderPinA" value="0" min="0" max="48">
                 <small style="color: #888;">0 = disabled (requires restart)</small>
@@ -1016,6 +1022,26 @@
                 <label>Button Pin:</label>
                 <input type="number" id="buttonPin" value="0" min="0" max="48">
                 <small style="color: #888;">Profile switch button, 0 = disabled (requires restart)</small>
+            </div>
+            <div class="form-group">
+                <label>Status LED Red Pin:</label>
+                <input type="number" id="statusLedRedPin" value="9" min="0" max="48">
+                <small style="color: #888;">WiFi status, 0 = disabled (requires restart)</small>
+            </div>
+            <div class="form-group">
+                <label>Status LED Yellow Pin:</label>
+                <input type="number" id="statusLedYellowPin" value="10" min="0" max="48">
+                <small style="color: #888;">Dongle status, 0 = disabled (requires restart)</small>
+            </div>
+            <div class="form-group">
+                <label>Status LED Green Pin:</label>
+                <input type="number" id="statusLedGreenPin" value="11" min="0" max="48">
+                <small style="color: #888;">Client status, 0 = disabled (requires restart)</small>
+            </div>
+            <div class="form-group">
+                <label>Status LED Flicker (ms):</label>
+                <input type="number" id="statusLedFlickerMs" value="50" min="10" max="1000">
+                <small style="color: #888;">Inactivity timeout before LED returns to solid-on</small>
             </div>
         </div>
         
@@ -1121,10 +1147,135 @@
             return config.profiles[config.active_profile] || config.profiles[0];
         }
 
-        // Helper to get default value by path (e.g., 'obd2.dongle_ip')
+        // Helper to get/set nested values by path (e.g., 'obd2.dongle_ip')
+        function getPath(obj, path) {
+            return path.split('.').reduce((o, k) => o?.[k], obj);
+        }
+        function setPath(obj, path, value) {
+            const keys = path.split('.');
+            const last = keys.pop();
+            const target = keys.reduce((o, k) => (o[k] = o[k] || {}, o[k]), obj);
+            target[last] = value;
+        }
         function d(path) {
-            if (!defaults) return undefined;
-            return path.split('.').reduce((obj, key) => obj?.[key], defaults);
+            return getPath(defaults, path);
+        }
+
+        // Field definitions - single source of truth for form ↔ config mapping
+        // type: 'int' | 'bool' | 'str'
+        // default: path to default value (uses d())
+        // fallback: literal fallback value (e.g., 0 for disabled pins)
+        // nullIfEmpty: convert empty string to null
+        // emptyOnLoad: show empty string in form when loading (even if config has value)
+        const FORM_FIELDS = [
+            // System settings
+            { id: 'totalLeds', path: 'total_leds', type: 'int' },
+            { id: 'ledGpio', path: 'led_gpio', type: 'int', default: 'led_gpio' },
+            { id: 'rpmStaleTimeoutMs', path: 'rpm_stale_timeout_ms', type: 'int', fallback: 0 },
+            { id: 'encoderPinA', path: 'encoder_pin_a', type: 'int', fallback: 0 },
+            { id: 'encoderPinB', path: 'encoder_pin_b', type: 'int', fallback: 0 },
+            { id: 'buttonPin', path: 'button_pin', type: 'int', fallback: 0 },
+            { id: 'statusLedRedPin', path: 'status_led_red_pin', type: 'int', default: 'status_led_red_pin' },
+            { id: 'statusLedYellowPin', path: 'status_led_yellow_pin', type: 'int', default: 'status_led_yellow_pin' },
+            { id: 'statusLedGreenPin', path: 'status_led_green_pin', type: 'int', default: 'status_led_green_pin' },
+            { id: 'statusLedFlickerMs', path: 'status_led_flicker_ms', type: 'int', default: 'status_led_flicker_ms' },
+            { id: 'logLevel', path: 'log_level', type: 'str', default: 'log_level' },
+            { id: 'dumpCpuMetrics', path: 'dump_cpu_metrics', type: 'bool', default: 'dump_cpu_metrics' },
+            { id: 'dumpSocketInfo', path: 'dump_socket_info', type: 'bool', default: 'dump_socket_info' },
+            // WiFi
+            { id: 'wifiSsid', path: 'wifi.ssid', type: 'str', emptyOnLoad: true },
+            { id: 'wifiPassword', path: 'wifi.password', type: 'str', nullIfEmpty: true, emptyOnLoad: true },
+            // IP
+            { id: 'staticIp', path: 'ip.ip', type: 'str', default: 'ip.ip', emptyOnLoad: true },
+            { id: 'staticPrefixLen', path: 'ip.prefix_len', type: 'int', default: 'ip.prefix_len' },
+            // AP
+            { id: 'apSsid', path: 'ap_ssid', type: 'str', emptyOnLoad: true },
+            { id: 'apPassword', path: 'ap_password', type: 'str', nullIfEmpty: true, emptyOnLoad: true },
+            { id: 'apIp', path: 'ap_ip', type: 'str', default: 'ap_ip' },
+            { id: 'apPrefixLen', path: 'ap_prefix_len', type: 'int', default: 'ap_prefix_len' },
+            // OBD2 timeout (top-level)
+            { id: 'obd2TimeoutMs', path: 'obd2_timeout_ms', type: 'int', default: 'obd2_timeout_ms' },
+            // OBD2 nested
+            { id: 'obd2DongleIp', path: 'obd2.dongle_ip', type: 'str', default: 'obd2.dongle_ip' },
+            { id: 'obd2DonglePort', path: 'obd2.dongle_port', type: 'int', default: 'obd2.dongle_port' },
+            { id: 'obd2ListenPort', path: 'obd2.listen_port', type: 'int', default: 'obd2.listen_port' },
+            { id: 'obd2SlowPollMode', path: 'obd2.slow_poll_mode', type: 'str', default: 'obd2.slow_poll_mode' },
+            { id: 'obd2SlowPollMs', path: 'obd2.slow_poll_interval_ms', type: 'int', default: 'obd2.slow_poll_interval_ms' },
+            { id: 'obd2SlowPollRatio', path: 'obd2.slow_poll_ratio', type: 'int', default: 'obd2.slow_poll_ratio' },
+            { id: 'obd2PromotionThreshold', path: 'obd2.promotion_wait_threshold_ms', type: 'int', default: 'obd2.promotion_wait_threshold_ms' },
+            { id: 'obd2FastDemotionMs', path: 'obd2.fast_demotion_ms', type: 'int', default: 'obd2.fast_demotion_ms' },
+            { id: 'obd2PidRemovalMs', path: 'obd2.pid_inactive_removal_ms', type: 'int', default: 'obd2.pid_inactive_removal_ms' },
+            { id: 'obd2UseMultiPid', path: 'obd2.use_multi_pid', type: 'bool', default: 'obd2.use_multi_pid' },
+            { id: 'obd2MaxPidsPerQuery', path: 'obd2.max_pids_per_query', type: 'int', default: 'obd2.max_pids_per_query' },
+            { id: 'obd2UseRepeat', path: 'obd2.use_repeat', type: 'bool', default: 'obd2.use_repeat' },
+            { id: 'obd2RepeatString', path: 'obd2.repeat_string', type: 'str', default: 'obd2.repeat_string' },
+            { id: 'obd2UseFraming', path: 'obd2.use_framing', type: 'bool', default: 'obd2.use_framing' },
+            { id: 'obd2UsePipelining', path: 'obd2.use_pipelining', type: 'bool', default: 'obd2.use_pipelining' },
+            { id: 'obd2CaptureEnabled', path: 'obd2.capture_enabled', type: 'bool', default: 'obd2.capture_enabled' },
+            { id: 'obd2CaptureBufferSize', path: 'obd2.capture_buffer_size', type: 'int', default: 'obd2.capture_buffer_size' },
+        ];
+
+        // Populate form from config object
+        function populateForm() {
+            for (const field of FORM_FIELDS) {
+                const el = document.getElementById(field.id);
+                if (!el) continue;
+                
+                let value = getPath(config, field.path);
+                // Apply default/fallback for missing values
+                if (value === undefined || value === null) {
+                    if (field.default) value = d(field.default);
+                    else if (field.fallback !== undefined) value = field.fallback;
+                }
+                // For fields that should show empty when value is falsy
+                if (field.emptyOnLoad && !value) value = '';
+                
+                if (field.type === 'bool') {
+                    el.checked = !!value;
+                } else {
+                    el.value = value ?? '';
+                }
+            }
+            // Special cases
+            const ipConfig = config.ip || defaults?.ip || {};
+            document.getElementById('ipMode').value = ipConfig.use_dhcp ? 'dhcp' : 'static';
+            toggleStaticIp();
+            toggleSlowPollMode();
+            // Brightness
+            const brightness = config.brightness !== undefined ? config.brightness : 255;
+            document.getElementById('brightnessSlider').value = brightness;
+            document.getElementById('brightnessValue').textContent = brightness;
+            
+            renderProfiles();
+            renderRules();
+        }
+
+        // Build config object from form values
+        function buildConfigFromForm() {
+            const result = { ...config };
+            for (const field of FORM_FIELDS) {
+                const el = document.getElementById(field.id);
+                if (!el) continue;
+                
+                let value;
+                if (field.type === 'bool') {
+                    value = el.checked;
+                } else if (field.type === 'int') {
+                    value = parseInt(el.value);
+                    if (isNaN(value) || el.value === '') {
+                        value = field.fallback !== undefined ? field.fallback : d(field.default);
+                    }
+                } else {
+                    value = el.value;
+                    if (field.nullIfEmpty && !value) value = null;
+                    else if (!value && field.default) value = d(field.default);
+                }
+                setPath(result, field.path, value);
+            }
+            // Special case: IP mode
+            result.ip = result.ip || {};
+            result.ip.use_dhcp = document.getElementById('ipMode').value === 'dhcp';
+            return result;
         }
 
         async function loadDefaults() {
@@ -1579,54 +1730,6 @@
             }, 3000);
         }
 
-        // Build config object from form values
-        function buildConfigFromForm() {
-            return {
-                ...config,
-                total_leds: parseInt(document.getElementById('totalLeds').value),
-                led_gpio: parseInt(document.getElementById('ledGpio').value),
-                encoder_pin_a: parseInt(document.getElementById('encoderPinA').value) || 0,
-                encoder_pin_b: parseInt(document.getElementById('encoderPinB').value) || 0,
-                button_pin: parseInt(document.getElementById('buttonPin').value) || 0,
-                obd2: {
-                    dongle_ip: document.getElementById('obd2DongleIp').value || d('obd2.dongle_ip'),
-                    dongle_port: parseInt(document.getElementById('obd2DonglePort').value) || d('obd2.dongle_port'),
-                    listen_port: parseInt(document.getElementById('obd2ListenPort').value) || d('obd2.listen_port'),
-                    slow_poll_mode: document.getElementById('obd2SlowPollMode').value || d('obd2.slow_poll_mode'),
-                    slow_poll_interval_ms: parseInt(document.getElementById('obd2SlowPollMs').value) || d('obd2.slow_poll_interval_ms'),
-                    slow_poll_ratio: parseInt(document.getElementById('obd2SlowPollRatio').value) || d('obd2.slow_poll_ratio'),
-                    promotion_wait_threshold_ms: parseInt(document.getElementById('obd2PromotionThreshold').value) || d('obd2.promotion_wait_threshold_ms'),
-                    fast_demotion_ms: parseInt(document.getElementById('obd2FastDemotionMs').value) || d('obd2.fast_demotion_ms'),
-                    pid_inactive_removal_ms: parseInt(document.getElementById('obd2PidRemovalMs').value) || d('obd2.pid_inactive_removal_ms'),
-                    use_multi_pid: document.getElementById('obd2UseMultiPid').checked,
-                    max_pids_per_query: parseInt(document.getElementById('obd2MaxPidsPerQuery').value) || d('obd2.max_pids_per_query'),
-                    use_repeat: document.getElementById('obd2UseRepeat').checked,
-                    repeat_string: document.getElementById('obd2RepeatString').value,
-                    use_framing: document.getElementById('obd2UseFraming').checked,
-                    use_pipelining: document.getElementById('obd2UsePipelining').checked,
-                    capture_enabled: document.getElementById('obd2CaptureEnabled').checked,
-                    capture_buffer_size: parseInt(document.getElementById('obd2CaptureBufferSize').value) || d('obd2.capture_buffer_size')
-                },
-                obd2_timeout_ms: parseInt(document.getElementById('obd2TimeoutMs').value) || d('obd2_timeout_ms'),
-                wifi: {
-                    ssid: document.getElementById('wifiSsid').value,
-                    password: document.getElementById('wifiPassword').value || null
-                },
-                ip: {
-                    use_dhcp: document.getElementById('ipMode').value === 'dhcp',
-                    ip: document.getElementById('staticIp').value || '192.168.0.20',
-                    prefix_len: parseInt(document.getElementById('staticPrefixLen').value) || 24
-                },
-                ap_ssid: document.getElementById('apSsid').value,
-                ap_password: document.getElementById('apPassword').value || null,
-                ap_ip: document.getElementById('apIp').value || d('ap_ip'),
-                ap_prefix_len: parseInt(document.getElementById('apPrefixLen').value) || d('ap_prefix_len'),
-                log_level: document.getElementById('logLevel').value,
-                dump_cpu_metrics: document.getElementById('dumpCpuMetrics').checked,
-                dump_socket_info: document.getElementById('dumpSocketInfo').checked
-            };
-        }
-
         async function saveConfig() {
             const newConfig = buildConfigFromForm();
             
@@ -1768,65 +1871,7 @@
                 const response = await fetch('/api/config');
                 if (response.ok) {
                     config = await response.json();
-                    document.getElementById('totalLeds').value = config.total_leds;
-                    document.getElementById('ledGpio').value = config.led_gpio ?? d('led_gpio');
-                    document.getElementById('encoderPinA').value = config.encoder_pin_a ?? 0;
-                    document.getElementById('encoderPinB').value = config.encoder_pin_b ?? 0;
-                    document.getElementById('buttonPin').value = config.button_pin ?? 0;
-                    document.getElementById('wifiSsid').value = config.wifi?.ssid || '';
-                    document.getElementById('wifiPassword').value = config.wifi?.password || '';
-                    
-                    // IP config
-                    const ipConfig = config.ip || defaults?.ip || {};
-                    document.getElementById('ipMode').value = ipConfig.use_dhcp ? 'dhcp' : 'static';
-                    document.getElementById('staticIp').value = ipConfig.ip || '';
-                    document.getElementById('staticPrefixLen').value = ipConfig.prefix_len ?? d('ip.prefix_len');
-                    toggleStaticIp();
-                    
-                    // OBD2 config
-                    const obd2Config = config.obd2 || defaults?.obd2 || {};
-                    document.getElementById('obd2DongleIp').value = obd2Config.dongle_ip ?? d('obd2.dongle_ip');
-                    document.getElementById('obd2DonglePort').value = obd2Config.dongle_port ?? d('obd2.dongle_port');
-                    document.getElementById('obd2ListenPort').value = obd2Config.listen_port ?? d('obd2.listen_port');
-                    document.getElementById('obd2SlowPollMode').value = obd2Config.slow_poll_mode ?? d('obd2.slow_poll_mode');
-                    document.getElementById('obd2SlowPollMs').value = obd2Config.slow_poll_interval_ms ?? d('obd2.slow_poll_interval_ms');
-                    document.getElementById('obd2SlowPollRatio').value = obd2Config.slow_poll_ratio ?? d('obd2.slow_poll_ratio');
-                    document.getElementById('obd2PromotionThreshold').value = obd2Config.promotion_wait_threshold_ms ?? d('obd2.promotion_wait_threshold_ms');
-                    document.getElementById('obd2FastDemotionMs').value = obd2Config.fast_demotion_ms ?? d('obd2.fast_demotion_ms');
-                    document.getElementById('obd2PidRemovalMs').value = obd2Config.pid_inactive_removal_ms ?? d('obd2.pid_inactive_removal_ms');
-                    document.getElementById('obd2UseMultiPid').checked = obd2Config.use_multi_pid ?? d('obd2.use_multi_pid');
-                    document.getElementById('obd2MaxPidsPerQuery').value = obd2Config.max_pids_per_query ?? d('obd2.max_pids_per_query');
-                    document.getElementById('obd2UseRepeat').checked = obd2Config.use_repeat ?? d('obd2.use_repeat');
-                    document.getElementById('obd2RepeatString').value = obd2Config.repeat_string ?? d('obd2.repeat_string');
-                    document.getElementById('obd2UseFraming').checked = obd2Config.use_framing ?? d('obd2.use_framing');
-                    document.getElementById('obd2UsePipelining').checked = obd2Config.use_pipelining ?? d('obd2.use_pipelining');
-                    document.getElementById('obd2CaptureEnabled').checked = obd2Config.capture_enabled ?? d('obd2.capture_enabled');
-                    document.getElementById('obd2CaptureBufferSize').value = obd2Config.capture_buffer_size ?? d('obd2.capture_buffer_size');
-                    toggleSlowPollMode();
-                    
-                    // Log level
-                    document.getElementById('logLevel').value = config.log_level ?? d('log_level');
-                    
-                    // Debug dump options
-                    document.getElementById('dumpCpuMetrics').checked = config.dump_cpu_metrics ?? d('dump_cpu_metrics');
-                    document.getElementById('dumpSocketInfo').checked = config.dump_socket_info ?? d('dump_socket_info');
-                    
-                    // AP config
-                    document.getElementById('apSsid').value = config.ap_ssid || '';
-                    document.getElementById('apPassword').value = config.ap_password || '';
-                    document.getElementById('apIp').value = config.ap_ip ?? d('ap_ip');
-                    document.getElementById('apPrefixLen').value = config.ap_prefix_len ?? d('ap_prefix_len');
-                    
-                    // OBD2 timeout
-                    document.getElementById('obd2TimeoutMs').value = config.obd2_timeout_ms ?? d('obd2_timeout_ms');
-                    
-                    // Brightness
-                    const brightness = config.brightness !== undefined ? config.brightness : 255;
-                    document.getElementById('brightnessSlider').value = brightness;
-                    document.getElementById('brightnessValue').textContent = brightness;
-                    
-                    renderProfiles();
-                    renderRules();
+                    populateForm();
                     showStatus('Configuration loaded!', false);
                 } else {
                     showStatus('Failed to load configuration', true);
@@ -2379,7 +2424,7 @@
                 }
 
                 // Poll for progress
-                const OTA_DOWNLOADING = 1, OTA_FLASHING = 2, OTA_DONE = 3, OTA_ERROR = 255;
+                const OTA_UPDATING = 1, OTA_DONE = 2, OTA_ERROR = 255;
                 const pollInterval = setInterval(async () => {
                     try {
                         const sr = await fetch('/api/ota/status');
@@ -2388,10 +2433,8 @@
                         barEl.style.width = pct + '%';
                         barEl.textContent = pct + '%';
 
-                        if (st.status === OTA_DOWNLOADING) {
-                            statusEl.textContent = 'Device is downloading firmware... ' + pct + '%';
-                        } else if (st.status === OTA_FLASHING) {
-                            statusEl.textContent = 'Downloading and flashing... ' + pct + '%';
+                        if (st.status === OTA_UPDATING) {
+                            statusEl.textContent = 'Updating firmware... ' + pct + '%';
                         } else if (st.status === OTA_DONE) {
                             clearInterval(pollInterval);
                             barEl.style.width = '100%';

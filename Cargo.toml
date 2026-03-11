@@ -28,6 +28,7 @@ esp-idf-svc = "0.51.0"
 esp-idf-sys = "0.36.1"
 indexmap = "2"
 log = { version = "0.4.29", default-features = false }
+atomic_enum = "0.3"
 num-integer = "0.1"
 oneshot = "0.1"
 rgb = { version = "0.8", features = ["serde"] }
