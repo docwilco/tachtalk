@@ -395,11 +395,9 @@ const HTML_INDEX_END: &str = include_str!(concat!(env!("OUT_DIR"), "/index_end.h
 /// Returns `true` if no admin password is configured (open access) or if the
 /// request carries a valid session cookie.
 fn is_authenticated(cookie_header: Option<&str>, state: &State) -> bool {
-    let cfg = state.config.lock().unwrap();
-    if cfg.admin_password_hash.is_none() {
+    if crate::config::load_admin_password_hash().is_none() {
         return true;
     }
-    drop(cfg);
 
     if let Some(cookie) = cookie_header {
         if let Some(token) = auth::extract_session_token(cookie) {
@@ -440,12 +438,7 @@ fn register_auth_status(server: &mut EspHttpServer<'static>, state: &Arc<State>)
         Method::Get,
         move |req| -> HandlerResult {
             debug!("HTTP: GET /api/auth/status");
-            let password_set = state_clone
-                .config
-                .lock()
-                .unwrap()
-                .admin_password_hash
-                .is_some();
+            let password_set = crate::config::load_admin_password_hash().is_some();
             let authenticated = is_authenticated(req.header("Cookie"), &state_clone);
             let mut response = req.into_ok_response()?;
             let body =
@@ -478,14 +471,13 @@ fn register_auth_login(server: &mut EspHttpServer<'static>, state: &Arc<State>) 
                 return Ok(());
             };
 
-            let cfg = state_clone.config.lock().unwrap();
-            let Some(ref stored_hash) = cfg.admin_password_hash else {
+            let Some(stored_hash) = crate::config::load_admin_password_hash() else {
                 // No password set — nothing to log in to
                 req.into_status_response(400)?;
                 return Ok(());
             };
 
-            if !auth::verify_password(&body.password, stored_hash) {
+            if !auth::verify_password(&body.password, &stored_hash) {
                 warn!("Failed login attempt");
                 let mut response = req.into_response(
                     401,
@@ -495,7 +487,6 @@ fn register_auth_login(server: &mut EspHttpServer<'static>, state: &Arc<State>) 
                 response.write_all(b"{\"error\":\"invalid_password\"}")?;
                 return Ok(());
             }
-            drop(cfg);
 
             let token = auth::generate_session_token();
             state_clone.sessions.insert(token);
@@ -566,12 +557,9 @@ fn register_auth_set_password(
 
             if body.password.is_empty() {
                 // Clear the password (disable auth)
-                let mut cfg = state_clone.config.lock().unwrap();
-                cfg.admin_password_hash = None;
-                if let Err(e) = cfg.save() {
-                    warn!("Failed to save config after clearing password: {e}");
+                if let Err(e) = crate::config::save_admin_password_hash(None) {
+                    warn!("Failed to clear admin password: {e}");
                 }
-                drop(cfg);
                 // Invalidate all sessions since auth is now disabled
                 state_clone.sessions.clear();
                 req.into_ok_response()?;
@@ -588,10 +576,8 @@ fn register_auth_set_password(
             };
 
             {
-                let mut cfg = state_clone.config.lock().unwrap();
-                cfg.admin_password_hash = Some(hash);
-                if let Err(e) = cfg.save() {
-                    warn!("Failed to save config after setting password: {e}");
+                if let Err(e) = crate::config::save_admin_password_hash(Some(&hash)) {
+                    warn!("Failed to save admin password: {e}");
                 }
             }
 
@@ -637,14 +623,11 @@ fn register_get_config(server: &mut EspHttpServer<'static>, state: &Arc<State>) 
         let cfg = state_clone.config.lock().unwrap();
         let mut response = req.into_ok_response()?;
         if authenticated {
-            // Authenticated: send full config, but always strip the password hash
-            let mut redacted = cfg.clone();
-            redacted.admin_password_hash = None;
-            write_json(&mut response, &redacted)?;
+            // Authenticated: send full config
+            write_json(&mut response, &*cfg)?;
         } else {
-            // Unauthenticated: also redact WiFi and AP passwords
+            // Unauthenticated: redact WiFi and AP passwords
             let mut redacted = cfg.clone();
-            redacted.admin_password_hash = None;
             if redacted.wifi.password.is_some() {
                 redacted.wifi.password = Some("********".into());
             }

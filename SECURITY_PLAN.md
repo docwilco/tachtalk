@@ -11,7 +11,8 @@
 - [x] `is_authenticated()` helper checks Cookie header; returns `true` when no password is set
 - [x] Auth endpoints: `GET /api/auth/status`, `POST /api/auth/login`, `POST /api/auth/logout`, `POST /api/auth/set-password`
 - [x] 13 admin endpoints protected with auth checks
-- [x] Config redaction: `admin_password_hash` always stripped; Wi-Fi/AP passwords masked for unauthenticated users
+- [x] Config redaction: Wi-Fi/AP passwords masked for unauthenticated users
+- [x] Admin password hash stored in separate NVS key (`admin_pw`), not in Config struct
 - [x] Clean build + zero pedantic clippy warnings
 
 ## In Progress
@@ -25,7 +26,6 @@
 - **Unified SSE**: SSE moves from a separate `TcpListener` on port 81 to the same server, routed by path — eliminates one socket, simplifies client code (no `SSE_PORT`)
 - **Native TLS path**: `edge-http` works with `esp-mbedtls` socket wrapping ([HTTPS example](https://github.com/esp-rs/esp-mbedtls/blob/main/examples/edge_server.rs)), enabling Phase 4 naturally
 - **Async concurrency**: `smol` executor with per-connection `spawn` — no artificial 4-handler slot limit from `Server::run`
-- **WebSocket option**: `edge-http` has built-in `is_ws_upgrade_request()` + `initiate_ws_upgrade_response()` via `edge-ws` — future SSE→WebSocket migration path
 
 **Architecture**:
 ```

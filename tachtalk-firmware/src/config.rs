@@ -71,6 +71,7 @@ impl LogLevel {
 
 const NVS_NAMESPACE: &str = "tachtalk";
 const NVS_CONFIG_KEY: &str = "config";
+const NVS_ADMIN_PW_KEY: &str = "admin_pw";
 
 // Global NVS handle - initialized once in main
 static NVS: Mutex<Option<EspNvs<NvsDefault>>> = Mutex::new(None);
@@ -80,6 +81,30 @@ pub fn init_nvs(nvs_partition: EspNvsPartition<NvsDefault>) -> Result<()> {
     let nvs = EspNvs::new(nvs_partition, NVS_NAMESPACE, true)?;
     *NVS.lock().unwrap() = Some(nvs);
     info!("NVS initialized");
+    Ok(())
+}
+
+/// Load the admin password hash from its own NVS key (separate from config).
+pub fn load_admin_password_hash() -> Option<String> {
+    let nvs_guard = NVS.lock().unwrap();
+    let nvs = nvs_guard.as_ref()?;
+    let len = nvs.str_len(NVS_ADMIN_PW_KEY).ok()??;
+    let mut buf = vec![0u8; len];
+    nvs.get_str(NVS_ADMIN_PW_KEY, &mut buf)
+        .ok()?
+        .map(String::from)
+}
+
+/// Save (or clear) the admin password hash in its own NVS key.
+pub fn save_admin_password_hash(hash: Option<&str>) -> Result<()> {
+    let mut nvs_guard = NVS.lock().unwrap();
+    let nvs = nvs_guard.as_mut().ok_or(Error::NvsNotInitialized)?;
+    match hash {
+        Some(h) => nvs.set_str(NVS_ADMIN_PW_KEY, h)?,
+        None => {
+            nvs.remove(NVS_ADMIN_PW_KEY)?;
+        }
+    }
     Ok(())
 }
 
@@ -461,10 +486,6 @@ pub struct Config {
     /// Turn off RGB LEDs after this many ms without an RPM update (0 = disabled)
     #[serde(default = "default_rpm_stale_timeout_ms")]
     pub rpm_stale_timeout_ms: u16,
-    /// PBKDF2-HMAC-SHA256 hash of the admin password (`iterations:salt_hex:hash_hex`)
-    /// When `None`, the device is unlocked — all endpoints are accessible without auth.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub admin_password_hash: Option<String>,
 }
 
 const fn default_led_gpio() -> u8 {
@@ -684,7 +705,6 @@ impl Default for Config {
             status_led_green_pin: default_status_led_green_pin(),
             status_led_flicker_ms: default_status_led_flicker_ms(),
             rpm_stale_timeout_ms: default_rpm_stale_timeout_ms(),
-            admin_password_hash: None,
         }
     }
 }

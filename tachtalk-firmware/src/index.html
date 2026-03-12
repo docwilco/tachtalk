@@ -785,6 +785,42 @@
         }
         button.danger { background-color: #ff4444; color: #fff; }
         button.danger:hover { background-color: #cc3333; }
+        /* Security section */
+        .security-section {
+            background-color: #2a2a2a;
+            padding: 15px;
+            margin: 20px 0;
+            border-radius: 5px;
+            border-left: 4px solid #ff8800;
+        }
+        .security-section h2 { margin-top: 0; }
+        .auth-status-badge {
+            display: inline-block;
+            padding: 4px 10px;
+            border-radius: 3px;
+            font-size: 0.9em;
+            margin-bottom: 10px;
+        }
+        .auth-status-badge.locked {
+            background-color: #5a3a1a;
+            border: 1px solid #ff8800;
+            color: #ff8800;
+        }
+        .auth-status-badge.unlocked {
+            background-color: #1a3a1a;
+            border: 1px solid #00ff00;
+            color: #00ff00;
+        }
+        .auth-status-badge.open {
+            background-color: #2a2a2a;
+            border: 1px solid #666;
+            color: #888;
+        }
+        .auth-error {
+            color: #ff4444;
+            margin-top: 5px;
+            display: none;
+        }
     </style>
 </head>
 <body>
@@ -1189,6 +1225,43 @@
                 <label>Status LED Flicker (ms):</label>
                 <input type="number" id="statusLedFlickerMs" value="50" min="10" max="1000">
                 <small style="color: #888;">Inactivity timeout before LED returns to solid-on</small>
+            </div>
+        </div>
+        
+        <div id="securitySection" class="security-section">
+            <h2>🔒 Security</h2>
+            <div id="authStatusBadge"></div>
+            <!-- Login form (shown when password set but not authenticated) -->
+            <div id="authLoginForm" style="display:none">
+                <div class="form-group">
+                    <label>Password:</label>
+                    <span class="password-wrapper">
+                        <input type="password" id="authLoginPassword" placeholder="Admin password" onkeydown="if(event.key==='Enter')authLogin()">
+                        <button type="button" class="toggle-password" onclick="togglePasswordVisibility(this)">Show</button>
+                    </span>
+                </div>
+                <button id="btnAuthLogin" onclick="authLogin()">Log In</button>
+                <div id="authLoginError" class="auth-error"></div>
+            </div>
+            <!-- Password management (shown when authenticated or no password set) -->
+            <div id="authManageForm" style="display:none">
+                <div class="form-group">
+                    <label id="authNewPasswordLabel">New Password:</label>
+                    <span class="password-wrapper">
+                        <input type="password" id="authNewPassword" placeholder="Admin password">
+                        <button type="button" class="toggle-password" onclick="togglePasswordVisibility(this)">Show</button>
+                    </span>
+                </div>
+                <div class="form-group">
+                    <label>Confirm:</label>
+                    <span class="password-wrapper">
+                        <input type="password" id="authConfirmPassword" placeholder="Confirm password" onkeydown="if(event.key==='Enter')authSetPassword()">
+                        <button type="button" class="toggle-password" onclick="togglePasswordVisibility(this)">Show</button>
+                    </span>
+                </div>
+                <button id="btnAuthSetPassword" onclick="authSetPassword()">Set Password</button>
+                <button id="btnAuthRemovePassword" class="danger" onclick="authRemovePassword()" style="display:none">Remove Password</button>
+                <button id="btnAuthLogout" onclick="authLogout()" style="display:none; margin-left: 10px;">Log Out</button>
             </div>
         </div>
         
@@ -2844,11 +2917,166 @@
             }
         }
 
+        // --- Authentication ---
+        let authState = { password_set: false, authenticated: false };
+
+        async function checkAuthStatus() {
+            try {
+                const response = await fetch('/api/auth/status');
+                if (response.ok) {
+                    authState = await response.json();
+                }
+            } catch (e) {
+                console.error('Failed to check auth status:', e);
+            }
+            updateAuthUI();
+        }
+
+        function updateAuthUI() {
+            const badge = document.getElementById('authStatusBadge');
+            const loginForm = document.getElementById('authLoginForm');
+            const manageForm = document.getElementById('authManageForm');
+            const removeBtn = document.getElementById('btnAuthRemovePassword');
+            const logoutBtn = document.getElementById('btnAuthLogout');
+            const pwLabel = document.getElementById('authNewPasswordLabel');
+            const setBtn = document.getElementById('btnAuthSetPassword');
+
+            if (authState.password_set && !authState.authenticated) {
+                badge.innerHTML = '<span class="auth-status-badge locked">🔒 Locked — log in to make changes</span>';
+                loginForm.style.display = '';
+                manageForm.style.display = 'none';
+            } else if (authState.password_set && authState.authenticated) {
+                badge.innerHTML = '<span class="auth-status-badge unlocked">🔓 Authenticated</span>';
+                loginForm.style.display = 'none';
+                manageForm.style.display = '';
+                removeBtn.style.display = '';
+                logoutBtn.style.display = '';
+                pwLabel.textContent = 'New Password:';
+                setBtn.textContent = 'Change Password';
+            } else {
+                badge.innerHTML = '<span class="auth-status-badge open">No admin password set</span>';
+                loginForm.style.display = 'none';
+                manageForm.style.display = '';
+                removeBtn.style.display = 'none';
+                logoutBtn.style.display = 'none';
+                pwLabel.textContent = 'Password:';
+                setBtn.textContent = 'Set Password';
+            }
+        }
+
+        async function authLogin() {
+            const input = document.getElementById('authLoginPassword');
+            const errorDiv = document.getElementById('authLoginError');
+            errorDiv.style.display = 'none';
+
+            if (!input.value) {
+                errorDiv.textContent = 'Please enter a password';
+                errorDiv.style.display = 'block';
+                return;
+            }
+
+            setButtonLoading('btnAuthLogin', true, 'Logging in...');
+            try {
+                const response = await fetch('/api/auth/login', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ password: input.value })
+                });
+                if (response.ok) {
+                    input.value = '';
+                    await checkAuthStatus();
+                    loadConfig();
+                } else {
+                    errorDiv.textContent = 'Invalid password';
+                    errorDiv.style.display = 'block';
+                }
+            } catch (e) {
+                errorDiv.textContent = 'Error: ' + e.message;
+                errorDiv.style.display = 'block';
+            } finally {
+                setButtonLoading('btnAuthLogin', false);
+            }
+        }
+
+        async function authLogout() {
+            try {
+                await fetch('/api/auth/logout', { method: 'POST' });
+                await checkAuthStatus();
+                loadConfig();
+            } catch (e) {
+                showStatus('Logout failed: ' + e.message, true);
+            }
+        }
+
+        async function authSetPassword() {
+            const newPw = document.getElementById('authNewPassword').value;
+            const confirmPw = document.getElementById('authConfirmPassword').value;
+
+            if (!newPw) {
+                showStatus('Password cannot be empty', true);
+                return;
+            }
+            if (newPw !== confirmPw) {
+                showStatus('Passwords do not match', true);
+                return;
+            }
+
+            setButtonLoading('btnAuthSetPassword', true, 'Setting...');
+            try {
+                const response = await fetch('/api/auth/set-password', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ password: newPw })
+                });
+                if (response.ok) {
+                    document.getElementById('authNewPassword').value = '';
+                    document.getElementById('authConfirmPassword').value = '';
+                    await checkAuthStatus();
+                    showStatus('Admin password set successfully', false);
+                } else if (response.status === 401) {
+                    showStatus('Authentication required. Please log in first.', true);
+                    document.getElementById('securitySection').scrollIntoView({ behavior: 'smooth' });
+                } else {
+                    showStatus('Failed to set password', true);
+                }
+            } catch (e) {
+                showStatus('Error: ' + e.message, true);
+            } finally {
+                setButtonLoading('btnAuthSetPassword', false);
+            }
+        }
+
+        async function authRemovePassword() {
+            if (!confirm('Remove admin password? Anyone will be able to make changes.')) return;
+
+            setButtonLoading('btnAuthRemovePassword', true, 'Removing...');
+            try {
+                const response = await fetch('/api/auth/set-password', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ password: '' })
+                });
+                if (response.ok) {
+                    await checkAuthStatus();
+                    showStatus('Admin password removed', false);
+                } else if (response.status === 401) {
+                    showStatus('Authentication required. Please log in first.', true);
+                } else {
+                    showStatus('Failed to remove password', true);
+                }
+            } catch (e) {
+                showStatus('Error: ' + e.message, true);
+            } finally {
+                setButtonLoading('btnAuthRemovePassword', false);
+            }
+        }
+
         // Initialize
         (async function init() {
             await loadDefaults();  // Load defaults first
             renderProfiles();
             renderRules();
+            checkAuthStatus();
             loadConfig();
             loadNetworkStatus();
             loadConnectionStatus();
