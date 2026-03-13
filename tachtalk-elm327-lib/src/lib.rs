@@ -187,31 +187,6 @@ impl ClientState {
     }
 }
 
-/// Extract RPM from an OBD2 response
-///
-/// OBD2 response format for RPM (PID 0C): "41 0C XX XX" or "410CXX XX"
-/// RPM = ((A * 256) + B) / 4
-pub fn extract_rpm_from_response(data: &[u8]) -> Option<u32> {
-    let text = std::str::from_utf8(data).ok()?;
-
-    // Look for "41 0C" or "410C" pattern
-    let text_upper = text.to_uppercase();
-    if let Some(pos) = text_upper.find("410C") {
-        let after = &text_upper[pos + 4..];
-        // Try to parse hex bytes (with or without spaces)
-        let hex_chars: String = after.chars().filter(char::is_ascii_hexdigit).collect();
-
-        if hex_chars.len() >= 4 {
-            let a = u32::from_str_radix(&hex_chars[0..2], 16).ok()?;
-            let b = u32::from_str_radix(&hex_chars[2..4], 16).ok()?;
-            let rpm = ((a * 256) + b) / 4;
-            return Some(rpm);
-        }
-    }
-
-    None
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -253,21 +228,6 @@ mod tests {
         assert!(resp.contains("ELM327"));
         assert!(state.echo_enabled);
         assert!(state.spaces_enabled);
-    }
-
-    #[test]
-    fn test_extract_rpm() {
-        // Test with spaces
-        let data = b"41 0C 1A F8\r\r>";
-        assert_eq!(extract_rpm_from_response(data), Some(1726));
-
-        // Test without spaces
-        let data = b"410C1AF8\r\r>";
-        assert_eq!(extract_rpm_from_response(data), Some(1726));
-
-        // Test no RPM data
-        let data = b"41 0D 28\r\r>";
-        assert_eq!(extract_rpm_from_response(data), None);
     }
 
     #[test]

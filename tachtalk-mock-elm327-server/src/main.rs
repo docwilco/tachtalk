@@ -187,17 +187,68 @@ fn get_rpm_value(start_time: &Instant) -> u32 {
     result
 }
 
+/// Coolant temperature in OBD2 encoded byte.
+///
+/// Normal cycles (~90°C), spike cycles (ramp to ~125°C and back).
+/// Alternates every RPM cycle (`CYCLE_TIME` = 14s).
+fn get_coolant_temp_byte(start_time: &Instant) -> u8 {
+    const CYCLE_TIME: f64 = 14.0; // must match RPM CYCLE_TIME
+    const NORMAL_TEMP: f64 = 90.0;
+    const SPIKE_PEAK: f64 = 125.0;
+
+    let elapsed = start_time.elapsed().as_secs_f64();
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let cycle_number = (elapsed / CYCLE_TIME) as u64;
+    let phase = elapsed % CYCLE_TIME;
+
+    let temp = if cycle_number % 2 == 1 {
+        // Spike cycle: ramp up to peak at midpoint, then back down
+        let half = CYCLE_TIME / 2.0;
+        let t = if phase < half {
+            phase / half
+        } else {
+            (CYCLE_TIME - phase) / half
+        };
+        // Smooth with sine easing
+        let eased = (t * std::f64::consts::FRAC_PI_2).sin();
+        NORMAL_TEMP + (SPIKE_PEAK - NORMAL_TEMP) * eased
+    } else {
+        NORMAL_TEMP
+    };
+
+    // OBD2 encoding: byte = temp_C + 40
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let byte = (temp + 40.0).clamp(0.0, 255.0) as u8;
+    byte
+}
+
+/// Vehicle speed in OBD2 encoded byte (= km/h directly).
+///
+/// Sine wave: 60 ± 3 km/h with ~8s period.
+fn get_speed_byte(start_time: &Instant) -> u8 {
+    const CENTER: f64 = 60.0;
+    const AMPLITUDE: f64 = 3.0;
+    const PERIOD: f64 = 8.0;
+
+    let elapsed = start_time.elapsed().as_secs_f64();
+    let speed = CENTER + AMPLITUDE * (2.0 * std::f64::consts::PI * elapsed / PERIOD).sin();
+
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let byte = speed.round().clamp(0.0, 255.0) as u8;
+    byte
+}
+
 fn get_pid_response(pid: &str, start_time: &Instant) -> Option<String> {
     match pid {
         "00" => Some("BE3FA813".to_string()), // PIDs supported 01-20
         "04" => Some("64".to_string()),       // Engine load: 39.2%
-        "05" => Some("4F".to_string()),       // Coolant temp: 39°C
-        "0C" => Some(format!("{:04X}", get_rpm_value(start_time))), // RPM
-        "0D" => Some("28".to_string()),       // Speed: 40 km/h
-        "0F" => Some("38".to_string()),       // Intake air temp: 16°C
-        "11" => Some("45".to_string()),       // Throttle: 27%
-        "20" => Some("80000001".to_string()), // PIDs supported 21-40
-        "40" => Some("FED08000".to_string()), // PIDs supported 41-60
+        "05" => Some(format!("{:02X}", get_coolant_temp_byte(start_time))), // Coolant temp (dynamic)
+        "0C" => Some(format!("{:04X}", get_rpm_value(start_time))),         // RPM
+        "0D" => Some(format!("{:02X}", get_speed_byte(start_time))),        // Speed (dynamic)
+        "0F" => Some("38".to_string()),                                     // Intake air temp: 16°C
+        "11" => Some("45".to_string()),                                     // Throttle: 27%
+        "20" => Some("80000001".to_string()),                               // PIDs supported 21-40
+        "40" => Some("FED08000".to_string()),                               // PIDs supported 41-60
         #[allow(clippy::match_same_arms)] // Different PIDs, same value is coincidental
         "49" => Some("45".to_string()), // Accelerator pedal position D: 27%
         _ => None,
