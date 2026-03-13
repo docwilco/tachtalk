@@ -471,6 +471,16 @@ pub struct Config {
     /// Profile switch button pin - set to 0 to disable button
     #[serde(default)]
     pub button_pin: u8,
+    /// Encoder 2x acceleration threshold in ms. If consecutive encoder
+    /// events arrive within this window the brightness step is doubled.
+    /// Set to 0 to disable 2x acceleration.
+    #[serde(default = "default_encoder_accel_2x_ms")]
+    pub encoder_accel_2x_ms: u16,
+    /// Encoder 4x acceleration threshold in ms. If consecutive encoder
+    /// events arrive within this (shorter) window the brightness step is
+    /// quadrupled instead. Set to 0 to disable 4x acceleration.
+    #[serde(default = "default_encoder_accel_4x_ms")]
+    pub encoder_accel_4x_ms: u16,
     /// Status LED red (WiFi) GPIO pin - set to 0 to disable
     #[serde(default = "default_status_led_red_pin")]
     pub status_led_red_pin: u8,
@@ -514,6 +524,14 @@ const fn default_rpm_stale_timeout_ms() -> u16 {
 
 const fn default_brightness() -> u8 {
     255
+}
+
+const fn default_encoder_accel_2x_ms() -> u16 {
+    80
+}
+
+const fn default_encoder_accel_4x_ms() -> u16 {
+    30
 }
 
 fn default_ap_ip() -> Ipv4Addr {
@@ -700,6 +718,8 @@ impl Default for Config {
             encoder_pin_a: 0, // Disabled by default
             encoder_pin_b: 0,
             button_pin: 0, // Disabled by default
+            encoder_accel_2x_ms: default_encoder_accel_2x_ms(),
+            encoder_accel_4x_ms: default_encoder_accel_4x_ms(),
             status_led_red_pin: default_status_led_red_pin(),
             status_led_yellow_pin: default_status_led_yellow_pin(),
             status_led_green_pin: default_status_led_green_pin(),

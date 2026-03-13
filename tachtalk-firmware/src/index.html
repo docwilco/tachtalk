@@ -1207,6 +1207,16 @@
                 <small style="color: #888;">Profile switch button, 0 = disabled (requires restart)</small>
             </div>
             <div class="form-group">
+                <label>Encoder Accel 2x (ms):</label>
+                <input type="number" id="encoderAccel2xMs" value="80" min="0" max="1000">
+                <small style="color: #888;">2x speed threshold; 0 = disabled</small>
+            </div>
+            <div class="form-group">
+                <label>Encoder Accel 4x (ms):</label>
+                <input type="number" id="encoderAccel4xMs" value="30" min="0" max="1000">
+                <small style="color: #888;">4x speed threshold (must be &lt; 2x); 0 = disabled</small>
+            </div>
+            <div class="form-group">
                 <label>Status LED Red Pin:</label>
                 <input type="number" id="statusLedRedPin" value="9" min="0" max="48">
                 <small style="color: #888;">WiFi status, 0 = disabled (requires restart)</small>
@@ -1395,6 +1405,8 @@
             { id: 'encoderPinA', path: 'encoder_pin_a', type: 'int', fallback: 0 },
             { id: 'encoderPinB', path: 'encoder_pin_b', type: 'int', fallback: 0 },
             { id: 'buttonPin', path: 'button_pin', type: 'int', fallback: 0 },
+            { id: 'encoderAccel2xMs', path: 'encoder_accel_2x_ms', type: 'int', default: 'encoder_accel_2x_ms' },
+            { id: 'encoderAccel4xMs', path: 'encoder_accel_4x_ms', type: 'int', default: 'encoder_accel_4x_ms' },
             { id: 'statusLedRedPin', path: 'status_led_red_pin', type: 'int', default: 'status_led_red_pin' },
             { id: 'statusLedYellowPin', path: 'status_led_yellow_pin', type: 'int', default: 'status_led_yellow_pin' },
             { id: 'statusLedGreenPin', path: 'status_led_green_pin', type: 'int', default: 'status_led_green_pin' },

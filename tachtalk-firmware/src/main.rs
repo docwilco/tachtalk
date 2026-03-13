@@ -222,7 +222,10 @@ fn init_led_controller<C: esp_idf_hal::rmt::RmtChannel>(
     LedController::new(led_pin, rmt_channel, brightness)
 }
 
-/// Initialize rotary encoder if configured (both pins must be non-zero)
+/// Initialize the rotary encoder if configured (both pins must be non-zero).
+///
+/// Returns the PCNT driver. The ISR and notification are set up later
+/// inside `controls_task` (which runs on its own thread).
 fn init_encoder<PCNT: esp_idf_hal::pcnt::Pcnt>(
     config: &Config,
     pcnt: impl esp_idf_hal::peripheral::Peripheral<P = PCNT> + 'static,
