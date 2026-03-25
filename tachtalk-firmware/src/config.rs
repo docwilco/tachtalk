@@ -25,23 +25,44 @@ fn default_ap_ssid() -> String {
 }
 
 // Re-export shift-lights types for use in the firmware
-pub use tachtalk_shift_lights_lib::{LedRule, RGB8};
+pub use tachtalk_shift_lights_lib::{LedRule, PidPriority, ProfileType, RGB8};
 
-/// A named collection of LED rule configurations.
+/// A named collection of LED rule configurations bound to an OBD2 PID.
 ///
 /// Profiles allow users to switch between different shift light setups
-/// (e.g., "Street", "Track", "Economy") without reconfiguring each time.
+/// (e.g., "Street", "Track", "Economy") or define overlays (e.g.,
+/// coolant temperature warning) and triggered profiles (e.g., pit lane
+/// speed limiter).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LedProfile {
     pub name: String,
     pub rules: Vec<LedRule>,
-    /// RPM value to show when previewing this profile (e.g., when cycling profiles)
-    #[serde(default = "default_preview_rpm")]
-    pub preview_rpm: u32,
+    /// Decoded PID value to show when previewing this profile
+    #[serde(default = "default_preview_value")]
+    pub preview_value: u32,
+    /// OBD2 Mode 01 PID this profile is bound to (default: 0x0C = RPM)
+    #[serde(default = "default_pid")]
+    pub pid: u8,
+    /// Polling priority for this profile's PID
+    #[serde(default)]
+    pub pid_priority: PidPriority,
+    /// How this profile is activated
+    #[serde(default)]
+    pub profile_type: ProfileType,
+    /// GPIO pin for Triggered profiles (0 = disabled)
+    #[serde(default)]
+    pub button_pin: u8,
+    /// Auto-disable Triggered profiles when decoded value exceeds this threshold
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_disable_above: Option<u32>,
 }
 
-const fn default_preview_rpm() -> u32 {
+const fn default_preview_value() -> u32 {
     3000
+}
+
+const fn default_pid() -> u8 {
+    0x0C
 }
 
 /// Configurable log level
@@ -496,6 +517,9 @@ pub struct Config {
     /// Turn off RGB LEDs after this many ms without an RPM update (0 = disabled)
     #[serde(default = "default_rpm_stale_timeout_ms")]
     pub rpm_stale_timeout_ms: u16,
+    /// Duration (ms) to show `preview_value` after brightness/profile change
+    #[serde(default = "default_preview_duration_ms")]
+    pub preview_duration_ms: u16,
 }
 
 const fn default_led_gpio() -> u8 {
@@ -526,6 +550,10 @@ const fn default_brightness() -> u8 {
     255
 }
 
+const fn default_preview_duration_ms() -> u16 {
+    500
+}
+
 const fn default_encoder_accel_2x_ms() -> u16 {
     80
 }
@@ -548,8 +576,8 @@ fn default_profile() -> LedProfile {
         rules: vec![
             LedRule {
                 name: "Blue".to_string(),
-                rpm_lower: 1000,
-                rpm_upper: None,
+                value_lower: 4000,
+                value_upper: None,
                 start_led: 0,
                 end_led: 2,
                 colors: smallvec::smallvec![RGB8::new(0, 0, 255)],
@@ -558,8 +586,8 @@ fn default_profile() -> LedProfile {
             },
             LedRule {
                 name: "Green".to_string(),
-                rpm_lower: 1500,
-                rpm_upper: None,
+                value_lower: 6000,
+                value_upper: None,
                 start_led: 3,
                 end_led: 5,
                 colors: smallvec::smallvec![RGB8::new(0, 255, 0)],
@@ -568,8 +596,8 @@ fn default_profile() -> LedProfile {
             },
             LedRule {
                 name: "Yellow".to_string(),
-                rpm_lower: 2000,
-                rpm_upper: None,
+                value_lower: 8000,
+                value_upper: None,
                 start_led: 6,
                 end_led: 8,
                 colors: smallvec::smallvec![RGB8::new(255, 255, 0)],
@@ -578,8 +606,8 @@ fn default_profile() -> LedProfile {
             },
             LedRule {
                 name: "Red".to_string(),
-                rpm_lower: 2500,
-                rpm_upper: None,
+                value_lower: 10000,
+                value_upper: None,
                 start_led: 9,
                 end_led: 11,
                 colors: smallvec::smallvec![RGB8::new(255, 0, 0)],
@@ -588,8 +616,8 @@ fn default_profile() -> LedProfile {
             },
             LedRule {
                 name: "Off".to_string(),
-                rpm_lower: 3000,
-                rpm_upper: None,
+                value_lower: 12000,
+                value_upper: None,
                 start_led: 0,
                 end_led: 11,
                 colors: smallvec::smallvec![RGB8::new(0, 0, 0)],
@@ -598,8 +626,8 @@ fn default_profile() -> LedProfile {
             },
             LedRule {
                 name: "Shift".to_string(),
-                rpm_lower: 3000,
-                rpm_upper: None,
+                value_lower: 12000,
+                value_upper: None,
                 start_led: 0,
                 end_led: 11,
                 colors: smallvec::smallvec![RGB8::new(0, 0, 255)],
@@ -607,7 +635,12 @@ fn default_profile() -> LedProfile {
                 blink_ms: 500,
             },
         ],
-        preview_rpm: 2900,
+        preview_value: 11600,
+        pid: 0x0C,
+        pid_priority: PidPriority::Fast,
+        profile_type: ProfileType::Normal,
+        button_pin: 0,
+        auto_disable_above: None,
     }
 }
 
@@ -617,8 +650,8 @@ fn rainbow_profile() -> LedProfile {
         rules: vec![
             LedRule {
                 name: "Rainbow".to_string(),
-                rpm_lower: 1000,
-                rpm_upper: Some(3000),
+                value_lower: 4000,
+                value_upper: Some(12000),
                 start_led: 0,
                 end_led: 12,
                 colors: smallvec::smallvec![
@@ -633,8 +666,8 @@ fn rainbow_profile() -> LedProfile {
             },
             LedRule {
                 name: "Shift".to_string(),
-                rpm_lower: 3000,
-                rpm_upper: None,
+                value_lower: 12000,
+                value_upper: None,
                 start_led: 0,
                 end_led: 12,
                 colors: smallvec::smallvec![RGB8::new(0, 0, 255)],
@@ -642,7 +675,12 @@ fn rainbow_profile() -> LedProfile {
                 blink_ms: 100,
             },
         ],
-        preview_rpm: 2900,
+        preview_value: 11600,
+        pid: 0x0C,
+        pid_priority: PidPriority::Fast,
+        profile_type: ProfileType::Normal,
+        button_pin: 0,
+        auto_disable_above: None,
     }
 }
 
@@ -652,8 +690,8 @@ fn martijn_profile() -> LedProfile {
         rules: vec![
             LedRule {
                 name: "Left".to_string(),
-                rpm_lower: 1000,
-                rpm_upper: Some(3000),
+                value_lower: 4000,
+                value_upper: Some(12000),
                 start_led: 0,
                 end_led: 5,
                 colors: smallvec::smallvec![RGB8::new(0, 0, 255), RGB8::new(255, 0, 0),],
@@ -662,8 +700,8 @@ fn martijn_profile() -> LedProfile {
             },
             LedRule {
                 name: "Right".to_string(),
-                rpm_lower: 1000,
-                rpm_upper: Some(3000),
+                value_lower: 4000,
+                value_upper: Some(12000),
                 start_led: 11,
                 end_led: 6,
                 colors: smallvec::smallvec![RGB8::new(0, 0, 255), RGB8::new(255, 0, 0),],
@@ -672,8 +710,8 @@ fn martijn_profile() -> LedProfile {
             },
             LedRule {
                 name: "Shift".to_string(),
-                rpm_lower: 3000,
-                rpm_upper: None,
+                value_lower: 12000,
+                value_upper: None,
                 start_led: 0,
                 end_led: 11,
                 colors: smallvec::smallvec![RGB8::new(0, 0, 0)],
@@ -681,12 +719,44 @@ fn martijn_profile() -> LedProfile {
                 blink_ms: 100,
             },
         ],
-        preview_rpm: 2900,
+        preview_value: 11600,
+        pid: 0x0C,
+        pid_priority: PidPriority::Fast,
+        profile_type: ProfileType::Normal,
+        button_pin: 0,
+        auto_disable_above: None,
+    }
+}
+
+fn coolant_warning_profile() -> LedProfile {
+    LedProfile {
+        name: "Coolant Warning".to_string(),
+        rules: vec![LedRule {
+            name: "Overheat".to_string(),
+            value_lower: 150,
+            value_upper: None,
+            start_led: 0,
+            end_led: 11,
+            colors: smallvec::smallvec![RGB8::new(255, 0, 0)],
+            blink: true,
+            blink_ms: 200,
+        }],
+        preview_value: 160,
+        pid: 0x05,
+        pid_priority: PidPriority::Slow,
+        profile_type: ProfileType::Overlay,
+        button_pin: 0,
+        auto_disable_above: None,
     }
 }
 
 fn default_profiles() -> Vec<LedProfile> {
-    vec![default_profile(), rainbow_profile(), martijn_profile()]
+    vec![
+        default_profile(),
+        rainbow_profile(),
+        martijn_profile(),
+        coolant_warning_profile(),
+    ]
 }
 
 /// Maximum OBD2 timeout to avoid triggering watchdog in dongle task
@@ -725,17 +795,67 @@ impl Default for Config {
             status_led_green_pin: default_status_led_green_pin(),
             status_led_flicker_ms: default_status_led_flicker_ms(),
             rpm_stale_timeout_ms: default_rpm_stale_timeout_ms(),
+            preview_duration_ms: default_preview_duration_ms(),
         }
     }
 }
 
 impl Config {
-    /// Get the LED rules from the active profile
+    /// Get the active Normal profile (if any)
     #[must_use]
-    pub fn active_rules(&self) -> &[LedRule] {
+    pub fn active_normal_profile(&self) -> Option<&LedProfile> {
         self.profiles
             .get(self.active_profile)
+            .filter(|p| p.profile_type == ProfileType::Normal)
+    }
+
+    /// Get the LED rules from the active Normal profile
+    #[must_use]
+    pub fn active_rules(&self) -> &[LedRule] {
+        self.active_normal_profile()
             .map_or(&[], |p| p.rules.as_slice())
+    }
+
+    /// Iterate over all Overlay profiles
+    pub fn overlay_profiles(&self) -> impl Iterator<Item = (usize, &LedProfile)> {
+        self.profiles
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| p.profile_type == ProfileType::Overlay)
+    }
+
+    /// Iterate over all Triggered profiles
+    pub fn triggered_profiles(&self) -> impl Iterator<Item = (usize, &LedProfile)> {
+        self.profiles
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| p.profile_type == ProfileType::Triggered)
+    }
+
+    /// Iterate over Triggered profiles that are currently enabled at runtime.
+    pub fn enabled_triggered_profiles<'a>(
+        &'a self,
+        triggered_enabled: &'a [bool],
+    ) -> impl Iterator<Item = (usize, &'a LedProfile)> {
+        self.triggered_profiles()
+            .filter(move |(i, _)| triggered_enabled.get(*i).copied().unwrap_or(false))
+    }
+
+    /// Advance `active_profile` to the next Normal profile (wrapping).
+    /// Returns the new index, or the current index if no Normal profiles exist.
+    pub fn cycle_to_next_normal_profile(&mut self) -> usize {
+        let count = self.profiles.len();
+        if count == 0 {
+            return self.active_profile;
+        }
+        for offset in 1..=count {
+            let idx = (self.active_profile + offset) % count;
+            if self.profiles[idx].profile_type == ProfileType::Normal {
+                self.active_profile = idx;
+                return idx;
+            }
+        }
+        self.active_profile
     }
 
     /// Clamp values to valid ranges and fix invalid values
@@ -765,6 +885,18 @@ impl Config {
             self.obd2.capture_buffer_size = 16 * 1024;
         } else if self.obd2.capture_buffer_size > 6 * 1024 * 1024 {
             self.obd2.capture_buffer_size = 6 * 1024 * 1024;
+        }
+        // Validate profile fields
+        for profile in &mut self.profiles {
+            // Non-Triggered profiles shouldn't have button_pin or auto_disable
+            if profile.profile_type != ProfileType::Triggered {
+                profile.button_pin = 0;
+                profile.auto_disable_above = None;
+            }
+        }
+        // Ensure active_profile points to a valid index
+        if self.active_profile >= self.profiles.len() {
+            self.active_profile = 0;
         }
     }
 

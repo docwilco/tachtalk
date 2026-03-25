@@ -22,9 +22,9 @@ mod cpu_metrics;
 mod dns;
 mod error;
 mod heap_diag;
+mod led_display;
 mod obd2;
 mod ota;
-mod rpm_leds;
 mod sse_server;
 mod status_leds;
 mod thread_util;
@@ -33,12 +33,12 @@ mod web_server;
 mod wifi;
 
 use config::Config;
+use led_display::{led_display_task, LedController, LedTaskSender};
 use obd2::{
     cache_manager_task, dongle_task, AtomicDongleTcpState, CacheManagerSender, DongleSender,
     Obd2Proxy,
 };
 use ota::AtomicOtaState;
-use rpm_leds::{rpm_led_task, LedController, RpmTaskSender};
 use sse_server::{sse_server_task, SseSender};
 use status_leds::StatusLedSender;
 use thread_util::StackMemory::{Internal, SpiRam};
@@ -77,7 +77,7 @@ pub struct PollingMetrics {
 /// Channel senders bundled for `State` construction.
 pub struct TaskChannels {
     pub sse_tx: SseSender,
-    pub rpm_tx: RpmTaskSender,
+    pub led_tx: LedTaskSender,
     pub dongle_control_tx: DongleSender,
     pub cache_manager_tx: CacheManagerSender,
     pub status_led_tx: StatusLedSender,
@@ -93,7 +93,7 @@ pub struct State {
     /// AP SSID (cached at startup from config)
     pub ap_ssid: String,
     pub sse_tx: SseSender,
-    pub rpm_tx: RpmTaskSender,
+    pub led_tx: LedTaskSender,
     pub dongle_control_tx: DongleSender,
     pub cache_manager_tx: CacheManagerSender,
     pub shared_rpm: Mutex<Option<u32>>,
@@ -128,9 +128,20 @@ pub struct State {
     pub capture_active: AtomicBool,
     /// Session store for web authentication
     pub sessions: auth::SessionStore,
+    /// Runtime enabled state for Triggered profiles, indexed parallel to `config.profiles`.
+    /// Only entries for Triggered profiles are meaningful; all start `false`.
+    pub triggered_enabled: Mutex<Vec<bool>>,
 }
 
 impl State {
+    /// Notify LED + OBD2 tasks that profile configuration has changed.
+    pub fn notify_profile_change(&self) {
+        let _ = self.led_tx.send(led_display::LedTaskMessage::ConfigChanged);
+        let _ = self
+            .cache_manager_tx
+            .send(obd2::CacheManagerMessage::ProfilePidsChanged);
+    }
+
     /// Create a new `State` with the given injected dependencies; all other fields
     /// are initialised to their default (zero / empty) values.
     fn new(
@@ -140,12 +151,13 @@ impl State {
         channels: TaskChannels,
     ) -> Self {
         let capture_enabled = config.obd2.capture_enabled;
+        let num_profiles = config.profiles.len();
         Self {
             config: Mutex::new(config),
             wifi: Mutex::new(wifi),
             ap_ssid,
             sse_tx: channels.sse_tx,
-            rpm_tx: channels.rpm_tx,
+            led_tx: channels.led_tx,
             dongle_control_tx: channels.dongle_control_tx,
             cache_manager_tx: channels.cache_manager_tx,
             shared_rpm: Mutex::default(),
@@ -165,6 +177,7 @@ impl State {
             capture_buffer: Mutex::default(),
             capture_active: AtomicBool::new(capture_enabled),
             sessions: auth::SessionStore::default(),
+            triggered_enabled: Mutex::new(vec![false; num_profiles]),
         }
     }
 }
@@ -285,7 +298,7 @@ fn spawn_background_tasks(
     let (sse_tx, sse_rx) = std::sync::mpsc::channel();
     let (dongle_control_tx, dongle_control_rx) = std::sync::mpsc::channel();
     let (cache_manager_tx, cache_manager_rx) = std::sync::mpsc::channel();
-    let (rpm_tx, rpm_rx) = std::sync::mpsc::channel();
+    let (led_tx, led_rx) = std::sync::mpsc::channel();
     let (status_led_tx, status_led_rx) = std::sync::mpsc::channel();
 
     let state = Arc::new(State::new(
@@ -294,7 +307,7 @@ fn spawn_background_tasks(
         ap_ssid,
         TaskChannels {
             sse_tx,
-            rpm_tx,
+            led_tx,
             dongle_control_tx,
             cache_manager_tx,
             status_led_tx,
@@ -304,7 +317,7 @@ fn spawn_background_tasks(
     // Start DNS server for captive portal
     dns::start_dns_server(ap_ip);
 
-    // Start SSE server for RPM streaming (on port 81)
+    // Start SSE server for PID value streaming (on port 81)
     {
         let state = state.clone();
         thread_util::spawn_named(c"sse_srv", 6144, SpiRam, move || {
@@ -328,17 +341,17 @@ fn spawn_background_tasks(
         });
     }
 
-    // Start the combined RPM poller and LED update task
+    // Start the LED display task
     // Pin to Core 1 to avoid interference from WiFi (which runs on Core 0)
     {
         let state = state.clone();
         thread_util::spawn_named_on_core(
-            c"rpm_led",
+            c"led_disp",
             esp_idf_hal::cpu::Core::Core1,
             4096,
             Internal,
             move || {
-                rpm_led_task(&state, led_controller, rpm_rx);
+                led_display_task(&state, led_controller, led_rx);
             },
         );
     }
@@ -371,11 +384,11 @@ fn spawn_background_tasks(
         });
     }
 
-    // Start controls task (rotary encoder and/or button)
-    if let Some(driver) = encoder_driver {
+    // Start controls task (rotary encoder and/or buttons)
+    {
         let state = state.clone();
         thread_util::spawn_named(c"controls", 6144, Internal, move || {
-            controls::controls_task(&state, driver);
+            controls::controls_task(&state, encoder_driver);
         });
     }
 

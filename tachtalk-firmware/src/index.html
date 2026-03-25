@@ -19,6 +19,32 @@
         h1 {
             color: #00ff00;
         }
+        .profile-tabs {
+            display: flex;
+            gap: 0;
+            margin-top: 15px;
+        }
+        .profile-tab {
+            padding: 8px 16px;
+            background-color: #333;
+            color: #aaa;
+            border: 1px solid #444;
+            border-bottom: none;
+            border-radius: 5px 5px 0 0;
+            cursor: pointer;
+            font-weight: bold;
+            margin: 0;
+        }
+        .profile-tab:hover {
+            background-color: #444;
+            color: #fff;
+        }
+        .profile-tab.active {
+            background-color: #2a2a2a;
+            color: #00ff00;
+            border-color: #00ff00;
+            border-bottom: 1px solid #2a2a2a;
+        }
         .profile-controls {
             display: flex;
             align-items: center;
@@ -97,17 +123,19 @@
         .rule-grid .colors-group {
             grid-column: 1 / -1;
             display: flex;
-            align-items: center;
-            flex-wrap: wrap;
+            flex-direction: column;
+            align-items: flex-start;
             gap: 5px;
-        }
-        .rule-grid .colors-group label {
-            margin-right: 5px;
         }
         .rule-grid .colors-group input[type="color"] {
             margin: 0;
         }
-        .rule-grid .colors-group button {
+        .rule-grid .colors-group .color-entry {
+            display: flex;
+            align-items: center;
+            gap: 5px;
+        }
+        .rule-grid .colors-group .color-entry button {
             padding: 3px 8px;
             margin: 0;
             min-width: 24px;
@@ -830,7 +858,7 @@
         <div id="status"></div>
         
         <div class="rpm-display">
-            <div>RPM: <span id="currentRpm">---</span></div>
+            <div>PID Values: <span id="currentPidValues">---</span></div>
         </div>
         
         <!-- Brightness Slider -->
@@ -1192,6 +1220,11 @@
                 <small style="color: #888;">Turn off shift LEDs after this long without RPM data (0 = disabled)</small>
             </div>
             <div class="form-group">
+                <label>Preview Duration (ms):</label>
+                <input type="number" id="previewDurationMs" value="500" min="0" max="65535">
+                <small style="color: #888;">How long to show preview_value after brightness/profile change</small>
+            </div>
+            <div class="form-group">
                 <label>Encoder Pin A:</label>
                 <input type="number" id="encoderPinA" value="0" min="0" max="48">
                 <small style="color: #888;">0 = disabled (requires restart)</small>
@@ -1321,6 +1354,11 @@
         <button id="btnReset2" onclick="resetToDefaults()">Reset to Defaults</button>
         
         <h2>LED Profiles</h2>
+        <div class="profile-tabs">
+            <button class="profile-tab active" data-tab="normal" onclick="switchTab('normal')">Normal</button>
+            <button class="profile-tab" data-tab="overlay" onclick="switchTab('overlay')">Overlay</button>
+            <button class="profile-tab" data-tab="triggered" onclick="switchTab('triggered')">Triggered</button>
+        </div>
         <div class="profile-controls">
             <select id="profileSelect" onchange="selectProfile(this.value)"></select>
             <button onclick="addProfile()">New</button>
@@ -1328,15 +1366,164 @@
             <button onclick="deleteProfile()">Delete</button>
             <button onclick="moveProfile(-1)">▲</button>
             <button onclick="moveProfile(1)">▼</button>
+            <button id="setActiveBtn" onclick="setActiveProfile()" style="display: none; background-color: #ffa500;">Set Active</button>
         </div>
         <div class="form-group" style="margin-top: 10px;">
             <label>Profile Name:</label>
             <input type="text" id="profileName" onchange="renameProfile(this.value)">
         </div>
         <div class="form-group">
-            <label>Preview RPM:</label>
-            <input type="number" id="previewRpm" min="0" max="15000" step="100" style="width: 80px;" onchange="updatePreviewRpm(parseInt(this.value))">
-            <input type="range" id="previewRpmSlider" min="0" max="15000" step="100" style="width: 200px; vertical-align: middle;" oninput="updatePreviewRpm(parseInt(this.value))">
+            <label>PID:</label>
+            <select id="profilePid" onchange="updateProfileField('pid', parseInt(this.value)); renderRules(); renderProfiles();">
+                <optgroup label="Common">
+                <option value="12">0x0C - Engine RPM</option>
+                <option value="13">0x0D - Vehicle Speed</option>
+                <option value="5">0x05 - Coolant Temperature</option>
+                <option value="17">0x11 - Throttle Position</option>
+                <option value="4">0x04 - Engine Load</option>
+                <option value="15">0x0F - Intake Air Temperature</option>
+                <option value="16">0x10 - MAF Air Flow Rate</option>
+                <option value="90">0x5A - Relative Accelerator Pedal</option>
+                </optgroup>
+                <optgroup label="Engine &amp; Fuel">
+                <option value="1">0x01 - Monitor Status (DTCs)</option>
+                <option value="2">0x02 - Freeze DTC</option>
+                <option value="3">0x03 - Fuel System Status</option>
+                <option value="6">0x06 - Short Term Fuel Trim B1</option>
+                <option value="7">0x07 - Long Term Fuel Trim B1</option>
+                <option value="8">0x08 - Short Term Fuel Trim B2</option>
+                <option value="9">0x09 - Long Term Fuel Trim B2</option>
+                <option value="10">0x0A - Fuel Pressure</option>
+                <option value="11">0x0B - Intake Manifold Pressure</option>
+                <option value="14">0x0E - Timing Advance</option>
+                <option value="18">0x12 - Secondary Air Status</option>
+                <option value="28">0x1C - OBD Standards</option>
+                <option value="30">0x1E - Auxiliary Input Status</option>
+                <option value="31">0x1F - Run Time Since Start</option>
+                <option value="44">0x2C - Commanded EGR</option>
+                <option value="45">0x2D - EGR Error</option>
+                <option value="46">0x2E - Commanded Evaporative Purge</option>
+                <option value="47">0x2F - Fuel Tank Level</option>
+                <option value="48">0x30 - Warm-ups Since Codes Cleared</option>
+                <option value="49">0x31 - Distance Since Codes Cleared</option>
+                <option value="50">0x32 - Evap System Vapor Pressure</option>
+                <option value="51">0x33 - Barometric Pressure</option>
+                <option value="81">0x51 - Fuel Type</option>
+                <option value="82">0x52 - Ethanol Fuel %</option>
+                <option value="83">0x53 - Absolute Evap Vapor Pressure</option>
+                <option value="84">0x54 - Evap System Vapor Pressure</option>
+                <option value="89">0x59 - Fuel Rail Absolute Pressure</option>
+                <option value="92">0x5C - Engine Oil Temperature</option>
+                <option value="93">0x5D - Fuel Injection Timing</option>
+                <option value="94">0x5E - Engine Fuel Rate</option>
+                <option value="95">0x5F - Emission Requirements</option>
+                </optgroup>
+                <optgroup label="Distance &amp; MIL">
+                <option value="33">0x21 - Distance with MIL On</option>
+                <option value="77">0x4D - Time with MIL On</option>
+                <option value="78">0x4E - Time Since Codes Cleared</option>
+                </optgroup>
+                <optgroup label="Fuel Rail &amp; Pressure">
+                <option value="34">0x22 - Fuel Rail Pressure (Vacuum)</option>
+                <option value="35">0x23 - Fuel Rail Gauge Pressure</option>
+                </optgroup>
+                <optgroup label="O2 Sensors (Voltage &amp; Trim)">
+                <option value="19">0x13 - O2 Sensors Present (2 Banks)</option>
+                <option value="20">0x14 - O2 Sensor 1 V+Trim</option>
+                <option value="21">0x15 - O2 Sensor 2 V+Trim</option>
+                <option value="22">0x16 - O2 Sensor 3 V+Trim</option>
+                <option value="23">0x17 - O2 Sensor 4 V+Trim</option>
+                <option value="24">0x18 - O2 Sensor 5 V+Trim</option>
+                <option value="25">0x19 - O2 Sensor 6 V+Trim</option>
+                <option value="26">0x1A - O2 Sensor 7 V+Trim</option>
+                <option value="27">0x1B - O2 Sensor 8 V+Trim</option>
+                <option value="29">0x1D - O2 Sensors Present (4 Banks)</option>
+                </optgroup>
+                <optgroup label="O2 Sensors (Equiv Ratio &amp; Voltage)">
+                <option value="36">0x24 - O2 Sensor 1 ER+V</option>
+                <option value="37">0x25 - O2 Sensor 2 ER+V</option>
+                <option value="38">0x26 - O2 Sensor 3 ER+V</option>
+                <option value="39">0x27 - O2 Sensor 4 ER+V</option>
+                <option value="40">0x28 - O2 Sensor 5 ER+V</option>
+                <option value="41">0x29 - O2 Sensor 6 ER+V</option>
+                <option value="42">0x2A - O2 Sensor 7 ER+V</option>
+                <option value="43">0x2B - O2 Sensor 8 ER+V</option>
+                </optgroup>
+                <optgroup label="O2 Sensors (Equiv Ratio &amp; Current)">
+                <option value="52">0x34 - O2 Sensor 1 ER+I</option>
+                <option value="53">0x35 - O2 Sensor 2 ER+I</option>
+                <option value="54">0x36 - O2 Sensor 3 ER+I</option>
+                <option value="55">0x37 - O2 Sensor 4 ER+I</option>
+                <option value="56">0x38 - O2 Sensor 5 ER+I</option>
+                <option value="57">0x39 - O2 Sensor 6 ER+I</option>
+                <option value="58">0x3A - O2 Sensor 7 ER+I</option>
+                <option value="59">0x3B - O2 Sensor 8 ER+I</option>
+                </optgroup>
+                <optgroup label="Catalyst Temperature">
+                <option value="60">0x3C - Catalyst Temp B1S1</option>
+                <option value="61">0x3D - Catalyst Temp B2S1</option>
+                <option value="62">0x3E - Catalyst Temp B1S2</option>
+                <option value="63">0x3F - Catalyst Temp B2S2</option>
+                </optgroup>
+                <optgroup label="Throttle &amp; Pedal">
+                <option value="69">0x45 - Relative Throttle Position</option>
+                <option value="71">0x47 - Absolute Throttle B</option>
+                <option value="72">0x48 - Absolute Throttle C</option>
+                <option value="73">0x49 - Accelerator Pedal D</option>
+                <option value="74">0x4A - Accelerator Pedal E</option>
+                <option value="75">0x4B - Accelerator Pedal F</option>
+                <option value="76">0x4C - Commanded Throttle Actuator</option>
+                </optgroup>
+                <optgroup label="Voltage &amp; Temperature">
+                <option value="66">0x42 - Control Module Voltage</option>
+                <option value="67">0x43 - Absolute Load Value</option>
+                <option value="68">0x44 - Fuel-Air Equiv Ratio</option>
+                <option value="70">0x46 - Ambient Air Temperature</option>
+                </optgroup>
+                <optgroup label="Secondary O2 Trim">
+                <option value="85">0x55 - Short Term O2 Trim B1&amp;3</option>
+                <option value="86">0x56 - Long Term O2 Trim B1&amp;3</option>
+                <option value="87">0x57 - Short Term O2 Trim B2&amp;4</option>
+                <option value="88">0x58 - Long Term O2 Trim B2&amp;4</option>
+                </optgroup>
+                <optgroup label="Hybrid &amp; Torque">
+                <option value="91">0x5B - Hybrid Battery Remaining</option>
+                <option value="97">0x61 - Driver Demand Torque %</option>
+                <option value="98">0x62 - Actual Engine Torque %</option>
+                <option value="99">0x63 - Engine Reference Torque</option>
+                <option value="100">0x64 - Engine Torque Data</option>
+                <option value="101">0x65 - Aux Input/Output Supported</option>
+                </optgroup>
+                <optgroup label="Monitor Status">
+                <option value="65">0x41 - Monitor Status (Drive Cycle)</option>
+                <option value="79">0x4F - Max Values (ER/O2V/O2I/MAP)</option>
+                <option value="80">0x50 - Max MAF Air Flow Rate</option>
+                </optgroup>
+            </select>
+        </div>
+        <div class="form-group">
+            <label>PID Priority:</label>
+            <select id="profilePidPriority" onchange="updateProfileField('pid_priority', this.value)">
+                <option value="fast">Fast</option>
+                <option value="slow">Slow</option>
+            </select>
+        </div>
+        <div id="triggeredFields" style="display: none;">
+            <div class="form-group">
+                <label>Button GPIO Pin:</label>
+                <input type="number" id="profileButtonPin" min="0" max="48" value="0" onchange="updateProfileField('button_pin', parseInt(this.value))">
+            </div>
+            <div class="form-group">
+                <label>Auto-disable above:</label>
+                <input type="number" id="profileAutoDisable" min="0" style="width: 80px;" onchange="updateProfileField('auto_disable_above', this.value ? encodePidValue(getActiveProfile().pid, parseFloat(this.value)) : null)">
+                <span id="autoDisableUnit" style="color: #888; font-size: 0.85em;">(empty = disabled)</span>
+            </div>
+        </div>
+        <div class="form-group">
+            <label>Preview Value:</label>
+            <input type="number" id="previewValue" min="0" max="65535" step="1" style="width: 80px;" onchange="updatePreviewValue(parseFloat(this.value))">
+            <input type="range" id="previewValueSlider" min="0" max="65535" step="1" style="width: 200px; vertical-align: middle;" oninput="updatePreviewValue(parseFloat(this.value))">
+            <span id="previewValueUnit" style="color: #888; font-size: 0.85em;"></span>
         </div>
         <div class="led-preview-container">
             <label>LED Preview:</label>
@@ -1371,10 +1558,92 @@
         let config = { profiles: [{ name: 'Default', rules: [] }], active_profile: 0 };
         // Default config (loaded from server, used as fallback)
         let defaults = null;
+        // UI state: which profile is being edited (separate from config.active_profile which is the firmware-active normal profile)
+        let editingProfileIndex = 0;
+        // UI state: which tab is shown
+        let activeTab = 'normal';
 
-        // Helper to get the active profile
+        // PID codec table: decode raw→human, encode human→raw, unit, step for input granularity
+        const PID_CODECS = {
+            0x04: { decode: r => r * 100 / 255,        encode: v => Math.round(v * 255 / 100),   unit: '%',    step: 1 },
+            0x05: { decode: r => r - 40,                encode: v => v + 40,                      unit: '°C',   step: 1 },
+            0x06: { decode: r => r * 100 / 128 - 100,   encode: v => Math.round((v + 100) * 128 / 100), unit: '%', step: 1 },
+            0x07: { decode: r => r * 100 / 128 - 100,   encode: v => Math.round((v + 100) * 128 / 100), unit: '%', step: 1 },
+            0x08: { decode: r => r * 100 / 128 - 100,   encode: v => Math.round((v + 100) * 128 / 100), unit: '%', step: 1 },
+            0x09: { decode: r => r * 100 / 128 - 100,   encode: v => Math.round((v + 100) * 128 / 100), unit: '%', step: 1 },
+            0x0A: { decode: r => r * 3,                 encode: v => Math.round(v / 3),            unit: 'kPa',  step: 1 },
+            0x0B: { decode: r => r,                     encode: v => Math.round(v),                unit: 'kPa',  step: 1 },
+            0x0C: { decode: r => r / 4,                 encode: v => Math.round(v * 4),            unit: 'RPM',  step: 1 },
+            0x0D: { decode: r => r,                     encode: v => Math.round(v),                unit: 'km/h', step: 1 },
+            0x0E: { decode: r => r / 2 - 64,            encode: v => Math.round((v + 64) * 2),     unit: '°',    step: 0.5 },
+            0x0F: { decode: r => r - 40,                encode: v => v + 40,                       unit: '°C',   step: 1 },
+            0x10: { decode: r => r / 100,               encode: v => Math.round(v * 100),          unit: 'g/s',  step: 0.01 },
+            0x11: { decode: r => r * 100 / 255,         encode: v => Math.round(v * 255 / 100),    unit: '%',    step: 1 },
+            0x1F: { decode: r => r,                     encode: v => Math.round(v),                unit: 'sec',  step: 1 },
+            0x21: { decode: r => r,                     encode: v => Math.round(v),                unit: 'km',   step: 1 },
+            0x2C: { decode: r => r * 100 / 255,         encode: v => Math.round(v * 255 / 100),    unit: '%',    step: 1 },
+            0x2D: { decode: r => r * 100 / 128 - 100,   encode: v => Math.round((v + 100) * 128 / 100), unit: '%', step: 1 },
+            0x2E: { decode: r => r * 100 / 255,         encode: v => Math.round(v * 255 / 100),    unit: '%',    step: 1 },
+            0x2F: { decode: r => r * 100 / 255,         encode: v => Math.round(v * 255 / 100),    unit: '%',    step: 1 },
+            0x30: { decode: r => r,                     encode: v => Math.round(v),                unit: '',     step: 1 },
+            0x31: { decode: r => r,                     encode: v => Math.round(v),                unit: 'km',   step: 1 },
+            0x33: { decode: r => r,                     encode: v => Math.round(v),                unit: 'kPa',  step: 1 },
+            0x3C: { decode: r => r / 10 - 40,           encode: v => Math.round((v + 40) * 10),    unit: '°C',   step: 0.1 },
+            0x3D: { decode: r => r / 10 - 40,           encode: v => Math.round((v + 40) * 10),    unit: '°C',   step: 0.1 },
+            0x3E: { decode: r => r / 10 - 40,           encode: v => Math.round((v + 40) * 10),    unit: '°C',   step: 0.1 },
+            0x3F: { decode: r => r / 10 - 40,           encode: v => Math.round((v + 40) * 10),    unit: '°C',   step: 0.1 },
+            0x42: { decode: r => r / 1000,              encode: v => Math.round(v * 1000),         unit: 'V',    step: 0.001 },
+            0x43: { decode: r => r * 100 / 255,         encode: v => Math.round(v * 255 / 100),    unit: '%',    step: 1 },
+            0x44: { decode: r => r / 32768,             encode: v => Math.round(v * 32768),        unit: 'λ',    step: 0.001 },
+            0x45: { decode: r => r * 100 / 255,         encode: v => Math.round(v * 255 / 100),    unit: '%',    step: 1 },
+            0x46: { decode: r => r - 40,                encode: v => v + 40,                       unit: '°C',   step: 1 },
+            0x47: { decode: r => r * 100 / 255,         encode: v => Math.round(v * 255 / 100),    unit: '%',    step: 1 },
+            0x48: { decode: r => r * 100 / 255,         encode: v => Math.round(v * 255 / 100),    unit: '%',    step: 1 },
+            0x49: { decode: r => r * 100 / 255,         encode: v => Math.round(v * 255 / 100),    unit: '%',    step: 1 },
+            0x4A: { decode: r => r * 100 / 255,         encode: v => Math.round(v * 255 / 100),    unit: '%',    step: 1 },
+            0x4B: { decode: r => r * 100 / 255,         encode: v => Math.round(v * 255 / 100),    unit: '%',    step: 1 },
+            0x4C: { decode: r => r * 100 / 255,         encode: v => Math.round(v * 255 / 100),    unit: '%',    step: 1 },
+            0x4D: { decode: r => r,                     encode: v => Math.round(v),                unit: 'min',  step: 1 },
+            0x4E: { decode: r => r,                     encode: v => Math.round(v),                unit: 'min',  step: 1 },
+            0x52: { decode: r => r * 100 / 255,         encode: v => Math.round(v * 255 / 100),    unit: '%',    step: 1 },
+            0x53: { decode: r => r / 200,               encode: v => Math.round(v * 200),          unit: 'kPa',  step: 0.01 },
+            0x59: { decode: r => r * 10,                encode: v => Math.round(v / 10),           unit: 'kPa',  step: 10 },
+            0x5A: { decode: r => r * 100 / 255,         encode: v => Math.round(v * 255 / 100),    unit: '%',    step: 1 },
+            0x5B: { decode: r => r * 100 / 255,         encode: v => Math.round(v * 255 / 100),    unit: '%',    step: 1 },
+            0x5C: { decode: r => r - 40,                encode: v => v + 40,                       unit: '°C',   step: 1 },
+            0x5D: { decode: r => r / 128 - 210,         encode: v => Math.round((v + 210) * 128),  unit: '°',    step: 0.1 },
+            0x5E: { decode: r => r / 20,                encode: v => Math.round(v * 20),           unit: 'L/h',  step: 0.05 },
+        };
+
+        function decodePidValue(pid, raw) {
+            if (raw == null) return null;
+            const codec = PID_CODECS[pid];
+            if (!codec) return raw;
+            const decoded = codec.decode(raw);
+            // Round to step precision to avoid floating-point display noise
+            const factor = 1 / codec.step;
+            return Math.round(decoded * factor) / factor;
+        }
+
+        function encodePidValue(pid, decoded) {
+            if (decoded == null) return null;
+            const codec = PID_CODECS[pid];
+            return codec ? codec.encode(decoded) : Math.round(decoded);
+        }
+
+        function getPidUnit(pid) {
+            const codec = PID_CODECS[pid];
+            return codec ? codec.unit : '';
+        }
+
+        function getPidStep(pid) {
+            const codec = PID_CODECS[pid];
+            return codec ? codec.step : 1;
+        }
+
+        // Helper to get the profile currently being edited
         function getActiveProfile() {
-            return config.profiles[config.active_profile] || config.profiles[0];
+            return config.profiles[editingProfileIndex];
         }
 
         // Helper to get/set nested values by path (e.g., 'obd2.dongle_ip')
@@ -1402,6 +1671,7 @@
             { id: 'totalLeds', path: 'total_leds', type: 'int' },
             { id: 'ledGpio', path: 'led_gpio', type: 'int', default: 'led_gpio' },
             { id: 'rpmStaleTimeoutMs', path: 'rpm_stale_timeout_ms', type: 'int', fallback: 0 },
+            { id: 'previewDurationMs', path: 'preview_duration_ms', type: 'int', default: 'preview_duration_ms' },
             { id: 'encoderPinA', path: 'encoder_pin_a', type: 'int', fallback: 0 },
             { id: 'encoderPinB', path: 'encoder_pin_b', type: 'int', fallback: 0 },
             { id: 'buttonPin', path: 'button_pin', type: 'int', fallback: 0 },
@@ -1478,6 +1748,10 @@
             document.getElementById('brightnessSlider').value = brightness;
             document.getElementById('brightnessValue').textContent = brightness;
             
+            // Initialize UI state for profile editing
+            editingProfileIndex = config.active_profile;
+            activeTab = 'normal';
+            renderProfileTabs();
             renderProfiles();
             renderRules();
         }
@@ -1586,66 +1860,123 @@
             } : { r: 0, g: 0, b: 0 };
         }
 
-        function getPreviewRpmBounds(rules) {
+        function getPreviewValueBounds(rules, pid) {
+            const step = getPidStep(pid);
+            const roundUnit = Math.max(step * 10, 1);
             if (!rules || rules.length === 0) {
-                return { min: 0, max: 10000 };
+                const defaultMax = decodePidValue(pid, 10000);
+                return { min: 0, max: Math.ceil(defaultMax / roundUnit) * roundUnit, step };
             }
             let min = Infinity;
-            let max = 0;
+            let max = -Infinity;
             for (const t of rules) {
-                if (t.rpm_lower !== undefined && t.rpm_lower !== null) {
-                    min = Math.min(min, t.rpm_lower);
-                    max = Math.max(max, t.rpm_lower);
+                if (t.value_lower != null) {
+                    const decoded = decodePidValue(pid, t.value_lower);
+                    min = Math.min(min, decoded);
+                    max = Math.max(max, decoded);
                 }
-                if (t.rpm_upper !== undefined && t.rpm_upper !== null) {
-                    min = Math.min(min, t.rpm_upper);
-                    max = Math.max(max, t.rpm_upper);
+                if (t.value_upper != null) {
+                    const decoded = decodePidValue(pid, t.value_upper);
+                    min = Math.min(min, decoded);
+                    max = Math.max(max, decoded);
                 }
             }
-            // Ensure reasonable defaults if no valid values found
             if (min === Infinity) min = 0;
-            if (max === 0) max = 10000;
-            // Round down min to nearest 500, round up max to nearest 500
-            min = Math.floor(min / 500) * 500;
-            max = Math.ceil(max / 500) * 500;
-            // Ensure at least some range
-            if (max <= min) max = min + 1000;
-            return { min, max };
+            if (max === -Infinity) max = decodePidValue(pid, 10000);
+            min = Math.floor(min / roundUnit) * roundUnit;
+            max = Math.ceil(max / roundUnit) * roundUnit;
+            if (max <= min) max = min + roundUnit * 10;
+            return { min, max, step };
+        }
+
+        function renderProfileTabs() {
+            document.querySelectorAll('.profile-tab').forEach(btn => {
+                btn.classList.toggle('active', btn.dataset.tab === activeTab);
+            });
+        }
+
+        function switchTab(tabType) {
+            activeTab = tabType;
+            // Select first profile of this type
+            const idx = config.profiles.findIndex(p => (p.profile_type || 'normal') === tabType);
+            if (idx >= 0) editingProfileIndex = idx;
+            renderProfileTabs();
+            renderProfiles();
+            renderRules();
+        }
+
+        function setActiveProfile() {
+            config.active_profile = editingProfileIndex;
+            renderProfiles();
         }
 
         function renderProfiles() {
             const select = document.getElementById('profileSelect');
             const nameInput = document.getElementById('profileName');
             select.innerHTML = '';
+            // Show only profiles matching the active tab
             config.profiles.forEach((profile, index) => {
+                if ((profile.profile_type || 'normal') !== activeTab) return;
                 const option = document.createElement('option');
                 option.value = index;
-                option.textContent = profile.name;
-                option.selected = index === config.active_profile;
+                let label = profile.name;
+                if (activeTab === 'normal' && index === config.active_profile) {
+                    label += ' \u2605';
+                }
+                option.textContent = label;
+                option.selected = index === editingProfileIndex;
                 select.appendChild(option);
             });
-            const activeProfile = getActiveProfile();
-            nameInput.value = activeProfile ? activeProfile.name : '';
+            const editingProfile = getActiveProfile();
+            nameInput.value = editingProfile ? editingProfile.name : '';
             
-            // Update preview RPM slider bounds based on rules
-            const bounds = getPreviewRpmBounds(activeProfile ? activeProfile.rules : []);
-            const previewRpmInput = document.getElementById('previewRpm');
-            const previewRpmSlider = document.getElementById('previewRpmSlider');
-            previewRpmInput.min = bounds.min;
-            previewRpmInput.max = bounds.max;
-            previewRpmSlider.min = bounds.min;
-            previewRpmSlider.max = bounds.max;
+            // Show/hide Set Active button (Normal tab, non-active profile)
+            const setActiveBtn = document.getElementById('setActiveBtn');
+            if (activeTab === 'normal' && editingProfile && editingProfileIndex !== config.active_profile) {
+                setActiveBtn.style.display = '';
+            } else {
+                setActiveBtn.style.display = 'none';
+            }
             
-            // Update preview RPM controls
-            const previewRpm = activeProfile ? (activeProfile.preview_rpm || bounds.max) : bounds.max;
-            previewRpmInput.value = previewRpm;
-            previewRpmSlider.value = previewRpm;
+            // Populate profile-level fields
+            if (editingProfile) {
+                document.getElementById('profilePid').value = editingProfile.pid !== undefined ? editingProfile.pid : 12;
+                document.getElementById('profilePidPriority').value = editingProfile.pid_priority || 'fast';
+                document.getElementById('profileButtonPin').value = editingProfile.button_pin || 0;
+                const pid = editingProfile.pid !== undefined ? editingProfile.pid : 12;
+                document.getElementById('profileAutoDisable').value = editingProfile.auto_disable_above != null ? decodePidValue(pid, editingProfile.auto_disable_above) : '';
+                const adUnit = getPidUnit(pid);
+                document.getElementById('autoDisableUnit').textContent = adUnit ? '(' + adUnit + ', empty = disabled)' : '(empty = disabled)';
+                document.getElementById('profileAutoDisable').step = getPidStep(pid);
+                syncPidDropdown(pid);
+                toggleTriggeredFields();
+            }
+            
+            // Update preview value slider bounds based on rules
+            const pid = editingProfile ? (editingProfile.pid !== undefined ? editingProfile.pid : 12) : 12;
+            const bounds = getPreviewValueBounds(editingProfile ? editingProfile.rules : [], pid);
+            const previewValueInput = document.getElementById('previewValue');
+            const previewValueSlider = document.getElementById('previewValueSlider');
+            previewValueInput.min = bounds.min;
+            previewValueInput.max = bounds.max;
+            previewValueInput.step = bounds.step;
+            previewValueSlider.min = bounds.min;
+            previewValueSlider.max = bounds.max;
+            previewValueSlider.step = bounds.step;
+            const unit = getPidUnit(pid);
+            document.getElementById('previewValueUnit').textContent = unit;
+            
+            // Update preview value controls (decode raw to human units)
+            const rawPreview = editingProfile ? (editingProfile.preview_value != null ? editingProfile.preview_value : encodePidValue(pid, bounds.max)) : encodePidValue(pid, bounds.max);
+            const decodedPreview = decodePidValue(pid, rawPreview);
+            previewValueInput.value = decodedPreview;
+            previewValueSlider.value = decodedPreview;
             
             renderLedPreview();
         }
 
         function selectProfile(index) {
-            config.active_profile = parseInt(index);
+            editingProfileIndex = parseInt(index);
             renderProfiles();
             renderRules();
         }
@@ -1654,20 +1985,25 @@
             config.profiles.push({
                 name: 'New Profile',
                 rules: [],
-                preview_rpm: 3000
+                preview_value: 3000,
+                pid: 12,
+                pid_priority: 'fast',
+                profile_type: activeTab,
+                button_pin: 0,
+                auto_disable_above: null
             });
-            config.active_profile = config.profiles.length - 1;
+            editingProfileIndex = config.profiles.length - 1;
             renderProfiles();
             renderRules();
         }
 
         function copyProfile() {
-            const activeProfile = getActiveProfile();
-            if (!activeProfile) return;
-            const copy = JSON.parse(JSON.stringify(activeProfile));
-            copy.name = activeProfile.name + ' (Copy)';
+            const editingProfile = getActiveProfile();
+            if (!editingProfile) return;
+            const copy = JSON.parse(JSON.stringify(editingProfile));
+            copy.name = editingProfile.name + ' (Copy)';
             config.profiles.push(copy);
-            config.active_profile = config.profiles.length - 1;
+            editingProfileIndex = config.profiles.length - 1;
             renderProfiles();
             renderRules();
         }
@@ -1677,21 +2013,52 @@
                 alert('Cannot delete the last profile');
                 return;
             }
-            config.profiles.splice(config.active_profile, 1);
-            if (config.active_profile >= config.profiles.length) {
-                config.active_profile = config.profiles.length - 1;
+            const deletedIndex = editingProfileIndex;
+            config.profiles.splice(deletedIndex, 1);
+            // Adjust config.active_profile for the firmware's active normal profile
+            if (deletedIndex === config.active_profile) {
+                const nextNormal = config.profiles.findIndex(p => (p.profile_type || 'normal') === 'normal');
+                config.active_profile = nextNormal >= 0 ? nextNormal : 0;
+            } else if (deletedIndex < config.active_profile) {
+                config.active_profile--;
+            }
+            // Select next profile of the same tab type
+            const sameType = config.profiles.findIndex(p => (p.profile_type || 'normal') === activeTab);
+            if (sameType >= 0) {
+                editingProfileIndex = sameType;
+            } else if (editingProfileIndex >= config.profiles.length) {
+                editingProfileIndex = config.profiles.length - 1;
             }
             renderProfiles();
             renderRules();
         }
 
         function moveProfile(direction) {
-            const newIndex = config.active_profile + direction;
-            if (newIndex < 0 || newIndex >= config.profiles.length) return;
-            const temp = config.profiles[config.active_profile];
-            config.profiles[config.active_profile] = config.profiles[newIndex];
-            config.profiles[newIndex] = temp;
-            config.active_profile = newIndex;
+            const profileType = activeTab;
+            const flatIdx = editingProfileIndex;
+            // Find adjacent profile of the same type
+            let targetIdx = -1;
+            if (direction < 0) {
+                for (let i = flatIdx - 1; i >= 0; i--) {
+                    if ((config.profiles[i].profile_type || 'normal') === profileType) {
+                        targetIdx = i; break;
+                    }
+                }
+            } else {
+                for (let i = flatIdx + 1; i < config.profiles.length; i++) {
+                    if ((config.profiles[i].profile_type || 'normal') === profileType) {
+                        targetIdx = i; break;
+                    }
+                }
+            }
+            if (targetIdx < 0) return;
+            const temp = config.profiles[flatIdx];
+            config.profiles[flatIdx] = config.profiles[targetIdx];
+            config.profiles[targetIdx] = temp;
+            // Adjust active_profile if one of the swapped profiles was active
+            if (config.active_profile === flatIdx) config.active_profile = targetIdx;
+            else if (config.active_profile === targetIdx) config.active_profile = flatIdx;
+            editingProfileIndex = targetIdx;
             renderProfiles();
         }
 
@@ -1703,12 +2070,86 @@
             }
         }
 
-        function updatePreviewRpm(rpm) {
+        function updateProfileField(field, value) {
             const activeProfile = getActiveProfile();
             if (activeProfile) {
-                activeProfile.preview_rpm = rpm;
-                document.getElementById('previewRpm').value = rpm;
-                document.getElementById('previewRpmSlider').value = rpm;
+                activeProfile[field] = value;
+            }
+        }
+
+        function syncPidDropdown(pid) {
+            const dropdown = document.getElementById('profilePid');
+            // Check if the PID matches a known option
+            const options = Array.from(dropdown.options);
+            const match = options.find(o => parseInt(o.value) === pid);
+            if (match) {
+                dropdown.value = pid;
+            } else {
+                // Add a custom option and select it
+                let customOpt = options.find(o => o.dataset.custom);
+                if (!customOpt) {
+                    customOpt = document.createElement('option');
+                    customOpt.dataset.custom = 'true';
+                    dropdown.appendChild(customOpt);
+                }
+                customOpt.value = pid;
+                customOpt.textContent = '0x' + pid.toString(16).toUpperCase().padStart(2, '0') + ' - Unknown';
+                dropdown.value = pid;
+            }
+        }
+
+        // Supported PIDs from dongle — null means not yet loaded
+        let supportedPids = null;
+
+        async function loadSupportedPids() {
+            try {
+                const response = await fetch('/api/supported-pids');
+                if (!response.ok) return;
+                const data = await response.json();
+                if (!data.ready) {
+                    supportedPids = null;
+                    return;
+                }
+                supportedPids = new Set(data.pids);
+                filterPidDropdown();
+            } catch (e) {
+                console.error('Failed to load supported PIDs:', e);
+            }
+        }
+
+        function filterPidDropdown() {
+            const dropdown = document.getElementById('profilePid');
+            for (const opt of dropdown.options) {
+                if (opt.parentElement.tagName === 'OPTGROUP' || opt.dataset.custom) {
+                    continue;
+                }
+                const pid = parseInt(opt.value);
+                if (supportedPids && !supportedPids.has(pid)) {
+                    opt.disabled = true;
+                    opt.style.color = '#666';
+                } else {
+                    opt.disabled = false;
+                    opt.style.color = '';
+                }
+            }
+            // Also hide empty optgroups
+            for (const group of dropdown.querySelectorAll('optgroup')) {
+                const hasEnabled = Array.from(group.children).some(o => !o.disabled);
+                group.style.display = hasEnabled ? '' : 'none';
+            }
+        }
+
+        function toggleTriggeredFields() {
+            document.getElementById('triggeredFields').style.display = activeTab === 'triggered' ? '' : 'none';
+        }
+
+        function updatePreviewValue(decodedValue) {
+            const activeProfile = getActiveProfile();
+            if (activeProfile) {
+                const pid = activeProfile.pid !== undefined ? activeProfile.pid : 12;
+                activeProfile.preview_value = encodePidValue(pid, decodedValue);
+                document.getElementById('previewValue').value = decodedValue;
+                document.getElementById('previewValueSlider').value = decodedValue;
                 renderLedPreview();
             }
         }
@@ -1717,11 +2158,11 @@
             const container = document.getElementById('ledPreview');
             const totalLeds = parseInt(document.getElementById('totalLeds').value) || 8;
             const profile = getActiveProfile();
-            const rpm = profile ? (profile.preview_rpm || 3000) : 3000;
+            const value = profile ? (profile.preview_value || 3000) : 3000;
             const rules = profile ? profile.rules : [];
             
             // Compute LED colors using the same logic as the firmware
-            const leds = computeLedState(rpm, rules, totalLeds);
+            const leds = computeLedState(value, rules, totalLeds);
             
             container.innerHTML = '';
             for (let i = 0; i < totalLeds; i++) {
@@ -1738,14 +2179,14 @@
         }
 
         // Simplified LED state computation (mirrors firmware logic)
-        function computeLedState(rpm, rules, totalLeds) {
+        function computeLedState(value, rules, totalLeds) {
             const leds = Array(totalLeds).fill(null).map(() => ({ r: 0, g: 0, b: 0 }));
             
             // Find all matching rules
-            const matching = rules.filter(t => rpm >= t.rpm_lower);
+            const matching = rules.filter(t => value >= t.value_lower);
             
             for (const rule of matching) {
-                const ledsToLight = computeLedsToLight(rpm, rule, totalLeds);
+                const ledsToLight = computeLedsToLight(value, rule, totalLeds);
                 const totalRange = Math.abs(rule.start_led - rule.end_led) + 1;
                 
                 for (let i = 0; i < ledsToLight.length; i++) {
@@ -1759,24 +2200,24 @@
             return leds;
         }
 
-        function computeLedsToLight(rpm, rule, totalLeds) {
+        function computeLedsToLight(value, rule, totalLeds) {
             const startLed = Math.min(rule.start_led, totalLeds - 1);
             const endLed = Math.min(rule.end_led, totalLeds - 1);
             const forward = startLed <= endLed;
             const ledCount = Math.abs(endLed - startLed) + 1;
             
             let ledsToLight;
-            if (rule.rpm_upper === null || rule.rpm_upper === undefined) {
+            if (rule.value_upper === null || rule.value_upper === undefined) {
                 // No upper bound - light all LEDs
                 ledsToLight = ledCount;
             } else {
                 // Proportional lighting
-                const rpmRange = rule.rpm_upper - rule.rpm_lower;
-                if (rpmRange <= 0) {
+                const valueRange = rule.value_upper - rule.value_lower;
+                if (valueRange <= 0) {
                     ledsToLight = ledCount;
                 } else {
-                    const rpmProgress = Math.min(rpm - rule.rpm_lower, rpmRange);
-                    ledsToLight = Math.min(1 + Math.floor((rpmProgress * ledCount) / rpmRange), ledCount);
+                    const valueProgress = Math.min(value - rule.value_lower, valueRange);
+                    ledsToLight = Math.min(1 + Math.floor((valueProgress * ledCount) / valueRange), ledCount);
                 }
             }
             
@@ -1814,6 +2255,11 @@
             const profile = getActiveProfile();
             if (!profile) return;
             
+            const pid = profile.pid !== undefined ? profile.pid : 12;
+            const step = getPidStep(pid);
+            const unit = getPidUnit(pid);
+            const unitLabel = unit ? ' <span style=\"color:#888;font-size:0.85em\">' + unit + '</span>' : '';
+            
             profile.rules.forEach((rule, index) => {
                 const div = document.createElement('div');
                 div.className = 'rule';
@@ -1822,24 +2268,28 @@
                         '<label>Blink ms:</label>' +
                         '<input type="number" min="50" step="50" value="' + (rule.blink_ms || 500) + '" onchange="updateRule(' + index + ', \'blink_ms\', parseInt(this.value))">' +
                     '</div>' : '<div class="form-group"></div>';
-                const hasRpmUpper = rule.rpm_upper !== null && rule.rpm_upper !== undefined;
-                const rpmUpperValue = hasRpmUpper ? rule.rpm_upper : (rule.rpm_lower + 1000);
-                const rpmUpperHtml = 
+                const hasValueUpper = rule.value_upper !== null && rule.value_upper !== undefined;
+                const decodedLower = decodePidValue(pid, rule.value_lower);
+                const decodedUpper = hasValueUpper ? decodePidValue(pid, rule.value_upper) : decodePidValue(pid, rule.value_lower + 1000);
+                const valueUpperHtml = 
                     '<div class="form-group">' +
-                        '<label>RPM Upper:</label>' +
-                        '<input type="number" value="' + rpmUpperValue + '" ' + (hasRpmUpper ? '' : 'disabled') + ' onchange="updateRule(' + index + ', \'rpm_upper\', parseInt(this.value))">' +
-                        '<input type="checkbox" ' + (hasRpmUpper ? 'checked' : '') + ' onchange="this.previousElementSibling.disabled = !this.checked; updateRule(' + index + ', \'rpm_upper\', this.checked ? parseInt(this.previousElementSibling.value) : null)">' +
+                        '<label>Value Upper:</label>' +
+                        '<input type="number" step="' + step + '" value="' + decodedUpper + '" ' + (hasValueUpper ? '' : 'disabled') + ' onchange="updateRule(' + index + ', \'value_upper\', encodePidValue(' + pid + ', parseFloat(this.value)))">' +
+                        '<input type="checkbox" ' + (hasValueUpper ? 'checked' : '') + ' onchange="this.previousElementSibling.disabled = !this.checked; updateRule(' + index + ', \'value_upper\', this.checked ? encodePidValue(' + pid + ', parseFloat(this.previousElementSibling.value)) : null)">' +
+                        unitLabel +
                     '</div>';
                 let colorsHtml = '<div class="form-group colors-group"><label>Colors:</label>';
                 const colors = rule.colors;
                 colors.forEach((c, colorIndex) => {
                     const isFirst = colorIndex === 0;
                     const isLast = colorIndex === colors.length - 1;
+                    colorsHtml += '<div class="color-entry">';
                     colorsHtml += '<input type="color" value="' + rgbToHex(c) + '" onchange="updateColor(' + index + ', ' + colorIndex + ', hexToRgb(this.value))">';
                     colorsHtml += '<button style="padding: 3px 6px; margin: 0 2px;" onclick="addColor(' + index + ', ' + colorIndex + ')">+</button>';
                     if (!isFirst) {
                         colorsHtml += '<button style="padding: 3px 6px; margin: 0 2px;" onclick="removeColor(' + index + ', ' + colorIndex + ')">−</button>';
                     }
+                    colorsHtml += '</div>';
                 });
                 colorsHtml += '</div>';
                 div.innerHTML = 
@@ -1848,10 +2298,11 @@
                     '</div>' +
                     '<div class="rule-grid">' +
                         '<div class="form-group">' +
-                            '<label>RPM Lower:</label>' +
-                            '<input type="number" value="' + rule.rpm_lower + '" onchange="updateRule(' + index + ', \'rpm_lower\', parseInt(this.value))">' +
+                            '<label>Value Lower:</label>' +
+                            '<input type="number" step="' + step + '" value="' + decodedLower + '" onchange="updateRule(' + index + ', \'value_lower\', encodePidValue(' + pid + ', parseFloat(this.value)))">' +
+                            unitLabel +
                         '</div>' +
-                        rpmUpperHtml +
+                        valueUpperHtml +
                         '<div class="form-group">' +
                             '<label>From LED:</label>' +
                             '<input type="number" min="0" value="' + rule.start_led + '" onchange="updateRule(' + index + ', \'start_led\', parseInt(this.value))">' +
@@ -1878,18 +2329,21 @@
 
         function updatePreviewSliderBounds() {
             const activeProfile = getActiveProfile();
-            const bounds = getPreviewRpmBounds(activeProfile ? activeProfile.rules : []);
-            const previewRpmInput = document.getElementById('previewRpm');
-            const previewRpmSlider = document.getElementById('previewRpmSlider');
-            previewRpmInput.min = bounds.min;
-            previewRpmInput.max = bounds.max;
-            previewRpmSlider.min = bounds.min;
-            previewRpmSlider.max = bounds.max;
+            const pid = activeProfile ? (activeProfile.pid !== undefined ? activeProfile.pid : 12) : 12;
+            const bounds = getPreviewValueBounds(activeProfile ? activeProfile.rules : [], pid);
+            const previewValueInput = document.getElementById('previewValue');
+            const previewValueSlider = document.getElementById('previewValueSlider');
+            previewValueInput.min = bounds.min;
+            previewValueInput.max = bounds.max;
+            previewValueInput.step = bounds.step;
+            previewValueSlider.min = bounds.min;
+            previewValueSlider.max = bounds.max;
+            previewValueSlider.step = bounds.step;
         }
 
         function updateRule(index, field, value) {
             getActiveProfile().rules[index][field] = value;
-            if (field === 'rpm_lower' || field === 'rpm_upper') {
+            if (field === 'value_lower' || field === 'value_upper') {
                 updatePreviewSliderBounds();
             }
             renderLedPreview();
@@ -1921,8 +2375,8 @@
         function addRule() {
             getActiveProfile().rules.push({
                 name: 'New Rule',
-                rpm_lower: 5000,
-                rpm_upper: null,
+                value_lower: 5000,
+                value_upper: null,
                 start_led: 0,
                 end_led: 7,
                 colors: [{ r: 255, g: 0, b: 0 }],
@@ -2282,11 +2736,39 @@
                 const response = await fetch('/api/rpm');
                 if (response.ok) {
                     const data = await response.json();
-                    document.getElementById('currentRpm').textContent = data.rpm !== null ? data.rpm : '---';
+                    if (data.rpm !== null) {
+                        livePidValues[0x0C] = data.rpm;
+                    }
+                    renderPidValues();
                 }
             } catch (error) {
                 console.error('Failed to poll RPM:', error);
             }
+        }
+
+        // Live PID values from SSE/polling, keyed by PID number
+        let livePidValues = {};
+
+        const PID_NAMES = {
+            0x04: 'Load', 0x05: 'Coolant', 0x0A: 'Fuel Press',
+            0x0B: 'Intake MAP', 0x0C: 'RPM', 0x0D: 'Speed',
+            0x0F: 'Intake Temp', 0x10: 'MAF', 0x11: 'Throttle',
+            0x33: 'Baro Press', 0x46: 'Ambient Temp', 0x5A: 'Accel Pedal'
+        };
+
+        function renderPidValues() {
+            const el = document.getElementById('currentPidValues');
+            const pids = Object.keys(livePidValues).map(Number).sort((a, b) => a - b);
+            if (pids.length === 0) {
+                el.textContent = '---';
+                return;
+            }
+            el.textContent = pids.map(pid => {
+                const name = PID_NAMES[pid] || ('0x' + pid.toString(16).toUpperCase().padStart(2, '0'));
+                const decoded = decodePidValue(pid, livePidValues[pid]);
+                const unit = getPidUnit(pid);
+                return name + ': ' + decoded + (unit ? ' ' + unit : '');
+            }).join(' | ');
         }
 
         let rpmEventSource = null;
@@ -2327,7 +2809,12 @@
                 sseConnected = true;
                 stopRpmPolling(); // SSE working, ensure polling stopped
                 const data = JSON.parse(event.data);
-                document.getElementById('currentRpm').textContent = data.rpm !== null ? data.rpm : '---';
+                if (data.pid !== undefined && data.value !== undefined) {
+                    livePidValues[data.pid] = data.value;
+                } else if (data.rpm !== undefined && data.rpm !== null) {
+                    livePidValues[0x0C] = data.rpm;
+                }
+                renderPidValues();
             };
             rpmEventSource.onerror = function() {
                 sseConnected = false;
@@ -3095,6 +3582,7 @@
             setupRpmEventSource();
             loadDebugInfo();
             otaLoadInfo();
+            loadSupportedPids();
         })();
         
         // Load raw config when that section is opened

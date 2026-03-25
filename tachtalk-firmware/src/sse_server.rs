@@ -23,8 +23,8 @@ const MAX_SSE_CLIENTS: usize = 3;
 
 /// Message types for SSE server
 pub enum SseMessage {
-    /// RPM update to broadcast
-    RpmUpdate(u32),
+    /// PID value update to broadcast (includes PID for context)
+    PidValueUpdate { pid: u8, value: u32 },
 }
 
 /// Sender for SSE messages
@@ -104,38 +104,24 @@ fn run_sse_server(rx: &Receiver<SseMessage>, state: &Arc<State>) -> std::io::Res
 
         // Send metrics periodically
         if last_metrics.elapsed() >= METRICS_INTERVAL && !clients.is_empty() {
-            let metrics = &state.polling_metrics;
-            // Hot path: capture buffer capped at 6 MB by config validation, fits u32
-            #[allow(clippy::cast_possible_truncation)]
-            let capture_bytes = state.capture_buffer.lock().unwrap().len() as u32;
-            let capture_active = state.capture_active.load(Ordering::Relaxed);
-            let msg = format!(
-                "event: metrics\ndata: {{\"fast_pids\":{},\"slow_pids\":{},\"reqs_per_sec\":{},\"capture_bytes\":{},\"capture_records\":{},\"capture_overflow\":{},\"capture_active\":{}}}\n\n",
-                metrics.fast_pid_count.load(Ordering::Relaxed),
-                metrics.slow_pid_count.load(Ordering::Relaxed),
-                metrics.dongle_requests_per_sec.load(Ordering::Relaxed),
-                capture_bytes,
-                metrics.records_captured.load(Ordering::Relaxed),
-                metrics.capture_overflow.load(Ordering::Relaxed),
-                capture_active,
-            );
-            let before = clients.len();
-            clients.retain(|client| send_to_client(client, msg.as_bytes()).is_ok());
-            let removed = before - clients.len();
-            if removed > 0 {
-                debug!(
-                    "SSE: Removed {removed} dead clients during metrics broadcast, {} remaining",
-                    clients.len()
-                );
-            }
+            broadcast_metrics(&mut clients, state);
             last_metrics = Instant::now();
         }
 
         // Process incoming messages
         match rx.try_recv() {
-            Ok(SseMessage::RpmUpdate(rpm)) => {
-                current_rpm = Some(rpm);
-                let msg = format!("data: {{\"rpm\":{rpm}}}\n\n");
+            Ok(SseMessage::PidValueUpdate { pid, value }) => {
+                // Update local RPM cache for new client initial state
+                // (RPM PID 0x0C is the most common value clients need)
+                if pid == 0x0C {
+                    current_rpm = Some(value);
+                }
+                // Send as JSON with pid and value fields; include "rpm" for backward compat
+                let msg = if pid == 0x0C {
+                    format!("data: {{\"rpm\":{value},\"pid\":{pid},\"value\":{value}}}\n\n")
+                } else {
+                    format!("data: {{\"pid\":{pid},\"value\":{value}}}\n\n")
+                };
 
                 let before = clients.len();
                 clients.retain(|client| send_to_client(client, msg.as_bytes()).is_ok());
@@ -159,6 +145,34 @@ fn run_sse_server(rx: &Receiver<SseMessage>, state: &Arc<State>) -> std::io::Res
     }
 
     Ok(())
+}
+
+/// Broadcast polling metrics to all SSE clients, removing dead ones.
+fn broadcast_metrics(clients: &mut SmallVec<TcpStream, MAX_SSE_CLIENTS>, state: &State) {
+    let metrics = &state.polling_metrics;
+    // Hot path: capture buffer capped at 6 MB by config validation, fits u32
+    #[allow(clippy::cast_possible_truncation)]
+    let capture_bytes = state.capture_buffer.lock().unwrap().len() as u32;
+    let capture_active = state.capture_active.load(Ordering::Relaxed);
+    let msg = format!(
+        "event: metrics\ndata: {{\"fast_pids\":{},\"slow_pids\":{},\"reqs_per_sec\":{},\"capture_bytes\":{},\"capture_records\":{},\"capture_overflow\":{},\"capture_active\":{}}}\n\n",
+        metrics.fast_pid_count.load(Ordering::Relaxed),
+        metrics.slow_pid_count.load(Ordering::Relaxed),
+        metrics.dongle_requests_per_sec.load(Ordering::Relaxed),
+        capture_bytes,
+        metrics.records_captured.load(Ordering::Relaxed),
+        metrics.capture_overflow.load(Ordering::Relaxed),
+        capture_active,
+    );
+    let before = clients.len();
+    clients.retain(|client| send_to_client(client, msg.as_bytes()).is_ok());
+    let removed = before - clients.len();
+    if removed > 0 {
+        debug!(
+            "SSE: Removed {removed} dead clients during metrics broadcast, {} remaining",
+            clients.len()
+        );
+    }
 }
 
 /// Handle a new connection - read HTTP request and send SSE headers

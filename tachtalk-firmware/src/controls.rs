@@ -29,7 +29,7 @@
 //! The button should connect the GPIO pin to GND when pressed.
 
 use core::num::NonZero;
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -43,7 +43,7 @@ use esp_idf_hal::task::notification::Notification;
 use esp_idf_sys::{pcnt_evt_type_t_PCNT_EVT_H_LIM, pcnt_evt_type_t_PCNT_EVT_L_LIM};
 use log::{debug, info, warn};
 
-use crate::rpm_leds::RpmTaskMessage;
+use crate::led_display::LedTaskMessage;
 use crate::watchdog::WatchdogHandle;
 use crate::State;
 
@@ -66,6 +66,16 @@ const BUTTON_DEBOUNCE: Duration = Duration::from_millis(200);
 /// Accumulated encoder delta, updated from the PCNT ISR.
 /// Positive = clockwise (brighter), negative = counter-clockwise (dimmer).
 static ENCODER_DELTA: AtomicI32 = AtomicI32::new(0);
+
+/// Set by main button ISR when pressed.
+static MAIN_BUTTON_PRESSED: AtomicBool = AtomicBool::new(false);
+
+/// Bitmask of triggered-profile buttons that were pressed since last check.
+/// Bit N corresponds to the Nth triggered-button slot (not the profile index).
+static TRIGGERED_PRESSED: AtomicU32 = AtomicU32::new(0);
+
+/// Maximum number of triggered-profile buttons (limited by `AtomicU32` bits).
+const MAX_TRIGGERED_BUTTONS: usize = 32;
 
 /// Initialize the PCNT driver for a rotary encoder (4x quadrature).
 ///
@@ -196,15 +206,23 @@ fn init_button(button_pin: u8) -> Option<(PinDriver<'static, AnyIOPin, Input>, N
     Some((button, Notification::new()))
 }
 
-/// Run the controls task (rotary encoder + optional button).
+/// A triggered-profile button: tracks which profile it controls.
+struct TriggeredButton {
+    profile_index: usize,
+    bit: u32,
+    driver: PinDriver<'static, AnyIOPin, Input>,
+}
+
+/// Run the controls task (optional rotary encoder + buttons).
 ///
 /// This task:
-/// - Wakes on encoder ISR or button ISR notifications
+/// - Wakes on encoder ISR, button ISR, or triggered button ISR notifications
 /// - Reads accumulated encoder delta from [`ENCODER_DELTA`]
 /// - Sends brightness updates to the LED task
+/// - Toggles triggered profiles via dedicated GPIO buttons
 /// - Debounces NVS writes (waits for controls to settle before saving)
-#[allow(clippy::needless_pass_by_value)] // driver is intentionally moved into this task
-pub fn controls_task(state: &Arc<State>, driver: PcntDriver<'static>) {
+#[allow(clippy::needless_pass_by_value)] // drivers are intentionally moved into this task
+pub fn controls_task(state: &Arc<State>, encoder: Option<PcntDriver<'static>>) {
     let watchdog = WatchdogHandle::register(c"controls");
     info!("Controls task started");
 
@@ -212,9 +230,11 @@ pub fn controls_task(state: &Arc<State>, driver: PcntDriver<'static>) {
     // FreeRTOS task handle and must be waited on from the same task.
     let notification = Notification::new();
 
-    // Now register the encoder ISR (needs the notification for waking us)
-    if let Err(e) = enable_encoder_isr(&driver, &notification) {
-        warn!("Failed to register encoder ISR: {e:?}");
+    // Register encoder ISR if encoder is present
+    if let Some(ref driver) = encoder {
+        if let Err(e) = enable_encoder_isr(driver, &notification) {
+            warn!("Failed to register encoder ISR: {e:?}");
+        }
     }
 
     // Load initial brightness and acceleration config
@@ -256,6 +276,12 @@ pub fn controls_task(state: &Arc<State>, driver: PcntDriver<'static>) {
         .checked_sub(BUTTON_DEBOUNCE)
         .unwrap_or_else(Instant::now);
 
+    // Initialize triggered-profile buttons
+    let mut triggered_buttons = init_triggered_buttons(state, &notification);
+    let mut last_triggered_press = Instant::now()
+        .checked_sub(BUTTON_DEBOUNCE)
+        .unwrap_or_else(Instant::now);
+
     let idle_ticks = TickType::from(IDLE_TIMEOUT).ticks();
 
     loop {
@@ -266,7 +292,8 @@ pub fn controls_task(state: &Arc<State>, driver: PcntDriver<'static>) {
             let waker = notification.notifier();
             let subscribe_ok = unsafe {
                 button.subscribe_nonstatic(move || {
-                    waker.notify(NonZero::new(2).unwrap());
+                    MAIN_BUTTON_PRESSED.store(true, Ordering::Relaxed);
+                    waker.notify(NonZero::new(1).unwrap());
                 })
             }
             .is_ok();
@@ -276,15 +303,31 @@ pub fn controls_task(state: &Arc<State>, driver: PcntDriver<'static>) {
             }
         }
 
-        // Block until notified by encoder ISR, button ISR, or timeout
-        let notified = notification.wait(idle_ticks);
+        // Re-enable triggered button interrupts (GPIO interrupts auto-disable after firing)
+        for tb in &mut triggered_buttons {
+            let _ = tb.driver.enable_interrupt();
+        }
 
-        // Handle button press (notification value 2)
-        if notified == Some(NonZero::new(2).unwrap())
+        // Block until notified by encoder ISR, button ISR, or timeout
+        notification.wait(idle_ticks);
+
+        // Handle main button press (profile cycling)
+        if MAIN_BUTTON_PRESSED.swap(false, Ordering::Relaxed)
             && last_button_press.elapsed() >= BUTTON_DEBOUNCE
         {
             last_button_press = Instant::now();
             handle_button_press(state, &mut last_change, &mut pending_profile_save);
+        }
+
+        // Handle triggered-profile button presses
+        let pressed = TRIGGERED_PRESSED.swap(0, Ordering::Relaxed);
+        if pressed != 0 && last_triggered_press.elapsed() >= BUTTON_DEBOUNCE {
+            last_triggered_press = Instant::now();
+            for tb in &triggered_buttons {
+                if pressed & (1 << tb.bit) != 0 {
+                    handle_triggered_button(state, tb.profile_index);
+                }
+            }
         }
 
         // Drain accumulated encoder delta and apply brightness
@@ -300,43 +343,64 @@ pub fn controls_task(state: &Arc<State>, driver: PcntDriver<'static>) {
 
             info!("Encoder: brightness -> {brightness_u8}");
 
-            let _ = state.rpm_tx.send(RpmTaskMessage::Brightness(brightness_u8));
+            let _ = state.led_tx.send(LedTaskMessage::Brightness(brightness_u8));
             last_change = Some(Instant::now());
             pending_brightness_save = true;
         }
 
         // Check if we should save to NVS (debounced)
-        if pending_brightness_save || pending_profile_save {
-            if let Some(changed_at) = last_change {
-                if changed_at.elapsed() >= NVS_SAVE_DELAY {
-                    let mut cfg_guard = state.config.lock().unwrap();
-
-                    if pending_brightness_save {
-                        // Safe cast: current_brightness is in 0..=255 range
-                        #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
-                        let brightness_u8 = current_brightness as u8;
-                        debug!("Controls: saving brightness {brightness_u8} to NVS");
-                        cfg_guard.brightness = brightness_u8;
-                    }
-
-                    if pending_profile_save {
-                        debug!(
-                            "Controls: saving active_profile {} to NVS",
-                            cfg_guard.active_profile
-                        );
-                    }
-
-                    if let Err(e) = cfg_guard.save() {
-                        warn!("Failed to save config to NVS: {e}");
-                    }
-
-                    pending_brightness_save = false;
-                    pending_profile_save = false;
-                    last_change = None;
-                }
-            }
-        }
+        maybe_save_nvs(
+            state,
+            current_brightness,
+            &mut pending_brightness_save,
+            &mut pending_profile_save,
+            &mut last_change,
+        );
     }
+}
+
+/// Debounced NVS save: waits for controls to settle before persisting.
+fn maybe_save_nvs(
+    state: &Arc<State>,
+    current_brightness: i16,
+    pending_brightness_save: &mut bool,
+    pending_profile_save: &mut bool,
+    last_change: &mut Option<Instant>,
+) {
+    if !*pending_brightness_save && !*pending_profile_save {
+        return;
+    }
+    let Some(changed_at) = *last_change else {
+        return;
+    };
+    if changed_at.elapsed() < NVS_SAVE_DELAY {
+        return;
+    }
+
+    let mut cfg_guard = state.config.lock().unwrap();
+
+    if *pending_brightness_save {
+        // Safe cast: current_brightness is in 0..=255 range
+        #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+        let brightness_u8 = current_brightness as u8;
+        debug!("Controls: saving brightness {brightness_u8} to NVS");
+        cfg_guard.brightness = brightness_u8;
+    }
+
+    if *pending_profile_save {
+        debug!(
+            "Controls: saving active_profile {} to NVS",
+            cfg_guard.active_profile
+        );
+    }
+
+    if let Err(e) = cfg_guard.save() {
+        warn!("Failed to save config to NVS: {e}");
+    }
+
+    *pending_brightness_save = false;
+    *pending_profile_save = false;
+    *last_change = None;
 }
 
 /// Process accumulated encoder delta with acceleration.
@@ -392,42 +456,169 @@ fn process_encoder_delta(
     }
 }
 
-/// Handle a button press by cycling to the next profile.
+/// Handle a button press by cycling to the next Normal profile.
 fn handle_button_press(
     state: &Arc<State>,
     last_change: &mut Option<Instant>,
     pending_profile_save: &mut bool,
 ) {
     let mut cfg_guard = state.config.lock().unwrap();
-    let num_profiles = cfg_guard.profiles.len();
 
-    if num_profiles == 0 {
+    if cfg_guard.profiles.is_empty() {
         warn!("No profiles configured, button press ignored");
         return;
     }
 
-    // Cycle to next profile (wrapping)
     let old_profile = cfg_guard.active_profile;
-    cfg_guard.active_profile = (old_profile + 1) % num_profiles;
+    let new_profile = cfg_guard.cycle_to_next_normal_profile();
+
+    if new_profile == old_profile {
+        debug!("No other Normal profiles to cycle to");
+        return;
+    }
 
     let new_profile_name = cfg_guard
         .profiles
-        .get(cfg_guard.active_profile)
+        .get(new_profile)
         .map_or("Unknown", |p| &p.name);
 
-    info!(
-        "Button: switching profile {} -> {} ('{}')",
-        old_profile, cfg_guard.active_profile, new_profile_name
-    );
+    info!("Button: switching profile {old_profile} -> {new_profile} ('{new_profile_name}')");
 
     // Re-bake LED rules for the new profile, then trigger LED preview
     let brightness = cfg_guard.brightness;
     drop(cfg_guard); // Release lock before sending
 
-    let _ = state.rpm_tx.send(RpmTaskMessage::ConfigChanged);
-    let _ = state.rpm_tx.send(RpmTaskMessage::Brightness(brightness));
+    state.notify_profile_change();
+    let _ = state.led_tx.send(LedTaskMessage::Brightness(brightness));
 
     // Mark for NVS save
     *last_change = Some(Instant::now());
     *pending_profile_save = true;
+}
+
+/// Initialize GPIO buttons for all Triggered profiles that have `button_pin > 0`.
+///
+/// Each button's ISR sets a bit in [`TRIGGERED_PRESSED`] and wakes the task via
+/// the shared `notification`.
+fn init_triggered_buttons(state: &Arc<State>, notification: &Notification) -> Vec<TriggeredButton> {
+    let cfg = state.config.lock().unwrap();
+    let mut buttons = Vec::new();
+
+    for (idx, profile) in cfg.profiles.iter().enumerate() {
+        if profile.profile_type != tachtalk_shift_lights_lib::ProfileType::Triggered {
+            continue;
+        }
+        if profile.button_pin == 0 {
+            continue;
+        }
+        if buttons.len() >= MAX_TRIGGERED_BUTTONS {
+            warn!(
+                "Too many triggered buttons (max {MAX_TRIGGERED_BUTTONS}), skipping '{}'",
+                profile.name
+            );
+            break;
+        }
+
+        // Safe: MAX_TRIGGERED_BUTTONS is 32, which fits in u32
+        #[allow(clippy::cast_possible_truncation)]
+        let bit = buttons.len() as u32;
+        let pin_num = profile.button_pin;
+
+        info!(
+            "Initializing triggered button for '{}' on GPIO {pin_num} (bit {bit})",
+            profile.name
+        );
+
+        let pin = unsafe { AnyIOPin::new(i32::from(pin_num)) };
+        let mut driver = match PinDriver::input(pin) {
+            Ok(d) => d,
+            Err(e) => {
+                warn!("Failed to init triggered button GPIO {pin_num}: {e:?}");
+                continue;
+            }
+        };
+        if driver.set_pull(Pull::Up).is_err()
+            || driver.set_interrupt_type(InterruptType::NegEdge).is_err()
+        {
+            warn!("Failed to configure triggered button GPIO {pin_num}");
+            continue;
+        }
+
+        // Register ISR that sets the bit and wakes the task
+        let waker = notification.notifier();
+        let subscribe_ok = unsafe {
+            driver.subscribe(move || {
+                TRIGGERED_PRESSED.fetch_or(1 << bit, Ordering::Relaxed);
+                waker.notify(NonZero::new(1).unwrap());
+            })
+        }
+        .is_ok();
+
+        if subscribe_ok {
+            let _ = driver.enable_interrupt();
+        } else {
+            warn!("Failed to subscribe triggered button GPIO {pin_num}");
+            continue;
+        }
+
+        buttons.push(TriggeredButton {
+            profile_index: idx,
+            bit,
+            driver,
+        });
+    }
+
+    if !buttons.is_empty() {
+        info!("Initialized {} triggered button(s)", buttons.len());
+    }
+    buttons
+}
+
+/// Toggle a triggered profile's enabled state and notify the LED + OBD2 tasks.
+fn handle_triggered_button(state: &Arc<State>, profile_index: usize) {
+    let preview = {
+        let mut enabled = state.triggered_enabled.lock().unwrap();
+        // Grow if needed (config may have changed)
+        if enabled.len() <= profile_index {
+            enabled.resize(profile_index + 1, false);
+        }
+        enabled[profile_index] = !enabled[profile_index];
+        let now_enabled = enabled[profile_index];
+
+        let cfg = state.config.lock().unwrap();
+        let name = cfg.profiles.get(profile_index).map_or("?", |p| &p.name);
+        info!(
+            "Triggered profile '{}' [{}] {}",
+            name,
+            profile_index,
+            if now_enabled { "ENABLED" } else { "DISABLED" }
+        );
+
+        // When enabling, capture triggered profile's preview info
+        // When disabling, capture brightness to trigger normal profile preview
+        if now_enabled {
+            cfg.profiles
+                .get(profile_index)
+                .map(|p| (Some((p.pid, p.preview_value)), cfg.brightness))
+        } else {
+            Some((None, cfg.brightness))
+        }
+    };
+
+    // Notify LED + OBD2 tasks to re-bake (includes/excludes this triggered profile)
+    state.notify_profile_change();
+
+    // Show a brief LED preview so the driver sees visual confirmation
+    if let Some((triggered_preview, brightness)) = preview {
+        // When enabling: inject the triggered profile's PID value for overlay preview
+        if let Some((pid, preview_value)) = triggered_preview {
+            let _ = state.led_tx.send(LedTaskMessage::PidValue {
+                pid,
+                value: preview_value,
+            });
+        }
+        // Brightness triggers the preview timer, which shows either the triggered
+        // profile's injected value or the normal profile's preview_value
+        let _ = state.led_tx.send(LedTaskMessage::Brightness(brightness));
+    }
 }

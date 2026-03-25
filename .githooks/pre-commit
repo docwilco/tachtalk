@@ -82,6 +82,13 @@ if ! (cd "$staged_dir/tachtalk-test-firmware" && cargo clippy --all-targets --al
     fail "clippy (tachtalk-test-firmware)"
 fi
 
+# ---------- tests: host crates ----------
+step "cargo test (host crates)"
+if ! (cd "$staged_dir" && cargo test --all-features \
+        --workspace --exclude tachtalk-firmware --exclude tachtalk-test-firmware); then
+    fail "cargo test (host crates)"
+fi
+
 # ---------- summary ----------
 if [ "$failed" -ne 0 ]; then
     printf "\n${RED}${BOLD}Pre-commit checks failed.${RESET}\n" >&2

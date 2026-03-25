@@ -18,8 +18,8 @@ use esp_idf_svc::sys::{
 };
 use std::mem::MaybeUninit;
 
-use crate::config::Config;
-use crate::rpm_leds::RpmTaskMessage;
+use crate::config::{Config, ProfileType};
+use crate::led_display::LedTaskMessage;
 use crate::sse_server::SSE_PORT;
 use crate::State;
 use smallvec::SmallVec;
@@ -139,6 +139,21 @@ fn check_restart_needed(current: &Config, new: &Config) -> (SmallVec<u8, 4>, boo
         || current.ap_ip != new.ap_ip
         || current.ap_prefix_len != new.ap_prefix_len;
 
+    // Check if any triggered profile button_pins changed (GPIO allocation)
+    let current_pins: SmallVec<u8, 4> = current
+        .profiles
+        .iter()
+        .filter(|p| p.profile_type == ProfileType::Triggered && p.button_pin != 0)
+        .map(|p| p.button_pin)
+        .collect();
+    let new_pins: SmallVec<u8, 4> = new
+        .profiles
+        .iter()
+        .filter(|p| p.profile_type == ProfileType::Triggered && p.button_pin != 0)
+        .map(|p| p.button_pin)
+        .collect();
+    let triggered_pins_changed = current_pins != new_pins;
+
     // Collect old GPIO pins that need reset (to disconnect from RMT/PCNT peripherals)
     let mut gpios_to_reset = SmallVec::new();
     if led_changed {
@@ -162,6 +177,11 @@ fn check_restart_needed(current: &Config, new: &Config) -> (SmallVec<u8, 4>, boo
     if status_green_changed && current.status_led_green_pin != 0 {
         gpios_to_reset.push(current.status_led_green_pin);
     }
+    if triggered_pins_changed {
+        for &pin in &current_pins {
+            gpios_to_reset.push(pin);
+        }
+    }
 
     let needs_restart = led_changed
         || encoder_a_changed
@@ -170,6 +190,7 @@ fn check_restart_needed(current: &Config, new: &Config) -> (SmallVec<u8, 4>, boo
         || status_red_changed
         || status_yellow_changed
         || status_green_changed
+        || triggered_pins_changed
         || wifi_changed
         || ip_changed
         || ap_changed;
@@ -727,10 +748,14 @@ fn register_post_config(server: &mut EspHttpServer<'static>, state: &Arc<State>)
                     if let Err(e) = cfg.save() {
                         warn!("Failed to save config: {e}");
                     }
+                    // Resize triggered_enabled to match number of profiles
+                    let num_profiles = cfg.profiles.len();
+                    let mut te = state_clone.triggered_enabled.lock().unwrap();
+                    te.resize(num_profiles, false);
                 }
 
-                // Notify RPM task of config change (to recalculate render interval)
-                let _ = state_clone.rpm_tx.send(RpmTaskMessage::ConfigChanged);
+                // Notify LED + OBD2 tasks of config change
+                state_clone.notify_profile_change();
 
                 if needs_restart {
                     info!("Config changed (requires restart), restarting in 2 seconds...");
@@ -787,8 +812,8 @@ fn register_post_brightness(server: &mut EspHttpServer<'static>, state: &Arc<Sta
 
                 // Send brightness to LED task immediately
                 let _ = state_clone
-                    .rpm_tx
-                    .send(RpmTaskMessage::Brightness(brightness_req.brightness));
+                    .led_tx
+                    .send(LedTaskMessage::Brightness(brightness_req.brightness));
 
                 // Optionally save to config
                 if brightness_req.save {
@@ -908,6 +933,7 @@ fn register_network_routes(server: &mut EspHttpServer<'static>, state: &Arc<Stat
 }
 
 /// Register status and metrics routes (connection status, TCP info, RPM, polling metrics)
+#[allow(clippy::too_many_lines)]
 fn register_status_routes(server: &mut EspHttpServer<'static>, state: &Arc<State>) -> Result<()> {
     // GET connection status endpoint for diagram
     let state_clone = state.clone();
@@ -1001,7 +1027,80 @@ fn register_status_routes(server: &mut EspHttpServer<'static>, state: &Arc<State
         Ok(())
     })?;
 
+    // GET supported PIDs (decoded from dongle capability queries)
+    let state_clone = state.clone();
+    server.fn_handler(
+        "/api/supported-pids",
+        Method::Get,
+        move |req| -> HandlerResult {
+            debug!("HTTP: GET /api/supported-pids");
+            let cache = state_clone.supported_pids.lock().unwrap();
+            if !cache.ready {
+                // Dongle not connected or queries haven't completed yet
+                let mut response = req.into_ok_response()?;
+                write_json(
+                    &mut response,
+                    &serde_json::json!({"ready": false, "pids": []}),
+                )?;
+                return Ok(());
+            }
+            let pids = decode_supported_pids(&cache);
+            drop(cache);
+            let mut response = req.into_ok_response()?;
+            write_json(
+                &mut response,
+                &serde_json::json!({"ready": true, "pids": pids}),
+            )?;
+            Ok(())
+        },
+    )?;
+
     Ok(())
+}
+
+/// Decode the supported PIDs bitmask cache into a list of PID numbers.
+///
+/// Each of the 8 supported-PID query responses (0100, 0120, ..., 01E0) contains
+/// a 4-byte bitmask. Bit 7 of byte 0 = first PID in that range, etc.
+fn decode_supported_pids(cache: &crate::obd2::SupportedPidsCache) -> Vec<u8> {
+    let mut pids = Vec::new();
+    for (slot, entry) in cache.entries.iter().enumerate() {
+        let Some(raw) = entry else { continue };
+        // Parse ASCII hex response: e.g. "\r\n4100BE3DA813\r\n>"
+        let hex_str: String = raw
+            .iter()
+            .filter(|b| b.is_ascii_hexdigit())
+            .map(|&b| b as char)
+            .collect();
+        let bytes: Vec<u8> = hex_str
+            .as_bytes()
+            .chunks(2)
+            .filter_map(|chunk| {
+                if chunk.len() == 2 {
+                    u8::from_str_radix(std::str::from_utf8(chunk).ok()?, 16).ok()
+                } else {
+                    None
+                }
+            })
+            .collect();
+        // Expect [0x41, PID_base, B0, B1, B2, B3]
+        if bytes.len() < 6 || bytes[0] != 0x41 {
+            continue;
+        }
+        // Base PID for this slot: 0x01, 0x21, 0x41, ...
+        #[allow(clippy::cast_possible_truncation)]
+        let base = (slot as u8) * 0x20 + 1;
+        for (byte_idx, &byte) in bytes[2..6].iter().enumerate() {
+            for bit in 0..8u8 {
+                if byte & (0x80 >> bit) != 0 {
+                    #[allow(clippy::cast_possible_truncation)]
+                    let pid = base + (byte_idx as u8) * 8 + bit;
+                    pids.push(pid);
+                }
+            }
+        }
+    }
+    pids
 }
 
 /// Register debug and system routes (sockets, debug info, reboot)

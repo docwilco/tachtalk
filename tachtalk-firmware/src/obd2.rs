@@ -23,8 +23,8 @@ use tachtalk_capture_format::{
 };
 use tachtalk_elm327_lib::ClientState;
 
-use crate::config::{PidDataLengths, SlowPollMode, MODE01_PID_DATA_LENGTHS};
-use crate::rpm_leds::RpmTaskMessage;
+use crate::config::{PidDataLengths, PidPriority, SlowPollMode, MODE01_PID_DATA_LENGTHS};
+use crate::led_display::LedTaskMessage;
 use crate::status_leds::StatusLedMessage;
 use crate::watchdog::WatchdogHandle;
 use crate::State;
@@ -56,8 +56,6 @@ impl Default for AtomicDongleTcpState {
 const RECONNECT_DELAY: Duration = Duration::from_secs(1);
 /// Maintenance interval for checking promotion/demotion/removal
 const MAINTENANCE_INTERVAL: Duration = Duration::from_millis(2000);
-/// RPM PID (always polled).
-const RPM_PID: u8 = 0x0C;
 
 /// Type alias for small OBD2 wire-format buffers (ASCII hex commands/responses).
 /// 20 bytes on 32-bit; 16 inline bytes covers multi-PID commands without heap.
@@ -592,13 +590,6 @@ impl ClientCache {
 /// Unique identifier for a client (monotonic counter; `u32` is sufficient for embedded use).
 type ClientId = u32;
 
-/// Priority level for PID polling
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PidPriority {
-    Fast,
-    Slow,
-}
-
 /// Tracking info for a PID
 struct PidInfo {
     /// Last time any client had to wait for this PID
@@ -609,6 +600,8 @@ struct PidInfo {
     priority: PidPriority,
     /// Request count since last maintenance (for rate logging)
     request_count: u32,
+    /// Pinned by an active profile — never demoted or removed
+    pinned: bool,
 }
 
 // ============================================================================
@@ -633,6 +626,8 @@ pub enum CacheManagerMessage {
     RegisterClient(oneshot::Sender<(ClientId, Arc<Mutex<ClientCache>>)>),
     /// Unregister a client
     UnregisterClient(ClientId),
+    /// Profile PIDs have changed — re-register immediately
+    ProfilePidsChanged,
 }
 
 /// Sender for cache manager messages
@@ -1060,9 +1055,9 @@ struct PollingState {
 
 impl Default for PollingState {
     fn default() -> Self {
-        // Always start with RPM in fast queue
+        // Start empty — profile PIDs are registered by cache_manager on startup
         Self {
-            fast_pids: IndexSet::from([RPM_PID]),
+            fast_pids: IndexSet::new(),
             slow_pids: IndexSet::new(),
             fast_index: 0,
             slow_index: 0,
@@ -1255,12 +1250,6 @@ impl PollingState {
                 .dongle_requests_total
                 .fetch_add(1, Ordering::Relaxed);
             let _ = state.status_led_tx.send(StatusLedMessage::DongleActivity);
-        } else {
-            // RPM is always in fast queue, so we should always poll something
-            debug_assert!(
-                false,
-                "Expected to poll at least RPM, but fast_pids is empty"
-            );
         }
 
         // Poll slow PID based on mode (interval or ratio)
@@ -1567,8 +1556,8 @@ fn run_maintenance(
     let mut pids_to_demote = Vec::new();
 
     for (pid, info) in &mut *pid_info {
-        // Skip RPM - always fast, never removed
-        if *pid == RPM_PID {
+        // Skip pinned PIDs — required by active profiles
+        if info.pinned {
             continue;
         }
 
@@ -1702,6 +1691,119 @@ fn update_client_caches(
     }
 }
 
+/// Auto-disable triggered profiles when a PID value exceeds `auto_disable_above`.
+fn check_triggered_auto_disable(pid: Pid, raw_value: u32, state: &Arc<State>) {
+    let mut notify = false;
+    {
+        let cfg = state.config.lock().unwrap();
+        let mut triggered_enabled = state.triggered_enabled.lock().unwrap();
+
+        for (idx, profile) in cfg.triggered_profiles() {
+            if profile.pid != pid {
+                continue;
+            }
+            let Some(threshold) = profile.auto_disable_above else {
+                continue;
+            };
+            if !triggered_enabled.get(idx).copied().unwrap_or(false) {
+                continue;
+            }
+            if raw_value > threshold {
+                triggered_enabled[idx] = false;
+                info!(
+                    "Auto-disabled triggered profile '{}' [{}]: raw value {raw_value} > threshold {threshold}",
+                    profile.name, idx
+                );
+                notify = true;
+            }
+        }
+    }
+    if notify {
+        state.notify_profile_change();
+    }
+}
+
+/// Register (or reconcile) PIDs needed by active profiles.
+///
+/// Reads the current config, computes which PIDs are required by the active
+/// normal profile and all overlay profiles, and updates `pid_info` accordingly:
+/// - New profile PIDs are added as pinned with their configured priority.
+/// - Existing profile PIDs are pinned (in case they were previously unpinned).
+/// - PIDs that are no longer needed by any profile are unpinned (subject to
+///   normal demotion/removal in maintenance).
+fn register_profile_pids(pid_info: &mut HashMap<Pid, PidInfo>, state: &Arc<State>) {
+    // Collect PIDs needed by active profiles with their highest priority
+    let mut needed: HashMap<Pid, PidPriority> = HashMap::new();
+    {
+        let cfg = state.config.lock().unwrap();
+        let triggered_enabled = state.triggered_enabled.lock().unwrap();
+
+        // Active normal profile
+        if let Some(profile) = cfg.active_normal_profile() {
+            needed
+                .entry(profile.pid)
+                .and_modify(|p| {
+                    if profile.pid_priority == PidPriority::Fast {
+                        *p = PidPriority::Fast;
+                    }
+                })
+                .or_insert(profile.pid_priority);
+        }
+
+        // All overlay profiles (always active) + enabled triggered profiles
+        for (_, profile) in cfg
+            .overlay_profiles()
+            .chain(cfg.enabled_triggered_profiles(&triggered_enabled))
+        {
+            needed
+                .entry(profile.pid)
+                .and_modify(|p| {
+                    if profile.pid_priority == PidPriority::Fast {
+                        *p = PidPriority::Fast;
+                    }
+                })
+                .or_insert(profile.pid_priority);
+        }
+    }
+
+    // Unpin PIDs no longer needed by any profile
+    for (pid, info) in &mut *pid_info {
+        if info.pinned && !needed.contains_key(pid) {
+            info.pinned = false;
+            info!("PID {pid:02X}: unpinned (no longer needed by profiles)");
+        }
+    }
+
+    // Pin (and add/upgrade) PIDs needed by profiles
+    for (pid, priority) in &needed {
+        let info = pid_info.entry(*pid).or_insert_with(|| {
+            info!("PID {pid:02X}: added as pinned ({priority:?})");
+            state
+                .dongle_control_tx
+                .send(DongleMessage::SetPidPriority(*pid, *priority))
+                .expect("dongle task dead");
+            PidInfo {
+                last_waiter_time: None,
+                last_consumed_time: Some(Instant::now()),
+                priority: *priority,
+                request_count: 0,
+                pinned: true,
+            }
+        });
+        info.pinned = true;
+
+        // Upgrade priority if profile needs Fast but PID is currently Slow
+        if *priority == PidPriority::Fast && info.priority == PidPriority::Slow {
+            info.priority = PidPriority::Fast;
+            info!("PID {pid:02X}: upgraded to fast (profile requirement)");
+            state
+                .dongle_control_tx
+                .send(DongleMessage::SetPidPriority(*pid, PidPriority::Fast))
+                .expect("dongle task dead");
+        }
+    }
+}
+
 /// Handle a PID entering the Waiting state: create or promote PID info as appropriate.
 fn handle_waiting_pid(pid: Pid, pid_info: &mut HashMap<Pid, PidInfo>, state: &Arc<State>) {
     let slow_poll_mode = {
@@ -1715,6 +1817,7 @@ fn handle_waiting_pid(pid: Pid, pid_info: &mut HashMap<Pid, PidInfo>, state: &Ar
         last_consumed_time: None,
         priority: PidPriority::Fast,
         request_count: 0,
+        pinned: false,
     });
     info.last_waiter_time = Some(Instant::now());
 
@@ -1806,16 +1909,8 @@ pub fn cache_manager_task(state: &Arc<State>, manager_rx: &Receiver<CacheManager
         total_wait_time: Duration::ZERO,
     };
 
-    // Initialize RPM PID info
-    pid_info.insert(
-        RPM_PID,
-        PidInfo {
-            last_waiter_time: None,
-            last_consumed_time: Some(Instant::now()),
-            priority: PidPriority::Fast,
-            request_count: 0,
-        },
-    );
+    // Register PIDs needed by active profiles
+    register_profile_pids(&mut pid_info, state);
 
     info!("Cache manager task started");
 
@@ -1829,18 +1924,25 @@ pub fn cache_manager_task(state: &Arc<State>, manager_rx: &Receiver<CacheManager
                 for (pid, data) in &responses {
                     update_client_caches(&clients, *pid, data);
 
-                    // Extract RPM from the first ECU response
-                    if *pid == RPM_PID {
-                        if let Some(first) = data.first() {
-                            // RPM data is 2 bytes: RPM = ((A * 256) + B) / 4
-                            if first.len() >= 2 {
-                                let rpm = (u32::from(first[0]) * 256 + u32::from(first[1])) / 4;
-                                debug!("Cache manager extracted RPM: {rpm}");
-                                let _ = state.rpm_tx.send(RpmTaskMessage::Rpm(rpm));
-                                *state.shared_rpm.lock().unwrap() = Some(rpm);
-                            }
-                        }
+                    // Convert raw response bytes to u32 and send to LED task
+                    let raw = data.first().map_or(0, |pid_data| {
+                        pid_data
+                            .iter()
+                            .take(4)
+                            .fold(0u32, |acc, &b| (acc << 8) | u32::from(b))
+                    });
+                    debug!("Cache manager raw PID 0x{pid:02X}: {raw}");
+                    let _ = state.led_tx.send(LedTaskMessage::PidValue {
+                        pid: *pid,
+                        value: raw,
+                    });
+                    // Keep shared_rpm updated for backward compatibility (decoded RPM)
+                    if *pid == 0x0C {
+                        *state.shared_rpm.lock().unwrap() = Some(raw / 4);
                     }
+
+                    // Auto-disable triggered profiles whose threshold is exceeded
+                    check_triggered_auto_disable(*pid, raw, state);
                 }
             }
             Ok(CacheManagerMessage::Waiting(pid)) => {
@@ -1861,6 +1963,9 @@ pub fn cache_manager_task(state: &Arc<State>, manager_rx: &Receiver<CacheManager
                 clients.remove(&id);
                 debug!("Unregistered client {id}");
             }
+            Ok(CacheManagerMessage::ProfilePidsChanged) => {
+                register_profile_pids(&mut pid_info, state);
+            }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 // Normal timeout, continue to maintenance
             }
@@ -1870,8 +1975,9 @@ pub fn cache_manager_task(state: &Arc<State>, manager_rx: &Receiver<CacheManager
             }
         }
 
-        // Periodic maintenance: check promotion/demotion/removal
+        // Periodic maintenance: check promotion/demotion/removal and reconcile profile PIDs
         if last_maintenance.elapsed() >= MAINTENANCE_INTERVAL {
+            register_profile_pids(&mut pid_info, state);
             run_maintenance(
                 &mut pid_info,
                 state,
