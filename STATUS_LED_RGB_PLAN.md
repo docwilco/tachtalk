@@ -43,7 +43,6 @@ the LED stays identifiable during heavy traffic).
 | 1+ clients connected, idle | green solid |
 | Client request activity | green pulse |
 | More than one client | shift hue toward cyan/blue (e.g. 1 = green, 2 = cyan, 3+ = blue) |
-| Client auth rejected | one red flash |
 
 ### Global overrides
 
