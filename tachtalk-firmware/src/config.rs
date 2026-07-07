@@ -97,6 +97,26 @@ const NVS_ADMIN_PW_KEY: &str = "admin_pw";
 // Global NVS handle - initialized once in main
 static NVS: Mutex<Option<EspNvs<NvsDefault>>> = Mutex::new(None);
 
+/// Run a closure that writes to NVS on a short-lived thread with an
+/// internal-RAM stack.  SPI flash writes disable the cache, so they cannot
+/// run on a thread whose stack is in PSRAM (same SPI bus).
+fn nvs_write_on_internal_stack<F>(f: F) -> Result<()>
+where
+    F: FnOnce() -> Result<()> + Send + 'static,
+{
+    let (tx, rx) = oneshot::channel();
+    crate::thread_util::spawn_named(
+        c"nvs_wr",
+        4096,
+        crate::thread_util::StackMemory::Internal,
+        move || {
+            let result = f();
+            let _ = tx.send(result);
+        },
+    );
+    rx.recv().map_err(|_| Error::NvsWriteThreadPanicked)?
+}
+
 pub fn init_nvs(nvs_partition: EspNvsPartition<NvsDefault>) -> Result<()> {
     debug!("Initializing NVS namespace: {NVS_NAMESPACE}");
     let nvs = EspNvs::new(nvs_partition, NVS_NAMESPACE, true)?;
@@ -118,15 +138,18 @@ pub fn load_admin_password_hash() -> Option<String> {
 
 /// Save (or clear) the admin password hash in its own NVS key.
 pub fn save_admin_password_hash(hash: Option<&str>) -> Result<()> {
-    let mut nvs_guard = NVS.lock().unwrap();
-    let nvs = nvs_guard.as_mut().ok_or(Error::NvsNotInitialized)?;
-    match hash {
-        Some(h) => nvs.set_str(NVS_ADMIN_PW_KEY, h)?,
-        None => {
-            nvs.remove(NVS_ADMIN_PW_KEY)?;
+    let hash = hash.map(String::from);
+    nvs_write_on_internal_stack(move || {
+        let mut nvs_guard = NVS.lock().unwrap();
+        let nvs = nvs_guard.as_mut().ok_or(Error::NvsNotInitialized)?;
+        match hash.as_deref() {
+            Some(h) => nvs.set_str(NVS_ADMIN_PW_KEY, h)?,
+            None => {
+                nvs.remove(NVS_ADMIN_PW_KEY)?;
+            }
         }
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -469,6 +492,7 @@ pub struct Config {
     /// Index of the currently active profile
     #[serde(default)]
     pub active_profile: usize,
+    #[serde(default = "default_total_leds")]
     pub total_leds: usize,
     #[serde(default = "default_led_gpio")]
     pub led_gpio: u8,
@@ -484,13 +508,13 @@ pub struct Config {
     #[serde(default)]
     pub dump_socket_info: bool,
     /// Rotary encoder pin A (CLK) - set to 0 to disable encoder
-    #[serde(default)]
+    #[serde(default = "default_encoder_pin_a")]
     pub encoder_pin_a: u8,
     /// Rotary encoder pin B (DT) - set to 0 to disable encoder
-    #[serde(default)]
+    #[serde(default = "default_encoder_pin_b")]
     pub encoder_pin_b: u8,
     /// Profile switch button pin - set to 0 to disable button
-    #[serde(default)]
+    #[serde(default = "default_button_pin")]
     pub button_pin: u8,
     /// Encoder 2x acceleration threshold in ms. If consecutive encoder
     /// events arrive within this window the brightness step is doubled.
@@ -502,15 +526,15 @@ pub struct Config {
     /// quadrupled instead. Set to 0 to disable 4x acceleration.
     #[serde(default = "default_encoder_accel_4x_ms")]
     pub encoder_accel_4x_ms: u16,
-    /// Status LED red (WiFi) GPIO pin - set to 0 to disable
-    #[serde(default = "default_status_led_red_pin")]
-    pub status_led_red_pin: u8,
-    /// Status LED yellow (dongle) GPIO pin - set to 0 to disable
-    #[serde(default = "default_status_led_yellow_pin")]
-    pub status_led_yellow_pin: u8,
-    /// Status LED green (clients) GPIO pin - set to 0 to disable
-    #[serde(default = "default_status_led_green_pin")]
-    pub status_led_green_pin: u8,
+    /// Status LED chain (3x WS2812B: WIFI, OBD, CLIENT) data GPIO - set to 0 to disable
+    #[serde(default = "default_status_led_gpio")]
+    pub status_led_gpio: u8,
+    /// Status LED brightness (0-255)
+    #[serde(default = "default_status_led_brightness")]
+    pub status_led_brightness: u8,
+    /// Generic red boot LED GPIO - blinks during boot animation, 0 to disable
+    #[serde(default = "default_boot_led_gpio")]
+    pub boot_led_gpio: u8,
     /// Status LED activity timeout in ms (LED returns to solid-on after this long without activity)
     #[serde(default = "default_status_led_flicker_ms")]
     pub status_led_flicker_ms: u16,
@@ -523,19 +547,35 @@ pub struct Config {
 }
 
 const fn default_led_gpio() -> u8 {
-    48
+    3
 }
 
-const fn default_status_led_red_pin() -> u8 {
-    9
+const fn default_total_leds() -> usize {
+    12
 }
 
-const fn default_status_led_yellow_pin() -> u8 {
-    10
+const fn default_encoder_pin_a() -> u8 {
+    43
 }
 
-const fn default_status_led_green_pin() -> u8 {
-    11
+const fn default_encoder_pin_b() -> u8 {
+    2
+}
+
+const fn default_button_pin() -> u8 {
+    44
+}
+
+const fn default_status_led_gpio() -> u8 {
+    7
+}
+
+const fn default_status_led_brightness() -> u8 {
+    64
+}
+
+const fn default_boot_led_gpio() -> u8 {
+    46
 }
 
 const fn default_status_led_flicker_ms() -> u16 {
@@ -779,20 +819,20 @@ impl Default for Config {
             log_level: LogLevel::default(),
             profiles: default_profiles(),
             active_profile: 0,
-            total_leds: 1,
+            total_leds: default_total_leds(),
             led_gpio: default_led_gpio(),
             obd2_timeout_ms: default_obd2_timeout_ms(),
             brightness: default_brightness(),
-            dump_cpu_metrics: false,
+            dump_cpu_metrics: true,
             dump_socket_info: false,
-            encoder_pin_a: 0, // Disabled by default
-            encoder_pin_b: 0,
-            button_pin: 0, // Disabled by default
+            encoder_pin_a: default_encoder_pin_a(),
+            encoder_pin_b: default_encoder_pin_b(),
+            button_pin: default_button_pin(),
             encoder_accel_2x_ms: default_encoder_accel_2x_ms(),
             encoder_accel_4x_ms: default_encoder_accel_4x_ms(),
-            status_led_red_pin: default_status_led_red_pin(),
-            status_led_yellow_pin: default_status_led_yellow_pin(),
-            status_led_green_pin: default_status_led_green_pin(),
+            status_led_gpio: default_status_led_gpio(),
+            status_led_brightness: default_status_led_brightness(),
+            boot_led_gpio: default_boot_led_gpio(),
             status_led_flicker_ms: default_status_led_flicker_ms(),
             rpm_stale_timeout_ms: default_rpm_stale_timeout_ms(),
             preview_duration_ms: default_preview_duration_ms(),
@@ -937,14 +977,19 @@ impl Config {
     }
 
     pub fn save(&self) -> Result<()> {
-        debug!("Saving config to NVS");
-        let mut nvs_guard = NVS.lock().unwrap();
-        let nvs = nvs_guard.as_mut().ok_or(Error::NvsNotInitialized)?;
-
+        debug!("Saving config to NVS (led_gpio={})", self.led_gpio);
+        // NVS writes go to SPI flash, which disables the cache.  If the
+        // current thread's stack lives in PSRAM (same SPI bus), ESP-IDF
+        // aborts.  Bounce the write to a short-lived thread with an
+        // internal-RAM stack.
         let json = serde_json::to_vec(self)?;
-        debug!("Config JSON size: {} bytes", json.len());
-        nvs.set_blob(NVS_CONFIG_KEY, &json)?;
-        info!("Config saved to NVS");
-        Ok(())
+        nvs_write_on_internal_stack(move || {
+            let mut nvs_guard = NVS.lock().unwrap();
+            let nvs = nvs_guard.as_mut().ok_or(Error::NvsNotInitialized)?;
+            debug!("Config JSON size: {} bytes", json.len());
+            nvs.set_blob(NVS_CONFIG_KEY, &json)?;
+            info!("Config saved to NVS");
+            Ok(())
+        })
     }
 }

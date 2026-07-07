@@ -122,9 +122,9 @@ where
 
 /// Check if a config change would require a device restart
 fn check_restart_needed(current: &Config, new: &Config) -> bool {
-    let status_led_changed = current.status_led_red_pin != new.status_led_red_pin
-        || current.status_led_yellow_pin != new.status_led_yellow_pin
-        || current.status_led_green_pin != new.status_led_green_pin;
+    let status_led_changed = current.status_led_gpio != new.status_led_gpio
+        || current.status_led_brightness != new.status_led_brightness
+        || current.boot_led_gpio != new.boot_led_gpio;
     let wifi_changed =
         current.wifi.ssid != new.wifi.ssid || current.wifi.password != new.wifi.password;
     let ip_changed = current.ip.use_dhcp != new.ip.use_dhcp

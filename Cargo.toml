@@ -24,9 +24,15 @@ derive_more = { version = "2", features = ["display", "error", "from"] }
 embedded-svc = "0.28.1"
 enumset = { version = "1", default-features = false }
 esp-idf-hal = "0.45.2"
-esp-idf-svc = "0.51.0"
+esp-idf-svc = { version = "0.51.0" }
 esp-idf-sys = "0.36.1"
 cookie = { version = "0.18", default-features = false }
+embassy-executor = { version = "0.7", features = ["arch-std", "executor-thread", "task-arena-size-32768"] }
+edge-http = { version = "0.7", features = ["log"] }
+edge-nal = "0.6"
+edge-nal-std = { version = "0.6", features = ["async-io-mini"] }
+embedded-io-async = "0.7"
+futures-lite = "2"
 hex = "0.4"
 indexmap = "2"
 log = { version = "0.4.29", default-features = false }

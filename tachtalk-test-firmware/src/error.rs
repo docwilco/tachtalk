@@ -15,6 +15,9 @@ pub enum Error {
     /// JSON serialization/deserialization error
     Json(serde_json::Error),
 
+    /// WS2812 LED driver error
+    Ws2812(ws2812_esp32_rmt_driver::Ws2812Esp32RmtDriverError),
+
     /// NVS storage not yet initialized
     #[display("NVS not initialized")]
     NvsNotInitialized,

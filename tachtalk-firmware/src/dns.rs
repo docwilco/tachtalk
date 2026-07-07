@@ -19,7 +19,7 @@ pub fn start_dns_server(ap_ip: Ipv4Addr) {
     AP_IP.get_or_init(|| ap_ip);
     crate::thread_util::spawn_named(
         c"dns_srv",
-        6144,
+        crate::thread_util::stack_size(c"dns_srv", 6144),
         crate::thread_util::StackMemory::SpiRam,
         || {
             if let Err(e) = run_dns_server() {

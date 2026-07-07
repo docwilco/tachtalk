@@ -670,19 +670,19 @@
                 </select>
             </div>
             <div class="form-group">
-                <label>Status LED Red Pin:</label>
-                <input type="number" id="statusLedRedPin" value="9" min="0" max="48">
-                <small style="color: #888;">WiFi status, 0 = disabled (requires restart)</small>
+                <label>Status LED GPIO Pin:</label>
+                <input type="number" id="statusLedGpio" value="7" min="0" max="48">
+                <small style="color: #888;">3x WS2812B chain (WIFI/OBD/CLIENT), 0 = disabled (requires restart)</small>
             </div>
             <div class="form-group">
-                <label>Status LED Yellow Pin:</label>
-                <input type="number" id="statusLedYellowPin" value="10" min="0" max="48">
-                <small style="color: #888;">Dongle status, 0 = disabled (requires restart)</small>
+                <label>Status LED Brightness:</label>
+                <input type="number" id="statusLedBrightness" value="64" min="0" max="255">
+                <small style="color: #888;">Brightness of the status LED chain (0-255)</small>
             </div>
             <div class="form-group">
-                <label>Status LED Green Pin:</label>
-                <input type="number" id="statusLedGreenPin" value="11" min="0" max="48">
-                <small style="color: #888;">Test status, 0 = disabled (requires restart)</small>
+                <label>Boot LED GPIO Pin:</label>
+                <input type="number" id="bootLedGpio" value="46" min="0" max="48">
+                <small style="color: #888;">Red LED blinked during boot, 0 = disabled (requires restart)</small>
             </div>
             <div class="form-group">
                 <label>Status LED Flicker (ms):</label>
@@ -787,9 +787,9 @@
             document.getElementById('apSsid').value = config.ap_ssid || 'TachTalk-Test';
             document.getElementById('apPassword').value = config.ap_password || '';
             document.getElementById('logLevel').value = config.log_level || 'info';
-            document.getElementById('statusLedRedPin').value = config.status_led_red_pin ?? 9;
-            document.getElementById('statusLedYellowPin').value = config.status_led_yellow_pin ?? 10;
-            document.getElementById('statusLedGreenPin').value = config.status_led_green_pin ?? 11;
+            document.getElementById('statusLedGpio').value = config.status_led_gpio ?? 7;
+            document.getElementById('statusLedBrightness').value = config.status_led_brightness ?? 64;
+            document.getElementById('bootLedGpio').value = config.boot_led_gpio ?? 46;
             document.getElementById('statusLedFlickerMs').value = config.status_led_flicker_ms ?? 50;
             
             updateModeUI();
@@ -844,9 +844,9 @@
                 ap_ssid: document.getElementById('apSsid').value,
                 ap_password: document.getElementById('apPassword').value || null,
                 log_level: document.getElementById('logLevel').value,
-                status_led_red_pin: parseInt(document.getElementById('statusLedRedPin').value) || 0,
-                status_led_yellow_pin: parseInt(document.getElementById('statusLedYellowPin').value) || 0,
-                status_led_green_pin: parseInt(document.getElementById('statusLedGreenPin').value) || 0,
+                status_led_gpio: parseInt(document.getElementById('statusLedGpio').value) || 0,
+                status_led_brightness: parseInt(document.getElementById('statusLedBrightness').value) || 0,
+                boot_led_gpio: parseInt(document.getElementById('bootLedGpio').value) || 0,
                 status_led_flicker_ms: parseInt(document.getElementById('statusLedFlickerMs').value) || 50
             };
 

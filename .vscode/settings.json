@@ -14,5 +14,26 @@
         "ESP_IDF_SDKCONFIG_DEFAULTS": "/home/drwilco/tachtalk/tachtalk-firmware/sdkconfig.defaults",
         "ESP_IDF_GLOB_0_BASE": "/home/drwilco/tachtalk/tachtalk-firmware",
         "ESP_IDF_GLOB_0_0": "partitions.csv"
+    },
+    "chat.tools.terminal.autoApprove": {
+        "cargo build": true,
+        "tee": true,
+        "cargo clippy": true,
+        "/^cd /home/drwilco/tachtalk/tachtalk-firmware && python3 \\./set_stack\\.py --port /dev/ttyACM1 \\$\\(cat stack_sizes\\.txt\\) 2>&1$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "/^cd /home/drwilco/tachtalk/tachtalk-firmware && python3 \\./tune_stacks\\.py --skip-override --skip-flash --port /dev/ttyACM1 --timeout 60 2>&1$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "/^cd /home/drwilco/tachtalk/tachtalk-firmware && python3 \\./set_stack\\.py --port /dev/ttyACM1 \\$\\(cat stack_sizes\\.txt\\)$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "/^cd /home/drwilco/tachtalk/tachtalk-firmware && python3 \\./tune_stacks\\.py --skip-override --port /dev/ttyACM1 --timeout 90$/": {
+            "approve": true,
+            "matchCommandLine": true
+        }
     }
 }

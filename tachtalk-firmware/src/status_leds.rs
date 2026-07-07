@@ -1,24 +1,54 @@
 //! Status LED controller and background task
 //!
-//! Drives three GPIO-connected status LEDs (red, yellow, green) to indicate:
-//! - **Red**: WiFi STA connection state (off/blink/solid)
-//! - **Yellow**: OBD2 dongle TCP state (off/solid during init/flicker when active)
-//! - **Green**: Client connection state (off/solid/flicker on activity)
+//! Drives a chain of three WS2812B status LEDs on a single data GPIO
+//! (ordered outward from the MCU): **WIFI**, **OBD**, **CLIENT**.
+//! - **WIFI**: WiFi STA connection state (off/blink/solid)
+//! - **OBD**: OBD2 dongle TCP state (off/solid during init/flicker when active)
+//! - **CLIENT**: Client connection state (off/solid/flicker on activity)
 //!
 //! The task is fully event-driven via an `mpsc` channel — producers send
 //! [`StatusLedMessage`] variants on state transitions and per-request activity.
 //! An OTA override displays a sequential chase pattern across all three LEDs.
+//!
+//! A plain red boot LED (separate GPIO) blinks along with the boot animation.
 
+use crate::error::Result;
 use crate::obd2::DongleTcpState;
 use crate::ota::OtaState;
 use crate::wifi::WifiStaState;
-use crate::State;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use esp_idf_hal::gpio::{AnyOutputPin, Output, PinDriver};
+use esp_idf_hal::peripheral::Peripheral;
+use esp_idf_hal::rmt::config::TransmitConfig;
+use esp_idf_hal::rmt::{RmtChannel, TxRmtDriver};
 use log::{info, warn};
+use smart_leds::{brightness, gamma, SmartLedsWrite, RGB8};
+use ws2812_esp32_rmt_driver::Ws2812Esp32Rmt;
+
+// ---------------------------------------------------------------------------
+// LED chain layout and colors
+// ---------------------------------------------------------------------------
+
+/// Number of WS2812B status LEDs in the chain
+pub const STATUS_LED_COUNT: usize = 3;
+
+/// Chain index of the WIFI status LED (closest to the MCU)
+const WIFI_LED: usize = 0;
+/// Chain index of the OBD status LED
+const OBD_LED: usize = 1;
+/// Chain index of the CLIENT status LED (furthest from the MCU)
+const CLIENT_LED: usize = 2;
+
+/// Color shown on the WIFI LED when lit
+const WIFI_COLOR: RGB8 = RGB8::new(255, 0, 0);
+/// Color shown on the OBD LED when lit
+const OBD_COLOR: RGB8 = RGB8::new(255, 200, 0);
+/// Color shown on the CLIENT LED when lit
+const CLIENT_COLOR: RGB8 = RGB8::new(0, 255, 0);
+
+const OFF: RGB8 = RGB8::new(0, 0, 0);
 
 // ---------------------------------------------------------------------------
 // StatusLedMessage — channel messages from producers
@@ -33,9 +63,9 @@ pub enum StatusLedMessage {
     DongleState(DongleTcpState),
     /// OBD2 client count changed (downstream clients in proxy mode)
     ClientCount(u32),
-    /// A request was sent to the dongle (triggers yellow flicker)
+    /// A request was sent to the dongle (triggers OBD LED flicker)
     DongleActivity,
-    /// A request was received from / sent on behalf of a client (triggers green flicker)
+    /// A request was received from / sent on behalf of a client (triggers CLIENT LED flicker)
     ClientActivity,
     /// OTA status changed
     OtaStatus(OtaState),
@@ -45,103 +75,166 @@ pub enum StatusLedMessage {
 pub type StatusLedSender = Sender<StatusLedMessage>;
 
 // ---------------------------------------------------------------------------
-// StatusLedController — GPIO output driver
+// StatusLedController — WS2812B chain driver
 // ---------------------------------------------------------------------------
 
-/// Drives up to three GPIO pins as status indicator LEDs (active-high).
+/// Drives the three-LED WS2812B status chain plus the plain red boot LED.
 pub struct StatusLedController {
-    red: Option<PinDriver<'static, AnyOutputPin, Output>>,
-    yellow: Option<PinDriver<'static, AnyOutputPin, Output>>,
-    green: Option<PinDriver<'static, AnyOutputPin, Output>>,
+    driver: Option<Ws2812Esp32Rmt<'static>>,
+    boot_led: Option<PinDriver<'static, AnyOutputPin, Output>>,
+    /// Desired LED colors (pre-brightness)
+    leds: [RGB8; STATUS_LED_COUNT],
+    /// Last chain state actually written, to skip redundant RMT transmissions
+    written: Option<[RGB8; STATUS_LED_COUNT]>,
+    brightness: u8,
     /// Activity flicker duration (how long activity indicators stay lit)
     flicker_duration: Duration,
 }
 
 impl StatusLedController {
-    /// Create a new controller from the configured GPIO pin numbers.
+    /// Create a new controller.
     ///
-    /// A pin value of 0 means "disabled" — that LED will not be driven.
-    /// `flicker_ms` sets how long activity indicators stay lit.
-    #[must_use]
-    pub fn new(red_pin: u8, yellow_pin: u8, green_pin: u8, flicker_ms: u16) -> Self {
+    /// `status_gpio` is the WS2812B chain data pin (0 = disabled). `boot_led_gpio`
+    /// is the plain red LED blinked during boot (0 = disabled). `flicker_ms` sets
+    /// how long activity indicators stay lit.
+    pub fn new<C: RmtChannel>(
+        status_gpio: u8,
+        boot_led_gpio: u8,
+        led_brightness: u8,
+        flicker_ms: u16,
+        rmt_channel: impl Peripheral<P = C> + 'static,
+    ) -> Self {
+        let driver = if status_gpio == 0 {
+            info!("Status LEDs disabled (pin not configured)");
+            None
+        } else {
+            match Self::init_driver(status_gpio, rmt_channel) {
+                Ok(d) => {
+                    info!("Status LEDs (3x WS2812B) initialized on GPIO {status_gpio}");
+                    Some(d)
+                }
+                Err(e) => {
+                    warn!("Failed to initialize status LEDs on GPIO {status_gpio}: {e:?}");
+                    None
+                }
+            }
+        };
+
         Self {
-            red: Self::init_pin(red_pin, "red"),
-            yellow: Self::init_pin(yellow_pin, "yellow"),
-            green: Self::init_pin(green_pin, "green"),
+            driver,
+            boot_led: Self::init_boot_led(boot_led_gpio),
+            leds: [OFF; STATUS_LED_COUNT],
+            written: None,
+            brightness: led_brightness,
             flicker_duration: Duration::from_millis(u64::from(flicker_ms)),
         }
     }
 
-    fn init_pin(pin: u8, name: &str) -> Option<PinDriver<'static, AnyOutputPin, Output>> {
+    fn init_driver<C: RmtChannel>(
+        pin: u8,
+        rmt_channel: impl Peripheral<P = C> + 'static,
+    ) -> Result<Ws2812Esp32Rmt<'static>> {
+        // Reset first to clear any residual peripheral configuration.
+        // SAFETY: We trust the configured GPIO pin number is valid for this board.
+        unsafe {
+            esp_idf_svc::sys::gpio_reset_pin(i32::from(pin));
+        }
+        let led_pin = unsafe { esp_idf_hal::gpio::AnyIOPin::new(i32::from(pin)) };
+        // Extra memory blocks buffer against WiFi interrupting the RMT
+        // (see led_display.rs); 3 LEDs × 24 items fit easily in 2 blocks.
+        let config = TransmitConfig::new().clock_divider(1).mem_block_num(2);
+        let tx_driver = TxRmtDriver::new(rmt_channel, led_pin, &config)?;
+        Ok(Ws2812Esp32Rmt::new_with_rmt_driver(tx_driver)?)
+    }
+
+    fn init_boot_led(pin: u8) -> Option<PinDriver<'static, AnyOutputPin, Output>> {
         if pin == 0 {
             return None;
         }
-        // SAFETY: We trust the user-configured GPIO pin number is valid for this board.
-        // The pin is reset first to clear any residual peripheral configuration.
+        // SAFETY: We trust the configured GPIO pin number is valid for this board.
         unsafe {
             esp_idf_svc::sys::gpio_reset_pin(i32::from(pin));
         }
         let output_pin = unsafe { AnyOutputPin::new(i32::from(pin)) };
         match PinDriver::output(output_pin) {
             Ok(driver) => {
-                info!("Status LED '{name}' initialized on GPIO {pin}");
+                info!("Boot LED initialized on GPIO {pin}");
                 Some(driver)
             }
             Err(e) => {
-                warn!("Failed to initialize status LED '{name}' on GPIO {pin}: {e}");
+                warn!("Failed to initialize boot LED on GPIO {pin}: {e}");
                 None
             }
         }
     }
 
-    /// Set the red LED on or off.
-    fn set_red(&mut self, on: bool) {
-        if let Some(ref mut pin) = self.red {
-            let _ = if on { pin.set_high() } else { pin.set_low() };
-        }
+    /// Set the WIFI LED on or off.
+    fn set_wifi(&mut self, on: bool) {
+        self.leds[WIFI_LED] = if on { WIFI_COLOR } else { OFF };
     }
 
-    /// Set the yellow LED on or off.
-    fn set_yellow(&mut self, on: bool) {
-        if let Some(ref mut pin) = self.yellow {
-            let _ = if on { pin.set_high() } else { pin.set_low() };
-        }
+    /// Set the OBD LED on or off.
+    fn set_obd(&mut self, on: bool) {
+        self.leds[OBD_LED] = if on { OBD_COLOR } else { OFF };
     }
 
-    /// Set the green LED on or off.
-    fn set_green(&mut self, on: bool) {
-        if let Some(ref mut pin) = self.green {
-            let _ = if on { pin.set_high() } else { pin.set_low() };
-        }
+    /// Set the CLIENT LED on or off.
+    fn set_client(&mut self, on: bool) {
+        self.leds[CLIENT_LED] = if on { CLIENT_COLOR } else { OFF };
     }
 
     /// All LEDs off.
     fn all_off(&mut self) {
-        self.set_red(false);
-        self.set_yellow(false);
-        self.set_green(false);
+        self.leds = [OFF; STATUS_LED_COUNT];
+        self.flush();
     }
 
-    /// Boot animation: blink each status LED in sequence, one per cycle.
-    ///
-    /// Designed to be called in sync with the RGB LED boot animation (3 purple
-    /// blinks at 250 ms on / 250 ms off). Each status LED lights during one of
-    /// the three on-phases:
-    /// - Cycle 1: red
-    /// - Cycle 2: yellow
-    /// - Cycle 3: green
-    pub fn boot_animation(&mut self, blink_duration: Duration) {
-        for i in 0..3 {
-            // On phase — light the LED for this cycle
-            match i {
-                0 => self.set_red(true),
-                1 => self.set_yellow(true),
-                _ => self.set_green(true),
+    /// Write the LED buffer to the chain if it changed since the last write.
+    fn flush(&mut self) {
+        if self.written == Some(self.leds) {
+            return;
+        }
+        if let Some(ref mut driver) = self.driver {
+            let iter = brightness(gamma(self.leds.iter().copied()), self.brightness);
+            if let Err(e) = driver.write(iter) {
+                warn!("Status LED write failed: {e:?}");
+                return;
             }
+            self.written = Some(self.leds);
+        }
+    }
+
+    /// Set the plain red boot LED on or off.
+    fn set_boot_led(&mut self, on: bool) {
+        if let Some(ref mut pin) = self.boot_led {
+            let _ = if on { pin.set_high() } else { pin.set_low() };
+        }
+    }
+
+    /// Boot animation: blink each status LED in sequence, one per cycle,
+    /// with the plain red boot LED blinking along.
+    ///
+    /// Designed to be called in sync with the main RGB LED boot animation
+    /// (3 purple blinks at 250 ms on / 250 ms off). Each status LED lights
+    /// during one of the three on-phases:
+    /// - Cycle 1: WIFI
+    /// - Cycle 2: OBD
+    /// - Cycle 3: CLIENT
+    pub fn boot_animation(&mut self, blink_duration: Duration) {
+        for i in 0..STATUS_LED_COUNT {
+            // On phase — light the LED for this cycle plus the boot LED
+            match i {
+                WIFI_LED => self.set_wifi(true),
+                OBD_LED => self.set_obd(true),
+                _ => self.set_client(true),
+            }
+            self.flush();
+            self.set_boot_led(true);
             std::thread::sleep(blink_duration);
 
             // Off phase
             self.all_off();
+            self.set_boot_led(false);
             std::thread::sleep(blink_duration);
         }
     }
@@ -164,7 +257,7 @@ const OTA_CHASE_MS: u64 = 200;
 /// Mutable shadow state used by the status LED event loop.
 ///
 /// Bundles all tracked state and timer bookkeeping so the public
-/// [`status_led_task`] stays short and duplication-free.
+/// [`run_status_led_task`] stays short and duplication-free.
 struct LedTaskState {
     wifi: WifiStaState,
     dongle: DongleTcpState,
@@ -174,10 +267,10 @@ struct LedTaskState {
     wifi_blink_on: bool,
     wifi_blink_deadline: Instant,
 
-    yellow_flicker_on: bool,
-    yellow_activity_deadline: Option<Instant>,
-    green_flicker_on: bool,
-    green_activity_deadline: Option<Instant>,
+    obd_flicker_on: bool,
+    obd_activity_deadline: Option<Instant>,
+    client_flicker_on: bool,
+    client_activity_deadline: Option<Instant>,
 
     ota_chase_index: u8,
     ota_chase_deadline: Instant,
@@ -195,10 +288,10 @@ impl LedTaskState {
             ota: OtaState::Idle,
             wifi_blink_on: false,
             wifi_blink_deadline: now,
-            yellow_flicker_on: true,
-            yellow_activity_deadline: None,
-            green_flicker_on: true,
-            green_activity_deadline: None,
+            obd_flicker_on: true,
+            obd_activity_deadline: None,
+            client_flicker_on: true,
+            client_activity_deadline: None,
             ota_chase_index: 0,
             ota_chase_deadline: now,
             activity_timeout,
@@ -219,25 +312,25 @@ impl LedTaskState {
             StatusLedMessage::DongleState(s) => {
                 self.dongle = s;
                 if s == DongleTcpState::Disconnected {
-                    self.yellow_activity_deadline = None;
+                    self.obd_activity_deadline = None;
                 }
             }
             StatusLedMessage::ClientCount(n) => {
                 self.client_count = n;
                 if n == 0 {
-                    self.green_activity_deadline = None;
+                    self.client_activity_deadline = None;
                 }
             }
             StatusLedMessage::DongleActivity => {
                 if self.dongle == DongleTcpState::Ready {
-                    self.yellow_flicker_on = !self.yellow_flicker_on;
-                    self.yellow_activity_deadline = Some(Instant::now() + self.activity_timeout);
+                    self.obd_flicker_on = !self.obd_flicker_on;
+                    self.obd_activity_deadline = Some(Instant::now() + self.activity_timeout);
                 }
             }
             StatusLedMessage::ClientActivity => {
                 if self.client_count > 0 {
-                    self.green_flicker_on = !self.green_flicker_on;
-                    self.green_activity_deadline = Some(Instant::now() + self.activity_timeout);
+                    self.client_flicker_on = !self.client_flicker_on;
+                    self.client_activity_deadline = Some(Instant::now() + self.activity_timeout);
                 }
             }
             StatusLedMessage::OtaStatus(s) => {
@@ -264,10 +357,10 @@ impl LedTaskState {
         if self.wifi == WifiStaState::Connecting {
             consider(self.wifi_blink_deadline);
         }
-        if let Some(t) = self.yellow_activity_deadline {
+        if let Some(t) = self.obd_activity_deadline {
             consider(t);
         }
-        if let Some(t) = self.green_activity_deadline {
+        if let Some(t) = self.client_activity_deadline {
             consider(t);
         }
         if self.ota == OtaState::Updating {
@@ -283,16 +376,16 @@ impl LedTaskState {
             self.wifi_blink_on = !self.wifi_blink_on;
             self.wifi_blink_deadline = now + Duration::from_millis(WIFI_BLINK_MS);
         }
-        if let Some(t) = self.yellow_activity_deadline {
+        if let Some(t) = self.obd_activity_deadline {
             if now >= t {
-                self.yellow_activity_deadline = None;
-                self.yellow_flicker_on = true;
+                self.obd_activity_deadline = None;
+                self.obd_flicker_on = true;
             }
         }
-        if let Some(t) = self.green_activity_deadline {
+        if let Some(t) = self.client_activity_deadline {
             if now >= t {
-                self.green_activity_deadline = None;
-                self.green_flicker_on = true;
+                self.client_activity_deadline = None;
+                self.client_flicker_on = true;
             }
         }
         if self.ota == OtaState::Updating && now >= self.ota_chase_deadline {
@@ -305,63 +398,50 @@ impl LedTaskState {
     fn drive_leds(&self, controller: &mut StatusLedController) {
         if self.ota == OtaState::Updating {
             // OTA override: sequential chase
-            controller.set_red(self.ota_chase_index == 0);
-            controller.set_yellow(self.ota_chase_index == 1);
-            controller.set_green(self.ota_chase_index == 2);
+            controller.set_wifi(self.ota_chase_index == 0);
+            controller.set_obd(self.ota_chase_index == 1);
+            controller.set_client(self.ota_chase_index == 2);
         } else {
-            // Red: WiFi STA state
-            let red_on = match self.wifi {
+            // WIFI: WiFi STA state
+            let wifi_on = match self.wifi {
                 WifiStaState::Disconnected => false,
                 WifiStaState::Connecting => self.wifi_blink_on,
                 WifiStaState::Connected => true,
             };
-            controller.set_red(red_on);
+            controller.set_wifi(wifi_on);
 
-            // Yellow: dongle TCP state
-            let yellow_on = match self.dongle {
+            // OBD: dongle TCP state
+            let obd_on = match self.dongle {
                 DongleTcpState::Disconnected => false,
                 DongleTcpState::Initializing => true,
                 DongleTcpState::Ready => {
-                    if self.yellow_activity_deadline.is_some() {
-                        self.yellow_flicker_on
+                    if self.obd_activity_deadline.is_some() {
+                        self.obd_flicker_on
                     } else {
                         true
                     }
                 }
             };
-            controller.set_yellow(yellow_on);
+            controller.set_obd(obd_on);
 
-            // Green: client state
-            let green_on = self.client_count > 0
-                && if self.green_activity_deadline.is_some() {
-                    self.green_flicker_on
+            // CLIENT: client state
+            let client_on = self.client_count > 0
+                && if self.client_activity_deadline.is_some() {
+                    self.client_flicker_on
                 } else {
                     true
                 };
-            controller.set_green(green_on);
+            controller.set_client(client_on);
         }
+        controller.flush();
     }
 }
 
 /// Entry point for the status LED background task.
 ///
-/// Reads configuration from state to create the LED controller, runs boot
-/// animation, then enters the event-driven control loop.
-///
-/// # Panics
-///
-/// Panics if the config mutex is poisoned.
-pub fn run_status_led_task(state: &Arc<State>, rx: &Receiver<StatusLedMessage>) {
-    let mut controller = {
-        let cfg = state.config.lock().unwrap();
-        StatusLedController::new(
-            cfg.status_led_red_pin,
-            cfg.status_led_yellow_pin,
-            cfg.status_led_green_pin,
-            cfg.status_led_flicker_ms,
-        )
-    };
-
+/// Runs the boot animation, then enters the event-driven control loop.
+/// The controller is created in `main` (it needs an RMT channel peripheral).
+pub fn run_status_led_task(mut controller: StatusLedController, rx: &Receiver<StatusLedMessage>) {
     controller.boot_animation(Duration::from_millis(250));
     controller.run_task(rx);
 }

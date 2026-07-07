@@ -417,30 +417,30 @@ pub struct Config {
     /// Dump socket info to serial console every 5 seconds
     #[serde(default)]
     pub dump_socket_info: bool,
-    /// Status LED red (WiFi) GPIO pin - set to 0 to disable
-    #[serde(default = "default_status_led_red_pin")]
-    pub status_led_red_pin: u8,
-    /// Status LED yellow (dongle) GPIO pin - set to 0 to disable
-    #[serde(default = "default_status_led_yellow_pin")]
-    pub status_led_yellow_pin: u8,
-    /// Status LED green (test running) GPIO pin - set to 0 to disable
-    #[serde(default = "default_status_led_green_pin")]
-    pub status_led_green_pin: u8,
+    /// Status LED chain (3x WS2812B: WIFI, OBD, CLIENT/test) data GPIO - set to 0 to disable
+    #[serde(default = "default_status_led_gpio")]
+    pub status_led_gpio: u8,
+    /// Status LED brightness (0-255)
+    #[serde(default = "default_status_led_brightness")]
+    pub status_led_brightness: u8,
+    /// Generic red boot LED GPIO - blinks during boot animation, 0 to disable
+    #[serde(default = "default_boot_led_gpio")]
+    pub boot_led_gpio: u8,
     /// Status LED activity timeout in ms (LED returns to solid-on after this long without activity)
     #[serde(default = "default_status_led_flicker_ms")]
     pub status_led_flicker_ms: u16,
 }
 
-const fn default_status_led_red_pin() -> u8 {
-    9
+const fn default_status_led_gpio() -> u8 {
+    7
 }
 
-const fn default_status_led_yellow_pin() -> u8 {
-    10
+const fn default_status_led_brightness() -> u8 {
+    64
 }
 
-const fn default_status_led_green_pin() -> u8 {
-    11
+const fn default_boot_led_gpio() -> u8 {
+    46
 }
 
 const fn default_status_led_flicker_ms() -> u16 {
@@ -468,9 +468,9 @@ impl Default for Config {
             log_level: LogLevel::default(),
             dump_cpu_metrics: false,
             dump_socket_info: false,
-            status_led_red_pin: default_status_led_red_pin(),
-            status_led_yellow_pin: default_status_led_yellow_pin(),
-            status_led_green_pin: default_status_led_green_pin(),
+            status_led_gpio: default_status_led_gpio(),
+            status_led_brightness: default_status_led_brightness(),
+            boot_led_gpio: default_boot_led_gpio(),
             status_led_flicker_ms: default_status_led_flicker_ms(),
         }
     }

@@ -206,9 +206,7 @@ fn spawn_background_tasks(
     sse_rx: std::sync::mpsc::Receiver<sse_server::SseMessage>,
     test_control_rx: std::sync::mpsc::Receiver<TestControlMessage>,
     status_led_rx: std::sync::mpsc::Receiver<StatusLedMessage>,
-    status_led_red_pin: u8,
-    status_led_yellow_pin: u8,
-    status_led_green_pin: u8,
+    status_led_controller: StatusLedController,
     status_led_flicker_ms: u16,
     ap_hostname: String,
     ap_ip: Ipv4Addr,
@@ -252,13 +250,9 @@ fn spawn_background_tasks(
 
     // Start status LED task
     {
-        let mut status_led_controller = StatusLedController::new(
-            status_led_red_pin,
-            status_led_yellow_pin,
-            status_led_green_pin,
-        );
+        let mut status_led_controller = status_led_controller;
         let flicker_duration = Duration::from_millis(u64::from(status_led_flicker_ms));
-        thread_util::spawn_named(c"status_led", 3072, Internal, move || {
+        thread_util::spawn_named(c"status_led", 4096, Internal, move || {
             status_led_controller.boot_animation(Duration::from_millis(250));
             status_leds::status_led_task(status_led_controller, &status_led_rx, flicker_duration);
         });
@@ -381,10 +375,14 @@ fn main() -> Result<()> {
     let (test_control_tx, test_control_rx) = std::sync::mpsc::channel();
     let (status_led_tx, status_led_rx) = std::sync::mpsc::channel();
 
-    // Read status LED config before moving config into State
-    let status_led_red_pin = config.status_led_red_pin;
-    let status_led_yellow_pin = config.status_led_yellow_pin;
-    let status_led_green_pin = config.status_led_green_pin;
+    // Create status LED controller before moving config into State
+    // (needs the RMT channel peripheral for the WS2812B chain)
+    let status_led_controller = StatusLedController::new(
+        config.status_led_gpio,
+        config.boot_led_gpio,
+        config.status_led_brightness,
+        peripherals.rmt.channel0,
+    );
     let status_led_flicker_ms = config.status_led_flicker_ms;
 
     // Create central State struct
@@ -402,9 +400,7 @@ fn main() -> Result<()> {
         sse_rx,
         test_control_rx,
         status_led_rx,
-        status_led_red_pin,
-        status_led_yellow_pin,
-        status_led_green_pin,
+        status_led_controller,
         status_led_flicker_ms,
         ap_hostname,
         ap_ip,

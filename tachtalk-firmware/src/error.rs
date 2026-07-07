@@ -51,6 +51,10 @@ pub enum Error {
     /// Failed to register with the cache manager
     #[display("failed to register with cache manager")]
     CacheManagerRegistrationFailed,
+
+    /// NVS write thread panicked or was lost
+    #[display("NVS write thread panicked")]
+    NvsWriteThreadPanicked,
 }
 
 /// Crate-wide result alias.

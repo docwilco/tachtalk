@@ -33,8 +33,9 @@ CONFIG_LOG_DEFAULT_LEVEL_INFO=y
 # Increase HTTP server header buffer for captive portal (mobile browsers send long headers)
 CONFIG_HTTPD_MAX_REQ_HDR_LEN=4096
 
-# Enable mDNS for tachtalk.local access
+# Enable mDNS for tachtalk.local access (AP interface only)
 CONFIG_MDNS_ENABLED=y
+CONFIG_MDNS_PREDEF_NETIF_STA=n
 
 # Increase max sockets for handling multiple concurrent connections
 # Default is 10, max is 16 per LWIP Kconfig

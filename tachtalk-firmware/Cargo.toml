@@ -17,9 +17,15 @@ derive_more.workspace = true
 embedded-svc.workspace = true
 enumset.workspace = true
 esp-idf-hal.workspace = true
-esp-idf-svc.workspace = true
+esp-idf-svc = { workspace = true, features = ["embassy-time-driver"] }
 esp-idf-sys.workspace = true
 cookie.workspace = true
+embassy-executor.workspace = true
+edge-http.workspace = true
+edge-nal.workspace = true
+edge-nal-std.workspace = true
+embedded-io-async.workspace = true
+futures-lite.workspace = true
 hex.workspace = true
 indexmap.workspace = true
 log.workspace = true

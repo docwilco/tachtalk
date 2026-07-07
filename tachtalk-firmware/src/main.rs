@@ -22,6 +22,7 @@ mod cpu_metrics;
 mod dns;
 mod error;
 mod heap_diag;
+
 mod led_display;
 mod obd2;
 mod ota;
@@ -131,6 +132,8 @@ pub struct State {
     /// Runtime enabled state for Triggered profiles, indexed parallel to `config.profiles`.
     /// Only entries for Triggered profiles are meaningful; all start `false`.
     pub triggered_enabled: Mutex<Vec<bool>>,
+    /// HTTP request counter (incremented by `web_server` on each request)
+    pub http_request_count: AtomicU32,
 }
 
 impl State {
@@ -178,6 +181,7 @@ impl State {
             capture_active: AtomicBool::new(capture_enabled),
             sessions: auth::SessionStore::default(),
             triggered_enabled: Mutex::new(vec![false; num_profiles]),
+            http_request_count: AtomicU32::new(0),
         }
     }
 }
@@ -202,6 +206,7 @@ fn setup_mdns() -> Option<EspMdns> {
 /// Initialize logging and load configuration from NVS
 fn init_logging_and_config(nvs: EspDefaultNvsPartition) -> Result<Config> {
     config::init_nvs(nvs)?;
+    thread_util::load_stack_overrides();
     let config = Config::load_or_default();
 
     // Apply configured log level
@@ -284,11 +289,13 @@ fn init_encoder<PCNT: esp_idf_hal::pcnt::Pcnt>(
 }
 
 /// Create shared state, channels, and spawn all background tasks.
+#[allow(clippy::too_many_lines)] // linear list of task spawns; splitting adds no clarity
 fn spawn_background_tasks(
     config: Config,
     wifi: EspWifi<'static>,
     ap_ssid: String,
     led_controller: LedController,
+    status_led_controller: status_leds::StatusLedController,
     encoder_driver: Option<esp_idf_hal::pcnt::PcntDriver<'static>>,
 ) -> Arc<State> {
     let ap_hostname = ap_ssid.to_lowercase();
@@ -320,25 +327,40 @@ fn spawn_background_tasks(
     // Start SSE server for PID value streaming (on port 81)
     {
         let state = state.clone();
-        thread_util::spawn_named(c"sse_srv", 6144, SpiRam, move || {
-            sse_server_task(&sse_rx, &state);
-        });
+        thread_util::spawn_named(
+            c"sse_srv",
+            thread_util::stack_size(c"sse_srv", 6144),
+            SpiRam,
+            move || {
+                sse_server_task(&sse_rx, &state);
+            },
+        );
     }
 
     // Start OBD2 dongle task
     {
         let state = state.clone();
-        thread_util::spawn_named(c"dongle", 8192, Internal, move || {
-            dongle_task(&state, &dongle_control_rx);
-        });
+        thread_util::spawn_named(
+            c"dongle",
+            thread_util::stack_size(c"dongle", 8192),
+            Internal,
+            move || {
+                dongle_task(&state, &dongle_control_rx);
+            },
+        );
     }
 
     // Start cache manager task
     {
         let state = state.clone();
-        thread_util::spawn_named(c"cache_mgr", 6144, Internal, move || {
-            cache_manager_task(&state, &cache_manager_rx);
-        });
+        thread_util::spawn_named(
+            c"cache_mgr",
+            thread_util::stack_size(c"cache_mgr", 6144),
+            Internal,
+            move || {
+                cache_manager_task(&state, &cache_manager_rx);
+            },
+        );
     }
 
     // Start the LED display task
@@ -348,7 +370,7 @@ fn spawn_background_tasks(
         thread_util::spawn_named_on_core(
             c"led_disp",
             esp_idf_hal::cpu::Core::Core1,
-            4096,
+            thread_util::stack_size(c"led_disp", 4096),
             Internal,
             move || {
                 led_display_task(&state, led_controller, led_rx);
@@ -359,42 +381,77 @@ fn spawn_background_tasks(
     // Start OBD2 proxy
     {
         let state = state.clone();
-        thread_util::spawn_named(c"obd2_proxy", 4096, Internal, move || {
-            let proxy = Obd2Proxy::new(state);
-            if let Err(e) = proxy.run() {
-                error!("OBD2 proxy error: {e:?}");
-            }
-        });
+        thread_util::spawn_named(
+            c"obd2_proxy",
+            thread_util::stack_size(c"obd2_proxy", 4096),
+            Internal,
+            move || {
+                let proxy = Obd2Proxy::new(state);
+                if let Err(e) = proxy.run() {
+                    error!("OBD2 proxy error: {e:?}");
+                }
+            },
+        );
     }
     info!("OBD2 proxy started");
 
     // Start WiFi connection manager
     {
         let state = state.clone();
-        thread_util::spawn_named(c"wifi_mgr", 4096, SpiRam, move || {
-            wifi_connection_manager(&state);
-        });
+        thread_util::spawn_named(
+            c"wifi_mgr",
+            thread_util::stack_size(c"wifi_mgr", 4096),
+            SpiRam,
+            move || {
+                wifi_connection_manager(&state);
+            },
+        );
     }
 
     // Start status LED task
-    {
-        let state = state.clone();
-        thread_util::spawn_named(c"status_led", 3072, Internal, move || {
-            status_leds::run_status_led_task(&state, &status_led_rx);
-        });
-    }
+    thread_util::spawn_named(
+        c"status_led",
+        thread_util::stack_size(c"status_led", 4096),
+        Internal,
+        move || {
+            status_leds::run_status_led_task(status_led_controller, &status_led_rx);
+        },
+    );
 
     // Start controls task (rotary encoder and/or buttons)
     {
         let state = state.clone();
-        thread_util::spawn_named(c"controls", 6144, Internal, move || {
-            controls::controls_task(&state, encoder_driver);
-        });
+        thread_util::spawn_named(
+            c"controls",
+            thread_util::stack_size(c"controls", 6144),
+            Internal,
+            move || {
+                controls::controls_task(&state, encoder_driver);
+            },
+        );
     }
 
-    // Start web server
-    if let Err(e) = web_server::start_server(&state, Some(ap_hostname), ap_ip) {
-        error!("Web server error: {e:?}");
+    // Register eventfd VFS — required by async-io-mini's reactor for polling.
+    // Must be called before the HTTP server thread starts.
+    esp_idf_svc::sys::esp!(unsafe {
+        esp_idf_svc::sys::esp_vfs_eventfd_register(&esp_idf_svc::sys::esp_vfs_eventfd_config_t {
+            max_fds: 5,
+        })
+    })
+    .expect("eventfd VFS registration failed");
+
+    // Start async HTTP server (blocks, so runs on its own thread)
+    {
+        let state = state.clone();
+        let ap_hostname = ap_hostname.clone();
+        thread_util::spawn_named(
+            c"http_srv",
+            thread_util::stack_size(c"http_srv", 81920),
+            SpiRam,
+            move || {
+                web_server::start_server(&state, Some(ap_hostname), ap_ip);
+            },
+        );
     }
 
     state
@@ -432,11 +489,25 @@ fn main() -> Result<()> {
 
     let config = init_logging_and_config(nvs.clone())?;
     let led_controller = init_led_controller(&config, peripherals.rmt.channel0)?;
+    let status_led_controller = status_leds::StatusLedController::new(
+        config.status_led_gpio,
+        config.boot_led_gpio,
+        config.status_led_brightness,
+        config.status_led_flicker_ms,
+        peripherals.rmt.channel1,
+    );
     let encoder_driver = init_encoder(&config, peripherals.pcnt0);
 
     let (wifi, ap_ssid) = init_wifi(&config, peripherals.modem, sys_loop, nvs)?;
 
-    let state = spawn_background_tasks(config, wifi, ap_ssid, led_controller, encoder_driver);
+    let state = spawn_background_tasks(
+        config,
+        wifi,
+        ap_ssid,
+        led_controller,
+        status_led_controller,
+        encoder_driver,
+    );
 
     // Start mDNS for local discovery (tachtalk.local)
     let _mdns = setup_mdns();
@@ -467,6 +538,31 @@ fn main() -> Result<()> {
 
         // Heap memory stats
         heap_diag::log_heap_stats();
+
+        // HTTP server stats
+        info!(
+            "HTTP: {} requests total",
+            state.http_request_count.load(Ordering::Relaxed),
+        );
+
+        // OBD2 client stats
+        let dongle_state = match state.dongle_tcp_state.load(Ordering::Relaxed) {
+            obd2::DongleTcpState::Disconnected => "disconnected",
+            obd2::DongleTcpState::Initializing => "initializing",
+            obd2::DongleTcpState::Ready => "ready",
+        };
+        info!(
+            "OBD2: {} | {} req total | {}/sec",
+            dongle_state,
+            state
+                .polling_metrics
+                .dongle_requests_total
+                .load(Ordering::Relaxed),
+            state
+                .polling_metrics
+                .dongle_requests_per_sec
+                .load(Ordering::Relaxed),
+        );
 
         // Print polling metrics
         let metrics = &state.polling_metrics;

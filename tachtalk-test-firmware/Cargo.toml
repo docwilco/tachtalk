@@ -24,6 +24,8 @@ oneshot.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 smallvec.workspace = true
+smart-leds.workspace = true
+ws2812-esp32-rmt-driver.workspace = true
 
 [build-dependencies]
 embuild.workspace = true

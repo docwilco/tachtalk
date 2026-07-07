@@ -1250,19 +1250,19 @@
                 <small style="color: #888;">4x speed threshold (must be &lt; 2x); 0 = disabled</small>
             </div>
             <div class="form-group">
-                <label>Status LED Red Pin:</label>
-                <input type="number" id="statusLedRedPin" value="9" min="0" max="48">
-                <small style="color: #888;">WiFi status, 0 = disabled (requires restart)</small>
+                <label>Status LED GPIO Pin:</label>
+                <input type="number" id="statusLedGpio" value="7" min="0" max="48">
+                <small style="color: #888;">3x WS2812B chain (WIFI/OBD/CLIENT), 0 = disabled (requires restart)</small>
             </div>
             <div class="form-group">
-                <label>Status LED Yellow Pin:</label>
-                <input type="number" id="statusLedYellowPin" value="10" min="0" max="48">
-                <small style="color: #888;">Dongle status, 0 = disabled (requires restart)</small>
+                <label>Status LED Brightness:</label>
+                <input type="number" id="statusLedBrightness" value="64" min="0" max="255">
+                <small style="color: #888;">Brightness of the status LED chain (0-255)</small>
             </div>
             <div class="form-group">
-                <label>Status LED Green Pin:</label>
-                <input type="number" id="statusLedGreenPin" value="11" min="0" max="48">
-                <small style="color: #888;">Client status, 0 = disabled (requires restart)</small>
+                <label>Boot LED GPIO Pin:</label>
+                <input type="number" id="bootLedGpio" value="46" min="0" max="48">
+                <small style="color: #888;">Red LED blinked during boot, 0 = disabled (requires restart)</small>
             </div>
             <div class="form-group">
                 <label>Status LED Flicker (ms):</label>
@@ -1677,9 +1677,9 @@
             { id: 'buttonPin', path: 'button_pin', type: 'int', fallback: 0 },
             { id: 'encoderAccel2xMs', path: 'encoder_accel_2x_ms', type: 'int', default: 'encoder_accel_2x_ms' },
             { id: 'encoderAccel4xMs', path: 'encoder_accel_4x_ms', type: 'int', default: 'encoder_accel_4x_ms' },
-            { id: 'statusLedRedPin', path: 'status_led_red_pin', type: 'int', default: 'status_led_red_pin' },
-            { id: 'statusLedYellowPin', path: 'status_led_yellow_pin', type: 'int', default: 'status_led_yellow_pin' },
-            { id: 'statusLedGreenPin', path: 'status_led_green_pin', type: 'int', default: 'status_led_green_pin' },
+            { id: 'statusLedGpio', path: 'status_led_gpio', type: 'int', default: 'status_led_gpio' },
+            { id: 'statusLedBrightness', path: 'status_led_brightness', type: 'int', default: 'status_led_brightness' },
+            { id: 'bootLedGpio', path: 'boot_led_gpio', type: 'int', default: 'boot_led_gpio' },
             { id: 'statusLedFlickerMs', path: 'status_led_flicker_ms', type: 'int', default: 'status_led_flicker_ms' },
             { id: 'logLevel', path: 'log_level', type: 'str', default: 'log_level' },
             { id: 'dumpCpuMetrics', path: 'dump_cpu_metrics', type: 'bool', default: 'dump_cpu_metrics' },
