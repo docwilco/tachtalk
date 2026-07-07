@@ -19,11 +19,17 @@ the LED stays identifiable during heavy traffic).
 
 | State | Color / pattern |
 |---|---|
-| STA disabled / not configured (AP only) | dim white solid |
-| STA connecting / waiting for IP | blue blink |
+| No STA SSID configured (AP always active) | dim white solid |
+| Searching / associating with the SSID | blue slow blink (~1 Hz) |
+| L2 associated, waiting for DHCP | blue fast blink (~4 Hz) |
 | STA connected with IP | blue solid |
-| STA connect failure (auth/timeout, will retry) | red blink |
 | AP client currently associated | overlay: cyan pulse |
+
+This requires splitting the public `WifiStaState` (which today collapses
+scan/associate/DHCP into one `Connecting` variant) into `NotConfigured`,
+`Searching`, `AwaitingIp`, and `Connected` — the manager's internal
+`StaConnectionState` already distinguishes the association attempt from the
+DHCP wait, and the test firmware already uses the `AwaitingIp` name.
 
 ### OBD LED
 
@@ -69,8 +75,10 @@ differ in pattern (blink vs. solid) wherever both can occur on the same LED.
    visible color change cheaply.
 3. **Richer producer states** — extend the message enums where the new
    scheme needs distinctions that don't exist yet:
-   - `WifiStaState`: add `AuthFailed` (from wifi.rs disconnect reason) and an
-     AP-client-associated signal (AP staconnected/stadisconnected events).
+   - `WifiStaState`: split `Connecting` into `Searching` / `AwaitingIp`, add
+     `NotConfigured`, and add an AP-client-associated signal (subscribe to
+     `ApStaConnected`/`ApStaDisconnected` on the system event loop, or poll
+     the AP station list in the manager's 1 s loop).
    - `DongleState`: add an `Erroring` flag driven by the obd2 task's timeout
      counter (set after N consecutive failures, cleared on success).
    - `ClientCount` already carries the count for the hue shift.
