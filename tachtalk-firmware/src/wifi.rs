@@ -29,13 +29,15 @@ use crate::State;
 #[atomic_enum]
 #[derive(Default, PartialEq, Eq)]
 pub enum WifiStaState {
-    /// Not associated at L2
+    /// No STA SSID configured (AP-only operation)
     #[default]
-    Disconnected = 0,
-    /// Connecting (scanning, associating, or awaiting IP)
-    Connecting = 1,
+    NotConfigured = 0,
+    /// Searching for / associating with the configured SSID
+    Searching = 1,
+    /// L2 associated, waiting for a DHCP lease
+    AwaitingIp = 2,
     /// Fully connected with a valid IP address
-    Connected = 2,
+    Connected = 3,
 }
 
 impl Default for AtomicWifiStaState {
@@ -177,10 +179,10 @@ pub fn init_wifi(
 }
 
 enum StaConnectionState {
-    /// Not connected at L2 (WiFi association)
+    /// Not connected at L2 (WiFi association); the manager keeps retrying
     Disconnected,
-    /// Connecting (L2 associated but waiting for IP)
-    Connecting,
+    /// L2 associated but waiting for IP
+    AwaitingIp,
     /// Fully connected with a valid IP address
     Connected(Ipv4Addr),
 }
@@ -188,9 +190,82 @@ enum StaConnectionState {
 impl From<&StaConnectionState> for WifiStaState {
     fn from(cs: &StaConnectionState) -> Self {
         match cs {
-            StaConnectionState::Disconnected => Self::Disconnected,
-            StaConnectionState::Connecting => Self::Connecting,
+            // An SSID is configured (the no-SSID case never reaches the
+            // connection loop), so "not associated" means we're searching.
+            StaConnectionState::Disconnected => Self::Searching,
+            StaConnectionState::AwaitingIp => Self::AwaitingIp,
             StaConnectionState::Connected(_) => Self::Connected,
+        }
+    }
+}
+
+/// Poll the number of stations associated with our AP and notify the status
+/// LED task on change.
+fn poll_ap_clients(state: &State, prev_count: &mut u32) {
+    let mut list = esp_idf_svc::sys::wifi_sta_list_t::default();
+    // SAFETY: esp_wifi_ap_get_sta_list only writes into the provided struct.
+    let err = unsafe { esp_idf_svc::sys::esp_wifi_ap_get_sta_list(&mut list) };
+    if err != esp_idf_svc::sys::ESP_OK {
+        return;
+    }
+    let count = u32::try_from(list.num).unwrap_or(0);
+    if count != *prev_count {
+        info!("AP clients associated: {count}");
+        let _ = state
+            .status_led_tx
+            .send(StatusLedMessage::ApClientCount(count));
+        *prev_count = count;
+    }
+}
+
+/// Update the `wifi_sta_state` atomic and send a status LED message on change.
+fn update_wifi_state(state: &State, new: WifiStaState, prev: &mut WifiStaState) {
+    if new != *prev {
+        state
+            .wifi_sta_state
+            .store(new, std::sync::atomic::Ordering::Relaxed);
+        let _ = state.status_led_tx.send(StatusLedMessage::WifiState(new));
+        *prev = new;
+    }
+}
+
+/// Initiate an STA connection and wait up to 15 s for L2 association,
+/// updating the published state when it comes up.
+fn attempt_sta_connect(
+    state: &State,
+    watchdog: &WatchdogHandle,
+    prev_led_state: &mut WifiStaState,
+    ap_client_count: &mut u32,
+) {
+    // Initiate connection (non-blocking)
+    {
+        let mut wifi_guard = state.wifi.lock().unwrap();
+        if let Err(e) = wifi_guard.connect() {
+            debug!("STA connection initiation failed: {e:?}");
+        }
+    }
+
+    // Wait for L2 connection or timeout (15s)
+    for _ in 0..15 {
+        watchdog.feed();
+        poll_ap_clients(state, ap_client_count);
+        FreeRtos::delay_ms(1000);
+
+        let wifi_guard = state.wifi.lock().unwrap();
+        match wifi_guard.is_connected() {
+            Ok(true) => {
+                // Re-evaluate state for the LED on L2 connect
+                let new_state = match wifi_guard.sta_netif().get_ip_info() {
+                    Ok(info) if !info.ip.is_unspecified() => WifiStaState::Connected,
+                    _ => WifiStaState::AwaitingIp,
+                };
+                update_wifi_state(state, new_state, prev_led_state);
+                break;
+            }
+            Ok(false) => {}
+            Err(e) => {
+                error!("Failed to check WiFi connection status: {e}");
+            }
         }
     }
 }
@@ -199,17 +274,6 @@ impl From<&StaConnectionState> for WifiStaState {
 ///
 /// Always runs in Mixed mode (AP + STA) - AP is never disabled.
 pub fn wifi_connection_manager(state: &Arc<State>) {
-    /// Update the `wifi_sta_state` atomic and send a status LED message on change.
-    fn update_wifi_state(state: &State, new: WifiStaState, prev: &mut WifiStaState) {
-        if new != *prev {
-            state
-                .wifi_sta_state
-                .store(new, std::sync::atomic::Ordering::Relaxed);
-            let _ = state.status_led_tx.send(StatusLedMessage::WifiState(new));
-            *prev = new;
-        }
-    }
-
     let watchdog = WatchdogHandle::register(c"wifi_manager");
 
     // Read STA SSID from config (cached at task start - changes require reboot)
@@ -218,20 +282,37 @@ pub fn wifi_connection_manager(state: &Arc<State>) {
         cfg_guard.wifi.ssid.clone()
     };
 
-    let mut prev_led_state = WifiStaState::Disconnected;
     let mut was_connected = false;
+    let mut ap_client_count = 0u32;
 
-    // Send Connecting immediately so the LED starts blinking right away.
-    // Without this, the LED would remain off until a state change occurs.
-    if !sta_ssid.is_empty() {
-        let _ = state
-            .status_led_tx
-            .send(StatusLedMessage::WifiState(WifiStaState::Connecting));
-        prev_led_state = WifiStaState::Connecting;
+    // Publish the initial state unconditionally so the LED reflects it
+    // right away (Searching blinks immediately instead of staying off).
+    let initial_state = if sta_ssid.is_empty() {
+        WifiStaState::NotConfigured
+    } else {
+        WifiStaState::Searching
+    };
+    state
+        .wifi_sta_state
+        .store(initial_state, std::sync::atomic::Ordering::Relaxed);
+    let _ = state
+        .status_led_tx
+        .send(StatusLedMessage::WifiState(initial_state));
+    let mut prev_led_state = initial_state;
+
+    // AP-only operation: nothing to connect to, just watch for AP clients
+    if sta_ssid.is_empty() {
+        info!("No STA SSID configured - running AP only");
+        loop {
+            watchdog.feed();
+            poll_ap_clients(state, &mut ap_client_count);
+            FreeRtos::delay_ms(1000);
+        }
     }
 
     loop {
         watchdog.feed();
+        poll_ap_clients(state, &mut ap_client_count);
 
         let connection_state = {
             let wifi_guard = state.wifi.lock().unwrap();
@@ -245,10 +326,10 @@ pub fn wifi_connection_manager(state: &Arc<State>) {
             if l2_connected {
                 match wifi_guard.sta_netif().get_ip_info() {
                     Ok(info) if !info.ip.is_unspecified() => StaConnectionState::Connected(info.ip),
-                    Ok(_) => StaConnectionState::Connecting,
+                    Ok(_) => StaConnectionState::AwaitingIp,
                     Err(e) => {
                         error!("Failed to get STA IP info: {e}");
-                        StaConnectionState::Connecting
+                        StaConnectionState::AwaitingIp
                     }
                 }
             } else {
@@ -268,7 +349,7 @@ pub fn wifi_connection_manager(state: &Arc<State>) {
                 }
                 FreeRtos::delay_ms(1000);
             }
-            StaConnectionState::Connecting => {
+            StaConnectionState::AwaitingIp => {
                 // L2 connected but waiting for IP - don't call connect(), just wait
                 FreeRtos::delay_ms(1000);
             }
@@ -280,37 +361,7 @@ pub fn wifi_connection_manager(state: &Arc<State>) {
                 }
 
                 debug!("Attempting to connect to '{sta_ssid}'...");
-
-                // Initiate connection (non-blocking)
-                {
-                    let mut wifi_guard = state.wifi.lock().unwrap();
-                    if let Err(e) = wifi_guard.connect() {
-                        debug!("STA connection initiation failed: {e:?}");
-                    }
-                }
-
-                // Wait for L2 connection or timeout (15s)
-                for _ in 0..15 {
-                    watchdog.feed();
-                    FreeRtos::delay_ms(1000);
-
-                    let wifi_guard = state.wifi.lock().unwrap();
-                    match wifi_guard.is_connected() {
-                        Ok(true) => {
-                            // Re-evaluate state for the LED on L2 connect
-                            let new_state = match wifi_guard.sta_netif().get_ip_info() {
-                                Ok(info) if !info.ip.is_unspecified() => WifiStaState::Connected,
-                                _ => WifiStaState::Connecting,
-                            };
-                            update_wifi_state(state, new_state, &mut prev_led_state);
-                            break;
-                        }
-                        Ok(false) => {}
-                        Err(e) => {
-                            error!("Failed to check WiFi connection status: {e}");
-                        }
-                    }
-                }
+                attempt_sta_connect(state, &watchdog, &mut prev_led_state, &mut ap_client_count);
             }
         }
     }

@@ -2,13 +2,18 @@
 //!
 //! Drives a chain of three WS2812B status LEDs on a single data GPIO
 //! (ordered outward from the MCU): **WIFI**, **OBD**, **CLIENT**.
-//! - **WIFI**: WiFi STA connection state (off/blink/solid)
-//! - **OBD**: OBD2 dongle TCP state (off/solid during init/flicker when active)
-//! - **CLIENT**: Client connection state (off/solid/flicker on activity)
+//! - **WIFI**: STA state — dim white (no SSID configured), blue slow blink
+//!   (searching/associating), blue fast blink (awaiting DHCP), blue solid
+//!   (connected); cyan pulse overlay while an AP client is associated
+//! - **OBD**: dongle state — off (disconnected), amber blink (initializing),
+//!   green solid (ready) with dim-pulse on request activity
+//! - **CLIENT**: OBD2 proxy clients — off (none), solid when connected
+//!   (green 1, cyan 2, blue 3+) with dim-pulse on request activity
 //!
 //! The task is fully event-driven via an `mpsc` channel — producers send
-//! [`StatusLedMessage`] variants on state transitions and per-request activity.
-//! An OTA override displays a sequential chase pattern across all three LEDs.
+//! [`StatusLedMessage`] variants on state transitions and per-request
+//! activity. Blink and chase phases are derived from a wallclock so the task
+//! only wakes at phase boundaries. An OTA override displays a purple chase.
 //!
 //! A plain red boot LED (separate GPIO) blinks along with the boot animation.
 
@@ -41,14 +46,62 @@ const OBD_LED: usize = 1;
 /// Chain index of the CLIENT status LED (furthest from the MCU)
 const CLIENT_LED: usize = 2;
 
-/// Color shown on the WIFI LED when lit
-const WIFI_COLOR: RGB8 = RGB8::new(255, 0, 0);
-/// Color shown on the OBD LED when lit
-const OBD_COLOR: RGB8 = RGB8::new(255, 200, 0);
-/// Color shown on the CLIENT LED when lit
-const CLIENT_COLOR: RGB8 = RGB8::new(0, 255, 0);
+/// WIFI LED: STA activity (blink/solid per state)
+const WIFI_COLOR: RGB8 = RGB8::new(0, 0, 255);
+/// WIFI LED: no STA SSID configured (AP-only operation)
+const NOT_CONFIGURED_COLOR: RGB8 = RGB8::new(32, 32, 32);
+/// WIFI LED: overlay pulse while an AP client is associated
+const AP_CLIENT_COLOR: RGB8 = RGB8::new(0, 255, 255);
+/// OBD LED: dongle TCP connect / ELM327 init in progress
+const OBD_INIT_COLOR: RGB8 = RGB8::new(255, 160, 0);
+/// OBD LED: dongle ready
+const OBD_READY_COLOR: RGB8 = RGB8::new(0, 255, 0);
+/// CLIENT LED: color by client count (1, 2, 3+)
+const CLIENT_COLORS: [RGB8; 3] = [
+    RGB8::new(0, 255, 0),
+    RGB8::new(0, 255, 255),
+    RGB8::new(0, 0, 255),
+];
+/// All LEDs: OTA update chase
+const OTA_COLOR: RGB8 = RGB8::new(128, 0, 128);
 
 const OFF: RGB8 = RGB8::new(0, 0, 0);
+
+/// Dim a color to roughly a third of its intensity (activity pulse "low"
+/// phase — keeps the LED identifiable instead of blinking to black).
+fn dimmed(c: RGB8) -> RGB8 {
+    RGB8::new(c.r / 3, c.g / 3, c.b / 3)
+}
+
+// ---------------------------------------------------------------------------
+// Timing
+// ---------------------------------------------------------------------------
+
+/// Half-period of the slow "searching for SSID" blink (~1 Hz)
+const SLOW_BLINK_HALF_MS: u64 = 500;
+
+/// Half-period of the fast "awaiting DHCP" blink (~4 Hz)
+const FAST_BLINK_HALF_MS: u64 = 125;
+
+/// Half-period of the OBD "initializing" blink (~2 Hz)
+const OBD_INIT_BLINK_HALF_MS: u64 = 250;
+
+/// AP-client overlay pulse: cycle length and on-time at the start of each cycle
+const AP_PULSE_PERIOD_MS: u64 = 2000;
+const AP_PULSE_ON_MS: u64 = 200;
+
+/// OTA chase step duration (each LED lights for this long)
+const OTA_CHASE_MS: u64 = 200;
+
+/// Whether a square-wave blink with the given half-period is in its on phase.
+fn blink_on(now_ms: u64, half_period_ms: u64) -> bool {
+    (now_ms / half_period_ms) % 2 == 0
+}
+
+/// Milliseconds until the next multiple of `period_ms`.
+fn until_next_boundary(now_ms: u64, period_ms: u64) -> u64 {
+    period_ms - (now_ms % period_ms)
+}
 
 // ---------------------------------------------------------------------------
 // StatusLedMessage — channel messages from producers
@@ -59,6 +112,8 @@ const OFF: RGB8 = RGB8::new(0, 0, 0);
 pub enum StatusLedMessage {
     /// WiFi STA state changed
     WifiState(WifiStaState),
+    /// Number of stations associated with our AP changed
+    ApClientCount(u32),
     /// Dongle TCP state changed
     DongleState(DongleTcpState),
     /// OBD2 client count changed (downstream clients in proxy mode)
@@ -168,19 +223,9 @@ impl StatusLedController {
         }
     }
 
-    /// Set the WIFI LED on or off.
-    fn set_wifi(&mut self, on: bool) {
-        self.leds[WIFI_LED] = if on { WIFI_COLOR } else { OFF };
-    }
-
-    /// Set the OBD LED on or off.
-    fn set_obd(&mut self, on: bool) {
-        self.leds[OBD_LED] = if on { OBD_COLOR } else { OFF };
-    }
-
-    /// Set the CLIENT LED on or off.
-    fn set_client(&mut self, on: bool) {
-        self.leds[CLIENT_LED] = if on { CLIENT_COLOR } else { OFF };
+    /// Set one LED in the chain buffer (flushed by [`Self::flush`]).
+    fn set_led(&mut self, index: usize, color: RGB8) {
+        self.leds[index] = color;
     }
 
     /// All LEDs off.
@@ -216,18 +261,15 @@ impl StatusLedController {
     ///
     /// Designed to be called in sync with the main RGB LED boot animation
     /// (3 purple blinks at 250 ms on / 250 ms off). Each status LED lights
-    /// during one of the three on-phases:
-    /// - Cycle 1: WIFI
-    /// - Cycle 2: OBD
-    /// - Cycle 3: CLIENT
+    /// during one of the three on-phases in its identity color:
+    /// - Cycle 1: WIFI (blue)
+    /// - Cycle 2: OBD (amber)
+    /// - Cycle 3: CLIENT (green)
     pub fn boot_animation(&mut self, blink_duration: Duration) {
-        for i in 0..STATUS_LED_COUNT {
+        const BOOT_COLORS: [RGB8; STATUS_LED_COUNT] = [WIFI_COLOR, OBD_INIT_COLOR, OBD_READY_COLOR];
+        for (i, color) in BOOT_COLORS.iter().enumerate() {
             // On phase — light the LED for this cycle plus the boot LED
-            match i {
-                WIFI_LED => self.set_wifi(true),
-                OBD_LED => self.set_obd(true),
-                _ => self.set_client(true),
-            }
+            self.set_led(i, *color);
             self.flush();
             self.set_boot_led(true);
             std::thread::sleep(blink_duration);
@@ -241,74 +283,63 @@ impl StatusLedController {
 }
 
 // ---------------------------------------------------------------------------
-// Status LED task
-// ---------------------------------------------------------------------------
-
-/// Blink half-period for WiFi "connecting" state (~2 Hz = 250 ms half-period)
-const WIFI_BLINK_MS: u64 = 250;
-
-/// OTA chase step duration (each LED lights for this long)
-const OTA_CHASE_MS: u64 = 200;
-
-// ---------------------------------------------------------------------------
 // LedTaskState — mutable shadow state for the event loop
 // ---------------------------------------------------------------------------
 
 /// Mutable shadow state used by the status LED event loop.
 ///
 /// Bundles all tracked state and timer bookkeeping so the public
-/// [`run_status_led_task`] stays short and duplication-free.
+/// [`run_status_led_task`] stays short and duplication-free. Periodic
+/// patterns (blinks, pulses, chases) are phase-locked to `start` so the
+/// task can compute exact wake deadlines without per-pattern bookkeeping.
 struct LedTaskState {
+    /// Task start; blink/pulse phases are derived from time since here
+    start: Instant,
+
     wifi: WifiStaState,
+    ap_clients: u32,
     dongle: DongleTcpState,
     client_count: u32,
     ota: OtaState,
-
-    wifi_blink_on: bool,
-    wifi_blink_deadline: Instant,
 
     obd_flicker_on: bool,
     obd_activity_deadline: Option<Instant>,
     client_flicker_on: bool,
     client_activity_deadline: Option<Instant>,
 
-    ota_chase_index: u8,
-    ota_chase_deadline: Instant,
-
     activity_timeout: Duration,
 }
 
 impl LedTaskState {
     fn new(activity_timeout: Duration) -> Self {
-        let now = Instant::now();
         Self {
-            wifi: WifiStaState::Disconnected,
+            start: Instant::now(),
+            wifi: WifiStaState::NotConfigured,
+            ap_clients: 0,
             dongle: DongleTcpState::Disconnected,
             client_count: 0,
             ota: OtaState::Idle,
-            wifi_blink_on: false,
-            wifi_blink_deadline: now,
             obd_flicker_on: true,
             obd_activity_deadline: None,
             client_flicker_on: true,
             client_activity_deadline: None,
-            ota_chase_index: 0,
-            ota_chase_deadline: now,
             activity_timeout,
         }
+    }
+
+    /// Milliseconds since task start (blink phase reference).
+    fn now_ms(&self, now: Instant) -> u64 {
+        // u64::MAX ms = 584 million years, safe to truncate
+        #[allow(clippy::cast_possible_truncation)]
+        let ms = now.duration_since(self.start).as_millis() as u64;
+        ms
     }
 
     /// Process a single status LED message, updating shadow state.
     fn process_message(&mut self, msg: StatusLedMessage) {
         match msg {
-            StatusLedMessage::WifiState(s) => {
-                if s != self.wifi {
-                    self.wifi = s;
-                    self.wifi_blink_on = true;
-                    self.wifi_blink_deadline =
-                        Instant::now() + Duration::from_millis(WIFI_BLINK_MS);
-                }
-            }
+            StatusLedMessage::WifiState(s) => self.wifi = s,
+            StatusLedMessage::ApClientCount(n) => self.ap_clients = n,
             StatusLedMessage::DongleState(s) => {
                 self.dongle = s;
                 if s == DongleTcpState::Disconnected {
@@ -333,19 +364,13 @@ impl LedTaskState {
                     self.client_activity_deadline = Some(Instant::now() + self.activity_timeout);
                 }
             }
-            StatusLedMessage::OtaStatus(s) => {
-                let was_active = self.ota == OtaState::Updating;
-                self.ota = s;
-                if s == OtaState::Updating && !was_active {
-                    self.ota_chase_index = 0;
-                    self.ota_chase_deadline = Instant::now() + Duration::from_millis(OTA_CHASE_MS);
-                }
-            }
+            StatusLedMessage::OtaStatus(s) => self.ota = s,
         }
     }
 
     /// Compute the earliest deadline we need to wake for.
-    fn next_deadline(&self) -> Option<Instant> {
+    fn next_deadline(&self, now: Instant) -> Option<Instant> {
+        let now_ms = self.now_ms(now);
         let mut earliest: Option<Instant> = None;
         let mut consider = |t: Instant| {
             earliest = Some(match earliest {
@@ -354,8 +379,37 @@ impl LedTaskState {
             });
         };
 
-        if self.wifi == WifiStaState::Connecting {
-            consider(self.wifi_blink_deadline);
+        if self.ota == OtaState::Updating {
+            // OTA chase overrides everything; no other timer matters
+            return Some(now + Duration::from_millis(until_next_boundary(now_ms, OTA_CHASE_MS)));
+        }
+
+        match self.wifi {
+            WifiStaState::Searching => {
+                consider(
+                    now + Duration::from_millis(until_next_boundary(now_ms, SLOW_BLINK_HALF_MS)),
+                );
+            }
+            WifiStaState::AwaitingIp => {
+                consider(
+                    now + Duration::from_millis(until_next_boundary(now_ms, FAST_BLINK_HALF_MS)),
+                );
+            }
+            WifiStaState::NotConfigured | WifiStaState::Connected => {}
+        }
+        if self.ap_clients > 0 {
+            let pos = now_ms % AP_PULSE_PERIOD_MS;
+            let until = if pos < AP_PULSE_ON_MS {
+                AP_PULSE_ON_MS - pos
+            } else {
+                AP_PULSE_PERIOD_MS - pos
+            };
+            consider(now + Duration::from_millis(until));
+        }
+        if self.dongle == DongleTcpState::Initializing {
+            consider(
+                now + Duration::from_millis(until_next_boundary(now_ms, OBD_INIT_BLINK_HALF_MS)),
+            );
         }
         if let Some(t) = self.obd_activity_deadline {
             consider(t);
@@ -363,19 +417,12 @@ impl LedTaskState {
         if let Some(t) = self.client_activity_deadline {
             consider(t);
         }
-        if self.ota == OtaState::Updating {
-            consider(self.ota_chase_deadline);
-        }
 
         earliest
     }
 
-    /// Advance blink / flicker / chase timers based on the current time.
+    /// Expire activity-pulse timers based on the current time.
     fn update_timers(&mut self, now: Instant) {
-        if self.wifi == WifiStaState::Connecting && now >= self.wifi_blink_deadline {
-            self.wifi_blink_on = !self.wifi_blink_on;
-            self.wifi_blink_deadline = now + Duration::from_millis(WIFI_BLINK_MS);
-        }
         if let Some(t) = self.obd_activity_deadline {
             if now >= t {
                 self.obd_activity_deadline = None;
@@ -388,50 +435,85 @@ impl LedTaskState {
                 self.client_flicker_on = true;
             }
         }
-        if self.ota == OtaState::Updating && now >= self.ota_chase_deadline {
-            self.ota_chase_index = (self.ota_chase_index + 1) % 3;
-            self.ota_chase_deadline = now + Duration::from_millis(OTA_CHASE_MS);
+    }
+
+    /// Render the WIFI LED color for the current state.
+    fn wifi_color(&self, now_ms: u64) -> RGB8 {
+        // AP-client overlay: brief cyan pulse at the start of each cycle
+        if self.ap_clients > 0 && now_ms % AP_PULSE_PERIOD_MS < AP_PULSE_ON_MS {
+            return AP_CLIENT_COLOR;
+        }
+        match self.wifi {
+            WifiStaState::NotConfigured => NOT_CONFIGURED_COLOR,
+            WifiStaState::Searching => {
+                if blink_on(now_ms, SLOW_BLINK_HALF_MS) {
+                    WIFI_COLOR
+                } else {
+                    OFF
+                }
+            }
+            WifiStaState::AwaitingIp => {
+                if blink_on(now_ms, FAST_BLINK_HALF_MS) {
+                    WIFI_COLOR
+                } else {
+                    OFF
+                }
+            }
+            WifiStaState::Connected => WIFI_COLOR,
+        }
+    }
+
+    /// Render the OBD LED color for the current state.
+    fn obd_color(&self, now_ms: u64) -> RGB8 {
+        match self.dongle {
+            DongleTcpState::Disconnected => OFF,
+            DongleTcpState::Initializing => {
+                if blink_on(now_ms, OBD_INIT_BLINK_HALF_MS) {
+                    OBD_INIT_COLOR
+                } else {
+                    OFF
+                }
+            }
+            DongleTcpState::Ready => {
+                if self.obd_activity_deadline.is_some() && !self.obd_flicker_on {
+                    dimmed(OBD_READY_COLOR)
+                } else {
+                    OBD_READY_COLOR
+                }
+            }
+        }
+    }
+
+    /// Render the CLIENT LED color for the current state.
+    fn client_color(&self) -> RGB8 {
+        if self.client_count == 0 {
+            return OFF;
+        }
+        let idx = usize::try_from(self.client_count - 1)
+            .unwrap_or(usize::MAX)
+            .min(CLIENT_COLORS.len() - 1);
+        let color = CLIENT_COLORS[idx];
+        if self.client_activity_deadline.is_some() && !self.client_flicker_on {
+            dimmed(color)
+        } else {
+            color
         }
     }
 
     /// Set LED outputs based on current shadow state.
-    fn drive_leds(&self, controller: &mut StatusLedController) {
+    fn drive_leds(&self, now: Instant, controller: &mut StatusLedController) {
+        let now_ms = self.now_ms(now);
         if self.ota == OtaState::Updating {
-            // OTA override: sequential chase
-            controller.set_wifi(self.ota_chase_index == 0);
-            controller.set_obd(self.ota_chase_index == 1);
-            controller.set_client(self.ota_chase_index == 2);
+            // OTA override: purple chase across the chain
+            #[allow(clippy::cast_possible_truncation)]
+            let chase = ((now_ms / OTA_CHASE_MS) % STATUS_LED_COUNT as u64) as usize;
+            for i in 0..STATUS_LED_COUNT {
+                controller.set_led(i, if i == chase { OTA_COLOR } else { OFF });
+            }
         } else {
-            // WIFI: WiFi STA state
-            let wifi_on = match self.wifi {
-                WifiStaState::Disconnected => false,
-                WifiStaState::Connecting => self.wifi_blink_on,
-                WifiStaState::Connected => true,
-            };
-            controller.set_wifi(wifi_on);
-
-            // OBD: dongle TCP state
-            let obd_on = match self.dongle {
-                DongleTcpState::Disconnected => false,
-                DongleTcpState::Initializing => true,
-                DongleTcpState::Ready => {
-                    if self.obd_activity_deadline.is_some() {
-                        self.obd_flicker_on
-                    } else {
-                        true
-                    }
-                }
-            };
-            controller.set_obd(obd_on);
-
-            // CLIENT: client state
-            let client_on = self.client_count > 0
-                && if self.client_activity_deadline.is_some() {
-                    self.client_flicker_on
-                } else {
-                    true
-                };
-            controller.set_client(client_on);
+            controller.set_led(WIFI_LED, self.wifi_color(now_ms));
+            controller.set_led(OBD_LED, self.obd_color(now_ms));
+            controller.set_led(CLIENT_LED, self.client_color());
         }
         controller.flush();
     }
@@ -460,7 +542,7 @@ impl StatusLedController {
         );
 
         loop {
-            let deadline = state.next_deadline();
+            let deadline = state.next_deadline(Instant::now());
 
             // Block on channel with optional timeout
             let msg = match deadline {
@@ -502,8 +584,9 @@ impl StatusLedController {
             }
 
             // Advance timers and drive outputs
-            state.update_timers(Instant::now());
-            state.drive_leds(self);
+            let now = Instant::now();
+            state.update_timers(now);
+            state.drive_leds(now, self);
         }
     }
 }

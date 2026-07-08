@@ -25,11 +25,11 @@ the LED stays identifiable during heavy traffic).
 | STA connected with IP | blue solid |
 | AP client currently associated | overlay: cyan pulse |
 
-This requires splitting the public `WifiStaState` (which today collapses
-scan/associate/DHCP into one `Connecting` variant) into `NotConfigured`,
-`Searching`, `AwaitingIp`, and `Connected` — the manager's internal
-`StaConnectionState` already distinguishes the association attempt from the
-DHCP wait, and the test firmware already uses the `AwaitingIp` name.
+**Implemented.** `WifiStaState` is split into `NotConfigured`, `Searching`,
+`AwaitingIp`, and `Connected`; the manager publishes `Searching` during
+connect attempts (previously the LED went dark while associating), idles in
+an AP-only loop when no SSID is configured, and polls the AP station list
+each second for the cyan overlay pulse.
 
 ### OBD LED
 
@@ -64,24 +64,17 @@ differ in pattern (blink vs. solid) wherever both can occur on the same LED.
 
 ## Implementation steps
 
-1. **Pattern engine** — replace the per-LED `bool` outputs with a small
-   `LedPattern { color: RGB8, mode: Solid | Blink(ms) | Pulse }` per LED.
-   The existing event loop already computes wake deadlines for WiFi blink,
-   activity flicker, and the OTA chase; generalize that to one deadline per
-   LED derived from its pattern. `drive_leds()` then renders the three
-   patterns into the `[RGB8; 3]` buffer and flushes (dirty-checked, as now).
-2. **Map existing states** — express today's semantics in the new table
-   (colors above) without adding any new producer messages. This lands the
-   visible color change cheaply.
-3. **Richer producer states** — extend the message enums where the new
-   scheme needs distinctions that don't exist yet:
-   - `WifiStaState`: split `Connecting` into `Searching` / `AwaitingIp`, add
-     `NotConfigured`, and add an AP-client-associated signal (subscribe to
-     `ApStaConnected`/`ApStaDisconnected` on the system event loop, or poll
-     the AP station list in the manager's 1 s loop).
+1. **Pattern engine** — *done.* Blink/pulse/chase phases are derived from a
+   wallclock reference in `status_leds.rs`, so the task wakes exactly at
+   phase boundaries; per-LED colors render into the `[RGB8; 3]` buffer and
+   flush dirty-checked.
+2. **Map existing states** — *done.* WIFI, OBD, and CLIENT render the color
+   table above, including the client-count hue shift and dim-pulse activity.
+3. **Richer producer states**:
+   - `WifiStaState` — *done*, see the WIFI section above.
    - `DongleState`: add an `Erroring` flag driven by the obd2 task's timeout
-     counter (set after N consecutive failures, cleared on success).
-   - `ClientCount` already carries the count for the hue shift.
+     counter (set after N consecutive failures, cleared on success) for the
+     red-blink "repeated timeouts" state. Not yet implemented.
 4. **Optional polish**
    - Short gamma-correct fade (~100 ms, 3–4 steps) on color transitions to
      avoid harsh snaps; only ticks while a fade is active so the task stays
