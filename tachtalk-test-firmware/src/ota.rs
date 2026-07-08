@@ -95,11 +95,7 @@ where
 
         // Log progress at each 10% increment
         #[allow(clippy::cast_possible_truncation)]
-        let pct = if total_size > 0 {
-            (written * 100 / total_size) as u8
-        } else {
-            0
-        };
+        let pct = (written * 100).checked_div(total_size).unwrap_or(0) as u8;
         if pct / 10 > last_pct / 10 {
             info!("OTA: {written}/{total_size} bytes ({pct}%)");
             last_pct = pct;

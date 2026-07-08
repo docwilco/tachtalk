@@ -672,7 +672,7 @@ fn register_network_routes(server: &mut EspHttpServer<'static>, state: &Arc<Stat
                     .into_iter()
                     .map(|(ssid, rssi)| Network { ssid, rssi })
                     .collect();
-                networks.sort_by(|a, b| b.rssi.cmp(&a.rssi));
+                networks.sort_by_key(|n| core::cmp::Reverse(n.rssi));
                 networks
             }
             Err(e) => {

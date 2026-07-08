@@ -55,7 +55,7 @@ impl Default for AtomicDongleTcpState {
 
 const RECONNECT_DELAY: Duration = Duration::from_secs(1);
 /// Maintenance interval for checking promotion/demotion/removal
-const MAINTENANCE_INTERVAL: Duration = Duration::from_millis(2000);
+const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(2);
 
 /// Type alias for small OBD2 wire-format buffers (ASCII hex commands/responses).
 /// 20 bytes on 32-bit; 16 inline bytes covers multi-PID commands without heap.

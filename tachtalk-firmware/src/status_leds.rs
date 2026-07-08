@@ -5,8 +5,8 @@
 //! - **WIFI**: STA state — dim white (no SSID configured), blue slow blink
 //!   (searching/associating), blue fast blink (awaiting DHCP), blue solid
 //!   (connected); cyan pulse overlay while an AP client is associated
-//! - **OBD**: dongle state — off (disconnected), amber blink (initializing),
-//!   green solid (ready) with dim-pulse on request activity
+//! - **OBD**: dongle state — red blink (no connection), amber blink
+//!   (initializing), green solid (ready) with dim-pulse on request activity
 //! - **CLIENT**: OBD2 proxy clients — off (none), solid when connected
 //!   (green 1, cyan 2, blue 3+) with dim-pulse on request activity
 //!
@@ -56,6 +56,8 @@ const AP_CLIENT_COLOR: RGB8 = RGB8::new(0, 255, 255);
 const OBD_INIT_COLOR: RGB8 = RGB8::new(255, 160, 0);
 /// OBD LED: dongle ready
 const OBD_READY_COLOR: RGB8 = RGB8::new(0, 255, 0);
+/// OBD LED: no dongle connection
+const OBD_ERROR_COLOR: RGB8 = RGB8::new(255, 0, 0);
 /// CLIENT LED: color by client count (1, 2, 3+)
 const CLIENT_COLORS: [RGB8; 3] = [
     RGB8::new(0, 255, 0),
@@ -85,6 +87,9 @@ const FAST_BLINK_HALF_MS: u64 = 125;
 
 /// Half-period of the OBD "initializing" blink (~2 Hz)
 const OBD_INIT_BLINK_HALF_MS: u64 = 250;
+
+/// Half-period of the OBD "disconnected" blink (~1 Hz)
+const OBD_ERROR_BLINK_HALF_MS: u64 = 500;
 
 /// AP-client overlay pulse: cycle length and on-time at the start of each cycle
 const AP_PULSE_PERIOD_MS: u64 = 2000;
@@ -406,10 +411,24 @@ impl LedTaskState {
             };
             consider(now + Duration::from_millis(until));
         }
-        if self.dongle == DongleTcpState::Initializing {
-            consider(
-                now + Duration::from_millis(until_next_boundary(now_ms, OBD_INIT_BLINK_HALF_MS)),
-            );
+        match self.dongle {
+            DongleTcpState::Disconnected => {
+                consider(
+                    now + Duration::from_millis(until_next_boundary(
+                        now_ms,
+                        OBD_ERROR_BLINK_HALF_MS,
+                    )),
+                );
+            }
+            DongleTcpState::Initializing => {
+                consider(
+                    now + Duration::from_millis(until_next_boundary(
+                        now_ms,
+                        OBD_INIT_BLINK_HALF_MS,
+                    )),
+                );
+            }
+            DongleTcpState::Ready => {}
         }
         if let Some(t) = self.obd_activity_deadline {
             consider(t);
@@ -466,7 +485,13 @@ impl LedTaskState {
     /// Render the OBD LED color for the current state.
     fn obd_color(&self, now_ms: u64) -> RGB8 {
         match self.dongle {
-            DongleTcpState::Disconnected => OFF,
+            DongleTcpState::Disconnected => {
+                if blink_on(now_ms, OBD_ERROR_BLINK_HALF_MS) {
+                    OBD_ERROR_COLOR
+                } else {
+                    OFF
+                }
+            }
             DongleTcpState::Initializing => {
                 if blink_on(now_ms, OBD_INIT_BLINK_HALF_MS) {
                     OBD_INIT_COLOR

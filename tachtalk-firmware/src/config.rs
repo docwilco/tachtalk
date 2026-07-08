@@ -921,11 +921,10 @@ impl Config {
         }
         // Clamp capture buffer size (16KB - 6MB). Upper bound preserves
         // ~2MB of the 8MB PSRAM for TLS, WiFi, and heap allocations.
-        if self.obd2.capture_buffer_size < 16 * 1024 {
-            self.obd2.capture_buffer_size = 16 * 1024;
-        } else if self.obd2.capture_buffer_size > 6 * 1024 * 1024 {
-            self.obd2.capture_buffer_size = 6 * 1024 * 1024;
-        }
+        self.obd2.capture_buffer_size = self
+            .obd2
+            .capture_buffer_size
+            .clamp(16 * 1024, 6 * 1024 * 1024);
         // Validate profile fields
         for profile in &mut self.profiles {
             // Non-Triggered profiles shouldn't have button_pin or auto_disable

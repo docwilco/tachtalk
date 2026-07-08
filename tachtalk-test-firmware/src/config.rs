@@ -500,11 +500,10 @@ impl Config {
         }
         // Clamp capture buffer size (16KB - 6MB). Upper bound preserves
         // ~2MB of the 8MB PSRAM for TLS, WiFi, and heap allocations.
-        if self.test.capture_buffer_size < 16 * 1024 {
-            self.test.capture_buffer_size = 16 * 1024;
-        } else if self.test.capture_buffer_size > 6 * 1024 * 1024 {
-            self.test.capture_buffer_size = 6 * 1024 * 1024;
-        }
+        self.test.capture_buffer_size = self
+            .test
+            .capture_buffer_size
+            .clamp(16 * 1024, 6 * 1024 * 1024);
     }
 
     pub fn load_or_default() -> Self {

@@ -35,11 +35,10 @@ each second for the cyan overlay pulse.
 
 | State | Color / pattern |
 |---|---|
-| Dongle TCP disconnected | off |
+| No dongle connection (includes failed connect attempts) | red blink |
 | TCP connecting / ELM327 init | amber blink |
 | Ready, idle | green solid |
 | Ready, request in flight | green pulse (existing flicker logic) |
-| Repeated timeouts / protocol errors | red blink until next success |
 
 ### CLIENT LED
 
@@ -72,9 +71,9 @@ differ in pattern (blink vs. solid) wherever both can occur on the same LED.
    table above, including the client-count hue shift and dim-pulse activity.
 3. **Richer producer states**:
    - `WifiStaState` — *done*, see the WIFI section above.
-   - `DongleState`: add an `Erroring` flag driven by the obd2 task's timeout
-     counter (set after N consecutive failures, cleared on success) for the
-     red-blink "repeated timeouts" state. Not yet implemented.
+   - OBD disconnected/unreachable — *done*: `Disconnected` renders as a red
+     blink directly, so failed connect attempts are immediately visible; no
+     extra producer state was needed.
 4. **Optional polish**
    - Short gamma-correct fade (~100 ms, 3–4 steps) on color transitions to
      avoid harsh snaps; only ticks while a fade is active so the task stays
