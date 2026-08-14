@@ -54,21 +54,13 @@ jobs:
             tachtalk-firmware -> target
             tachtalk-test-firmware -> target
 
-      - name: Cache ESP-IDF build (firmware)
+      - name: Cache ESP-IDF tools
         uses: actions/cache@v4
         with:
-          path: tachtalk-firmware/.embuild
-          key: embuild-firmware-${{ hashFiles('tachtalk-firmware/sdkconfig.defaults', 'tachtalk-firmware/.cargo/config.toml', 'Cargo.lock') }}
+          path: ~/.espressif
+          key: espressif-${{ hashFiles('tachtalk-firmware/.cargo/config.toml', 'tachtalk-test-firmware/.cargo/config.toml') }}
           restore-keys: |
-            embuild-firmware-
-
-      - name: Cache ESP-IDF build (test-firmware)
-        uses: actions/cache@v4
-        with:
-          path: tachtalk-test-firmware/.embuild
-          key: embuild-test-firmware-${{ hashFiles('tachtalk-test-firmware/sdkconfig.defaults', 'tachtalk-test-firmware/.cargo/config.toml', 'Cargo.lock') }}
-          restore-keys: |
-            embuild-test-firmware-
+            espressif-
 
       - name: Build regular firmware
         working-directory: tachtalk-firmware
