@@ -523,8 +523,6 @@ fn schedule_ota_reboot(state: Arc<State>) {
 
 struct EdgeHandler {
     state: Arc<State>,
-    ap_hostname: Option<String>,
-    ap_ip: Ipv4Addr,
 }
 
 impl Handler for EdgeHandler {
@@ -545,7 +543,6 @@ impl Handler for EdgeHandler {
         let method = headers.method;
         let path = headers.path.to_owned();
         let cookie = headers.headers.get("Cookie").map(str::to_owned);
-        let host = headers.headers.host().map(str::to_owned);
         let content_len = headers.headers.content_len();
 
         self.state
@@ -587,10 +584,6 @@ impl Handler for EdgeHandler {
             }
             (Method::Post, "/api/ota/download") => self.handle_ota_download(conn, cookie).await,
             (Method::Get, "/api/ota/status") => self.handle_ota_status(conn).await,
-            (Method::Get, _) => {
-                self.handle_captive_portal(conn, host.as_deref(), &path)
-                    .await
-            }
             _ => self.handle_not_found(conn).await,
         }
     }
@@ -1482,62 +1475,6 @@ impl EdgeHandler {
         conn.write_all(b"Not Found").await?;
         Ok(())
     }
-
-    async fn handle_captive_portal<T, const N: usize>(
-        &self,
-        conn: &mut Connection<'_, T, N>,
-        host: Option<&str>,
-        path: &str,
-    ) -> Result<(), Error<T::Error>>
-    where
-        T: Read + Write,
-    {
-        let Some(ref hostname) = self.ap_hostname else {
-            // No captive portal configured — 404
-            conn.initiate_response(404, Some("Not Found"), &[("Content-Type", "text/plain")])
-                .await?;
-            conn.write_all(b"Not Found").await?;
-            return Ok(());
-        };
-
-        let ap_ip_str = self.ap_ip.to_string();
-        let host_lower = host.unwrap_or("").to_lowercase();
-        let host_without_port = host_lower.split(':').next().unwrap_or("");
-
-        let is_valid_host = host_without_port == hostname
-            || host_without_port == format!("{hostname}.local")
-            || host_without_port == ap_ip_str;
-
-        if is_valid_host {
-            info!("HTTP: GET {path} -> 404 (host: {host_lower})");
-            conn.initiate_response(404, Some("Not Found"), &[("Content-Type", "text/plain")])
-                .await?;
-            conn.write_all(b"Not Found").await?;
-        } else {
-            let redirect_url = format!("http://{ap_ip_str}/");
-            info!("HTTP: GET {path} -> 302 captive (host: {host_lower})");
-            let html = format!(
-                "<!DOCTYPE html>\n<html>\n<head>\n    <meta charset=\"UTF-8\">\n    \
-                 <title>TachTalk Setup</title>\n    \
-                 <meta http-equiv=\"refresh\" content=\"0;url={redirect_url}\">\n\
-                 </head>\n<body>\n    \
-                 <p>Redirecting to <a href=\"{redirect_url}\">TachTalk Setup</a>...</p>\n\
-                 </body>\n</html>\n"
-            );
-            conn.initiate_response(
-                302,
-                Some("Found"),
-                &[
-                    ("Location", &redirect_url),
-                    ("Cache-Control", "no-cache"),
-                    ("Connection", "close"),
-                ],
-            )
-            .await?;
-            conn.write_all(html.as_bytes()).await?;
-        }
-        Ok(())
-    }
 }
 
 // ── Resilient acceptor wrapper ───────────────────────────────────────────────
@@ -1572,12 +1509,8 @@ where
 // ── Public entry point ───────────────────────────────────────────────────────
 
 #[embassy_executor::task]
-async fn http_server_task(state: Arc<State>, ap_hostname: Option<String>, ap_ip: Ipv4Addr) -> ! {
-    let handler = EdgeHandler {
-        state,
-        ap_hostname,
-        ap_ip,
-    };
+async fn http_server_task(state: Arc<State>, ap_ip: Ipv4Addr) -> ! {
+    let handler = EdgeHandler { state };
 
     let acceptor = match edge_nal_std::Stack::new()
         .bind((ap_ip, HTTP_PORT).into())
@@ -1601,7 +1534,7 @@ async fn http_server_task(state: Arc<State>, ap_hostname: Option<String>, ap_ip:
     unreachable!("HTTP server exited")
 }
 
-pub fn start_server(state: &Arc<State>, ap_hostname: Option<String>, ap_ip: Ipv4Addr) -> ! {
+pub fn start_server(state: &Arc<State>, ap_ip: Ipv4Addr) -> ! {
     info!("edge-http server starting on {ap_ip}:{HTTP_PORT}...");
 
     let executor = embassy_executor::Executor::new();
@@ -1610,7 +1543,7 @@ pub fn start_server(state: &Arc<State>, ap_hostname: Option<String>, ap_ip: Ipv4
 
     executor.run(|spawner| {
         spawner
-            .spawn(http_server_task(state.clone(), ap_hostname, ap_ip))
+            .spawn(http_server_task(state.clone(), ap_ip))
             .expect("failed to spawn HTTP server task");
     });
 }

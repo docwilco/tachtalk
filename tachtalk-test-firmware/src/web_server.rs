@@ -14,7 +14,6 @@ use esp_idf_svc::http::server::{Configuration, EspHttpServer};
 use log::{debug, error, info, warn};
 use std::collections::HashMap;
 use std::io::Read as _;
-use std::net::Ipv4Addr;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
@@ -1025,70 +1024,10 @@ fn register_ota_status_route(
     Ok(())
 }
 
-/// Register captive portal wildcard handler (must be last — matches /*)
-fn register_captive_portal(
-    server: &mut EspHttpServer<'static>,
-    hostname: &str,
-    ap_ip: Ipv4Addr,
-) -> Result<()> {
-    let ap_ip_str = ap_ip.to_string();
-    let valid_hosts: Vec<String> = vec![
-        hostname.to_owned(),
-        format!("{hostname}.local"),
-        ap_ip_str.clone(),
-    ];
-    let redirect_url = format!("http://{ap_ip_str}/");
-    let captive_portal_html = format!(
-        r#"<!DOCTYPE html>
-<html>
-<head>
-    <meta charset="UTF-8">
-    <title>TachTalk Test Setup</title>
-    <meta http-equiv="refresh" content="0;url={redirect_url}">
-</head>
-<body>
-    <p>Redirecting to <a href="{redirect_url}">TachTalk Test Setup</a>...</p>
-</body>
-</html>
-"#
-    );
-
-    info!("Captive portal enabled for hostname: {hostname}");
-
-    server.fn_handler("/*", Method::Get, move |req| -> HandlerResult {
-        let host = req.header("Host").unwrap_or("");
-        let host_lower = host.to_lowercase();
-        let host_without_port = host_lower.split(':').next().unwrap_or("");
-
-        let is_valid_host = valid_hosts.iter().any(|h| h == host_without_port);
-
-        if is_valid_host {
-            info!("HTTP: GET {} -> 404 (host: {})", req.uri(), host);
-            req.into_status_response(404)?;
-        } else {
-            info!("HTTP: GET {} -> 302 captive (host: {})", req.uri(), host);
-            let mut response = req.into_response(
-                302,
-                Some("Found"),
-                &[
-                    ("Location", &redirect_url),
-                    ("Cache-Control", "no-cache"),
-                    ("Connection", "close"),
-                ],
-            )?;
-            response.write_all(captive_portal_html.as_bytes())?;
-        }
-        Ok(())
-    })?;
-
-    Ok(())
-}
-
-pub fn start_server(state: &Arc<State>, ap_hostname: Option<&str>, ap_ip: Ipv4Addr) -> Result<()> {
+pub fn start_server(state: &Arc<State>) -> Result<()> {
     info!("Web server starting...");
 
     let server_config = Configuration {
-        uri_match_wildcard: true,
         max_open_sockets: 6,
         session_timeout: core::time::Duration::from_secs(2),
         lru_purge_enable: true,
@@ -1105,11 +1044,6 @@ pub fn start_server(state: &Arc<State>, ap_hostname: Option<&str>, ap_ip: Ipv4Ad
     register_ota_routes(&mut server, state)?;
     register_ota_download_routes(&mut server, state)?;
     register_ota_status_route(&mut server, state)?;
-
-    // Captive portal wildcard must be registered last
-    if let Some(hostname) = &ap_hostname {
-        register_captive_portal(&mut server, hostname, ap_ip)?;
-    }
 
     info!("Web server started on http://0.0.0.0:80");
 

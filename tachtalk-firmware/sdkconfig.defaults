@@ -37,6 +37,11 @@ CONFIG_HTTPD_MAX_REQ_HDR_LEN=4096
 CONFIG_MDNS_ENABLED=y
 CONFIG_MDNS_PREDEF_NETIF_STA=n
 
+# Don't fall back to offering our own IP as DNS server in DHCP replies when no
+# DNS offer is configured. Handing phones a DNS server (and default route)
+# makes them run captive-portal detection against us; clients use mDNS instead.
+CONFIG_LWIP_DHCPS_ADD_DNS=n
+
 # Increase max sockets for handling multiple concurrent connections
 # Default is 10, max is 16 per LWIP Kconfig
 CONFIG_LWIP_MAX_SOCKETS=16

@@ -8,6 +8,7 @@ use crate::State;
 use atomic_enum::atomic_enum;
 use esp_idf_hal::delay::FreeRtos;
 use esp_idf_svc::eventloop::EspSystemEventLoop;
+use esp_idf_svc::handle::RawHandle;
 use esp_idf_svc::ipv4::{
     self, ClientConfiguration as IpClientConfiguration, ClientSettings as IpClientSettings,
     Configuration as IpConfiguration, Ipv4Addr, Mask, Subnet,
@@ -71,19 +72,39 @@ fn create_sta_netif(config: &Config) -> Result<EspNetif> {
 }
 
 fn create_ap_netif(ap_ip: Ipv4Addr, ap_prefix_len: u8) -> Result<EspNetif> {
+    // Offer neither DNS nor a default route via DHCP: advertising ourselves as
+    // DNS/gateway makes phones run captive-portal ("walled garden") detection
+    // against us. Clients reach us via mDNS (tachtalk-test.local) instead.
+    // (`subnet.gateway` doubles as the AP's own IP, so it must stay set;
+    // CONFIG_LWIP_DHCPS_ADD_DNS=n suppresses the own-IP-as-DNS fallback.)
     let ap_router_config = ipv4::RouterConfiguration {
         subnet: ipv4::Subnet {
             gateway: ap_ip,
             mask: ipv4::Mask(ap_prefix_len),
         },
         dhcp_enabled: true,
-        dns: Some(ap_ip),
-        secondary_dns: Some(ap_ip),
+        dns: None,
+        secondary_dns: None,
     };
 
     let mut ap_netif_config = NetifConfiguration::wifi_default_router();
     ap_netif_config.ip_configuration = Some(ipv4::Configuration::Router(ap_router_config));
-    Ok(EspNetif::new_with_conf(&ap_netif_config)?)
+    let netif = EspNetif::new_with_conf(&ap_netif_config)?;
+
+    // The DHCP server still offers our IP as default router unless the
+    // OFFER_ROUTER flag is cleared; esp-idf-svc has no API for that.
+    let mut offer_router: u8 = 0;
+    esp_idf_svc::sys::esp!(unsafe {
+        esp_idf_svc::sys::esp_netif_dhcps_option(
+            netif.handle(),
+            esp_idf_svc::sys::esp_netif_dhcp_option_mode_t_ESP_NETIF_OP_SET,
+            esp_idf_svc::sys::esp_netif_dhcp_option_id_t_ESP_NETIF_ROUTER_SOLICITATION_ADDRESS,
+            std::ptr::from_mut(&mut offer_router).cast(),
+            u32::try_from(core::mem::size_of_val(&offer_router)).unwrap(),
+        )
+    })?;
+
+    Ok(netif)
 }
 
 fn start_wifi(

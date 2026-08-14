@@ -19,7 +19,6 @@ mod auth;
 mod config;
 mod controls;
 mod cpu_metrics;
-mod dns;
 mod error;
 mod heap_diag;
 
@@ -298,7 +297,6 @@ fn spawn_background_tasks(
     status_led_controller: status_leds::StatusLedController,
     encoder_driver: Option<esp_idf_hal::pcnt::PcntDriver<'static>>,
 ) -> Arc<State> {
-    let ap_hostname = ap_ssid.to_lowercase();
     let ap_ip = config.ap_ip;
 
     // Create all channels
@@ -320,9 +318,6 @@ fn spawn_background_tasks(
             status_led_tx,
         },
     ));
-
-    // Start DNS server for captive portal
-    dns::start_dns_server(ap_ip);
 
     // Start SSE server for PID value streaming (on port 81)
     {
@@ -443,13 +438,12 @@ fn spawn_background_tasks(
     // Start async HTTP server (blocks, so runs on its own thread)
     {
         let state = state.clone();
-        let ap_hostname = ap_hostname.clone();
         thread_util::spawn_named(
             c"http_srv",
             thread_util::stack_size(c"http_srv", 81920),
             SpiRam,
             move || {
-                web_server::start_server(&state, Some(ap_hostname), ap_ip);
+                web_server::start_server(&state, ap_ip);
             },
         );
     }

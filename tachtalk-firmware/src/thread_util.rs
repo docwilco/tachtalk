@@ -6,7 +6,7 @@
 //! before spawning.
 //!
 //! Stack sizes can be overridden at runtime via NVS (namespace `stack_cfg`).
-//! Each key is a task name (e.g. `dns_srv`, `sse_srv`) and the value is a
+//! Each key is a task name (e.g. `sse_srv`, `dongle`) and the value is a
 //! `u32` stack size in bytes. Call [`load_stack_overrides`] once after NVS
 //! init. The override replaces the compiled default entirely.
 
@@ -51,7 +51,6 @@ static STACK_OVERRIDES: Mutex<Option<HashMap<String, usize>>> = Mutex::new(None)
 /// Task names that we look up in NVS. Must match the `c"..."` names passed to
 /// `spawn_named` / `spawn_named_on_core` (without the null terminator).
 const TASK_NAMES: &[&str] = &[
-    "dns_srv",
     "sse_srv",
     "dongle",
     "cache_mgr",

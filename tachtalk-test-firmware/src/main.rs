@@ -6,7 +6,6 @@ use thread_util::StackMemory::{Internal, Spiram};
 
 /// Firmware variant identifier for OTA: "regular" or "test"
 pub const FIRMWARE_VARIANT: &str = "test";
-use esp_idf_svc::ipv4::Ipv4Addr;
 use esp_idf_svc::mdns::EspMdns;
 use esp_idf_svc::nvs::EspDefaultNvsPartition;
 use esp_idf_svc::wifi::EspWifi;
@@ -19,7 +18,6 @@ use std::time::Duration;
 
 mod config;
 mod cpu_metrics;
-mod dns;
 mod error;
 mod obd2;
 mod ota;
@@ -208,12 +206,7 @@ fn spawn_background_tasks(
     status_led_rx: std::sync::mpsc::Receiver<StatusLedMessage>,
     status_led_controller: StatusLedController,
     status_led_flicker_ms: u16,
-    ap_hostname: String,
-    ap_ip: Ipv4Addr,
 ) {
-    // Start DNS server for captive portal
-    dns::start_dns_server(ap_ip);
-
     // Start SSE server for metrics streaming (on port 81)
     {
         let state = state.clone();
@@ -234,7 +227,7 @@ fn spawn_background_tasks(
     {
         let state = state.clone();
         thread_util::spawn_named(c"web_srv", 8192, Spiram, move || {
-            if let Err(e) = web_server::start_server(&state, Some(&ap_hostname), ap_ip) {
+            if let Err(e) = web_server::start_server(&state) {
                 error!("Web server error: {e:?}");
             }
         });
@@ -367,9 +360,6 @@ fn main() -> Result<()> {
     let config = init_logging_and_config(nvs.clone())?;
     let (wifi, ap_ssid) = init_wifi(&config, peripherals.modem, sys_loop, nvs)?;
 
-    let ap_hostname = ap_ssid.to_lowercase();
-    let ap_ip = config.ap_ip;
-
     // Create channels
     let (sse_tx, sse_rx) = std::sync::mpsc::channel();
     let (test_control_tx, test_control_rx) = std::sync::mpsc::channel();
@@ -402,8 +392,6 @@ fn main() -> Result<()> {
         status_led_rx,
         status_led_controller,
         status_led_flicker_ms,
-        ap_hostname,
-        ap_ip,
     );
 
     // Start mDNS for local discovery
