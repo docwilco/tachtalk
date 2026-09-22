@@ -1949,14 +1949,14 @@ dependencies = [
 
 [[package]]
 name = "tachtalk-benchmark-client"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "clap",
 ]
 
 [[package]]
 name = "tachtalk-capture-decode"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "clap",
  "tachtalk-capture-format",
@@ -1964,18 +1964,18 @@ dependencies = [
 
 [[package]]
 name = "tachtalk-capture-format"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "deku",
 ]
 
 [[package]]
 name = "tachtalk-elm327-lib"
-version = "0.3.0"
+version = "0.3.1"
 
 [[package]]
 name = "tachtalk-firmware"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "atomic_enum",
  "cookie",
@@ -2008,7 +2008,7 @@ dependencies = [
 
 [[package]]
 name = "tachtalk-mock-elm327-server"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "clap",
  "tachtalk-elm327-lib",
@@ -2016,7 +2016,7 @@ dependencies = [
 
 [[package]]
 name = "tachtalk-shift-lights-lib"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "num-integer",
  "rgb",
@@ -2026,7 +2026,7 @@ dependencies = [
 
 [[package]]
 name = "tachtalk-test-firmware"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "atomic_enum",
  "derive_more",
