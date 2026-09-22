@@ -544,6 +544,16 @@ pub struct Config {
     /// Duration (ms) to show `preview_value` after brightness/profile change
     #[serde(default = "default_preview_duration_ms")]
     pub preview_duration_ms: u16,
+    /// Continuously re-send rev strip LED frames at this rate in Hz
+    /// (0 = event-driven only). Bounds how long an EMI-induced glitch on the
+    /// strip stays visible: at most one frame period.
+    #[serde(default)]
+    pub led_stream_hz: u16,
+    /// Rev strip data pin drive strength in mA (5, 10, 20, or 40).
+    /// Higher drive lowers the pin's output impedance, so induced noise
+    /// produces a smaller voltage excursion on the data line.
+    #[serde(default = "default_led_drive_ma")]
+    pub led_drive_ma: u8,
 }
 
 const fn default_led_gpio() -> u8 {
@@ -592,6 +602,10 @@ const fn default_brightness() -> u8 {
 
 const fn default_preview_duration_ms() -> u16 {
     500
+}
+
+const fn default_led_drive_ma() -> u8 {
+    20
 }
 
 const fn default_encoder_accel_2x_ms() -> u16 {
@@ -802,6 +816,12 @@ fn default_profiles() -> Vec<LedProfile> {
 /// Maximum OBD2 timeout to avoid triggering watchdog in dongle task
 pub const MAX_OBD2_TIMEOUT_MS: u64 = 4500;
 
+/// Maximum LED stream rate. 1 kHz is the FreeRTOS tick granularity
+/// (`CONFIG_FREERTOS_HZ=1000`) and leaves a ~640 µs inter-frame gap for a
+/// 12-LED strip — comfortably above the ≥280 µs latch some WS2812B
+/// revisions need.
+pub const MAX_LED_STREAM_HZ: u16 = 1000;
+
 const fn default_obd2_timeout_ms() -> u64 {
     MAX_OBD2_TIMEOUT_MS
 }
@@ -836,6 +856,8 @@ impl Default for Config {
             status_led_flicker_ms: default_status_led_flicker_ms(),
             rpm_stale_timeout_ms: default_rpm_stale_timeout_ms(),
             preview_duration_ms: default_preview_duration_ms(),
+            led_stream_hz: 0,
+            led_drive_ma: default_led_drive_ma(),
         }
     }
 }
@@ -918,6 +940,21 @@ impl Config {
         if self.ip.ip.is_empty() {
             warn!("Static IP is empty, resetting to default");
             self.ip.ip = default_static_ip();
+        }
+        if self.led_stream_hz > MAX_LED_STREAM_HZ {
+            warn!(
+                "Clamping led_stream_hz from {} to {}",
+                self.led_stream_hz, MAX_LED_STREAM_HZ
+            );
+            self.led_stream_hz = MAX_LED_STREAM_HZ;
+        }
+        if !matches!(self.led_drive_ma, 5 | 10 | 20 | 40) {
+            warn!(
+                "Invalid led_drive_ma {} (must be 5, 10, 20, or 40), resetting to {}",
+                self.led_drive_ma,
+                default_led_drive_ma()
+            );
+            self.led_drive_ma = default_led_drive_ma();
         }
         // Clamp capture buffer size (16KB - 6MB). Upper bound preserves
         // ~2MB of the 8MB PSRAM for TLS, WiFi, and heap allocations.

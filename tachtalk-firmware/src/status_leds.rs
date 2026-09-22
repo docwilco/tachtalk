@@ -200,8 +200,11 @@ impl StatusLedController {
             esp_idf_svc::sys::gpio_reset_pin(i32::from(pin));
         }
         let led_pin = unsafe { esp_idf_hal::gpio::AnyIOPin::new(i32::from(pin)) };
-        // Extra memory blocks buffer against WiFi interrupting the RMT
-        // (see led_display.rs); 3 LEDs × 24 items fit easily in 2 blocks.
+        // RMT TX memory partition — keep in sync with led_display.rs, which
+        // documents the ESP32-S3 block layout and the overlap hazard:
+        //   rev strip  = channel 0, blocks 0-1
+        //   status     = channel 2, blocks 2-3
+        // 3 LEDs × 24 symbols = 72 > 48, so two blocks are required.
         let config = TransmitConfig::new().clock_divider(1).mem_block_num(2);
         let tx_driver = TxRmtDriver::new(rmt_channel, led_pin, &config)?;
         Ok(Ws2812Esp32Rmt::new_with_rmt_driver(tx_driver)?)

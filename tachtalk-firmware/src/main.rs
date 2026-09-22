@@ -219,13 +219,18 @@ fn init_logging_and_config(nvs: EspDefaultNvsPartition) -> Result<Config> {
     Ok(config)
 }
 
-/// Initialize LED controller with GPIO from config
+/// Initialize the rev-strip LED controller.
+///
+/// Must be called from a task pinned to Core 1, not from `main`: the RMT
+/// driver's refill interrupt is allocated on the core that installs the
+/// driver, and Core 0 services WiFi, whose interrupt load can starve the
+/// refill ISR mid-frame and glitch the strip.
 fn init_led_controller<C: esp_idf_hal::rmt::RmtChannel>(
-    config: &Config,
+    led_gpio: u8,
+    brightness: u8,
+    drive_ma: u8,
     rmt_channel: impl esp_idf_hal::peripheral::Peripheral<P = C> + 'static,
 ) -> Result<LedController> {
-    let led_gpio = config.led_gpio;
-    let brightness = config.brightness;
     info!("Initializing LED controller on GPIO {led_gpio} with brightness {brightness}...");
 
     // Reset the GPIO pin to clear any residual RMT configuration from previous boot
@@ -236,7 +241,25 @@ fn init_led_controller<C: esp_idf_hal::rmt::RmtChannel>(
 
     // SAFETY: We trust the user-configured GPIO pin number is valid for this board
     let led_pin = unsafe { AnyIOPin::new(i32::from(led_gpio)) };
-    LedController::new(led_pin, rmt_channel, brightness)
+    let controller = LedController::new(led_pin, rmt_channel, brightness)?;
+
+    // Apply pad drive strength last so the RMT pin setup can't reset it.
+    // Config::validate() guarantees drive_ma is one of 5/10/20/40.
+    let cap = match drive_ma {
+        5 => esp_idf_svc::sys::gpio_drive_cap_t_GPIO_DRIVE_CAP_0,
+        10 => esp_idf_svc::sys::gpio_drive_cap_t_GPIO_DRIVE_CAP_1,
+        40 => esp_idf_svc::sys::gpio_drive_cap_t_GPIO_DRIVE_CAP_3,
+        _ => esp_idf_svc::sys::gpio_drive_cap_t_GPIO_DRIVE_CAP_2, // 20 mA, chip default
+    };
+    // SAFETY: We trust the user-configured GPIO pin number is valid for this board
+    let err = unsafe { esp_idf_svc::sys::gpio_set_drive_capability(i32::from(led_gpio), cap) };
+    if err == esp_idf_svc::sys::ESP_OK {
+        info!("LED data pin drive strength set to {drive_ma} mA");
+    } else {
+        warn!("Failed to set LED data pin drive strength ({drive_ma} mA): esp_err {err}");
+    }
+
+    Ok(controller)
 }
 
 /// Initialize the rotary encoder if configured (both pins must be non-zero).
@@ -293,8 +316,8 @@ fn spawn_background_tasks(
     config: Config,
     wifi: EspWifi<'static>,
     ap_ssid: String,
-    led_controller: LedController,
-    status_led_controller: status_leds::StatusLedController,
+    rev_rmt: esp_idf_hal::rmt::CHANNEL0,
+    status_rmt: esp_idf_hal::rmt::CHANNEL2,
     encoder_driver: Option<esp_idf_hal::pcnt::PcntDriver<'static>>,
 ) -> Arc<State> {
     let ap_ip = config.ap_ip;
@@ -358,8 +381,10 @@ fn spawn_background_tasks(
         );
     }
 
-    // Start the LED display task
-    // Pin to Core 1 to avoid interference from WiFi (which runs on Core 0)
+    // Start the LED display task.
+    // Pinned to Core 1, and the RMT driver is constructed inside the task so
+    // its refill ISR is allocated there too, away from WiFi on Core 0 (see
+    // init_led_controller).
     {
         let state = state.clone();
         thread_util::spawn_named_on_core(
@@ -368,7 +393,17 @@ fn spawn_background_tasks(
             thread_util::stack_size(c"led_disp", 4096),
             Internal,
             move || {
-                led_display_task(&state, led_controller, led_rx);
+                let (led_gpio, brightness, drive_ma) = {
+                    let cfg = state.config.lock().unwrap();
+                    (cfg.led_gpio, cfg.brightness, cfg.led_drive_ma)
+                };
+                match init_led_controller(led_gpio, brightness, drive_ma, rev_rmt) {
+                    Ok(led_controller) => led_display_task(&state, led_controller, led_rx),
+                    // Don't propagate: a bad LED GPIO saved in NVS must not
+                    // reboot-loop the device — keep it up so the config can
+                    // be fixed via the web UI.
+                    Err(e) => error!("LED controller init failed, rev strip disabled: {e:?}"),
+                }
             },
         );
     }
@@ -403,15 +438,37 @@ fn spawn_background_tasks(
         );
     }
 
-    // Start status LED task
-    thread_util::spawn_named(
-        c"status_led",
-        thread_util::stack_size(c"status_led", 4096),
-        Internal,
-        move || {
-            status_leds::run_status_led_task(status_led_controller, &status_led_rx);
-        },
-    );
+    // Start status LED task.
+    // Pinned to Core 1 and constructing its RMT driver in-task for the same
+    // reason as the LED display task above.
+    {
+        let state = state.clone();
+        thread_util::spawn_named_on_core(
+            c"status_led",
+            esp_idf_hal::cpu::Core::Core1,
+            thread_util::stack_size(c"status_led", 4096),
+            Internal,
+            move || {
+                let (status_gpio, boot_gpio, brightness, flicker_ms) = {
+                    let cfg = state.config.lock().unwrap();
+                    (
+                        cfg.status_led_gpio,
+                        cfg.boot_led_gpio,
+                        cfg.status_led_brightness,
+                        cfg.status_led_flicker_ms,
+                    )
+                };
+                let controller = status_leds::StatusLedController::new(
+                    status_gpio,
+                    boot_gpio,
+                    brightness,
+                    flicker_ms,
+                    status_rmt,
+                );
+                status_leds::run_status_led_task(controller, &status_led_rx);
+            },
+        );
+    }
 
     // Start controls task (rotary encoder and/or buttons)
     {
@@ -482,24 +539,20 @@ fn main() -> Result<()> {
     let nvs = EspDefaultNvsPartition::take()?;
 
     let config = init_logging_and_config(nvs.clone())?;
-    let led_controller = init_led_controller(&config, peripherals.rmt.channel0)?;
-    let status_led_controller = status_leds::StatusLedController::new(
-        config.status_led_gpio,
-        config.boot_led_gpio,
-        config.status_led_brightness,
-        config.status_led_flicker_ms,
-        peripherals.rmt.channel1,
-    );
     let encoder_driver = init_encoder(&config, peripherals.pcnt0);
 
     let (wifi, ap_ssid) = init_wifi(&config, peripherals.modem, sys_loop, nvs)?;
 
+    // The LED RMT drivers are constructed inside their Core 1 tasks, not
+    // here: the RMT refill ISR lands on the core that installs the driver,
+    // and main runs on Core 0 with WiFi. Channel choice is part of the RMT
+    // memory partition — see led_display.rs / status_leds.rs.
     let state = spawn_background_tasks(
         config,
         wifi,
         ap_ssid,
-        led_controller,
-        status_led_controller,
+        peripherals.rmt.channel0,
+        peripherals.rmt.channel2,
         encoder_driver,
     );
 

@@ -1225,6 +1225,21 @@
                 <small style="color: #888;">How long to show preview_value after brightness/profile change</small>
             </div>
             <div class="form-group">
+                <label>LED Stream Rate (Hz):</label>
+                <input type="number" id="ledStreamHz" value="0" min="0" max="1000">
+                <small style="color: #888;">Continuously re-send LED frames so interference glitches vanish within one frame (0 = send only on change)</small>
+            </div>
+            <div class="form-group">
+                <label>LED Pin Drive Strength:</label>
+                <select id="ledDriveMa">
+                    <option value="5">5 mA</option>
+                    <option value="10">10 mA</option>
+                    <option value="20">20 mA (default)</option>
+                    <option value="40">40 mA</option>
+                </select>
+                <small style="color: #888;">Data pin output drive; higher = stiffer signal against interference (requires restart)</small>
+            </div>
+            <div class="form-group">
                 <label>Encoder Pin A:</label>
                 <input type="number" id="encoderPinA" value="0" min="0" max="48">
                 <small style="color: #888;">0 = disabled (requires restart)</small>
@@ -1672,6 +1687,8 @@
             { id: 'ledGpio', path: 'led_gpio', type: 'int', default: 'led_gpio' },
             { id: 'rpmStaleTimeoutMs', path: 'rpm_stale_timeout_ms', type: 'int', fallback: 0 },
             { id: 'previewDurationMs', path: 'preview_duration_ms', type: 'int', default: 'preview_duration_ms' },
+            { id: 'ledStreamHz', path: 'led_stream_hz', type: 'int', fallback: 0 },
+            { id: 'ledDriveMa', path: 'led_drive_ma', type: 'int', default: 'led_drive_ma' },
             { id: 'encoderPinA', path: 'encoder_pin_a', type: 'int', fallback: 0 },
             { id: 'encoderPinB', path: 'encoder_pin_b', type: 'int', fallback: 0 },
             { id: 'buttonPin', path: 'button_pin', type: 'int', fallback: 0 },
