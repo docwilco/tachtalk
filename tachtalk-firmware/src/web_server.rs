@@ -385,9 +385,7 @@ pub fn log_sockets() {
 
 #[allow(clippy::similar_names)]
 fn check_restart_needed(current: &Config, new: &Config) -> (SmallVec<u8, 4>, bool) {
-    // Drive strength is applied once at LED controller init, so changing it
-    // needs a restart like a pin change (but no GPIO reset).
-    let led_changed = current.led_gpio != new.led_gpio || current.led_drive_ma != new.led_drive_ma;
+    let led_changed = current.led_gpio != new.led_gpio;
     let encoder_a_changed = current.encoder_pin_a != new.encoder_pin_a;
     let encoder_b_changed = current.encoder_pin_b != new.encoder_pin_b;
     let button_changed = current.button_pin != new.button_pin;

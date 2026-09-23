@@ -26,7 +26,7 @@ use crate::sse_server::SseMessage;
 use crate::watchdog::WatchdogHandle;
 use crate::State;
 
-/// Default timeout when neither blinking nor streaming is active
+/// Default timeout when no blinking is active
 const DEFAULT_TIMEOUT_MS: u64 = 100;
 
 /// Get current wallclock time in milliseconds
@@ -187,19 +187,6 @@ fn stale_timeout_from_config(cfg: &Config) -> Option<Duration> {
     }
 }
 
-/// Convert `led_stream_hz` to a render interval in ms.
-/// Returns `None` when streaming is disabled (value 0).
-///
-/// When set, frames are re-sent at this rate even if nothing changed
-/// (all-off frames included), so EMI-induced glitches latched by the strip
-/// are overwritten within one interval.
-fn stream_interval_from_config(cfg: &Config) -> Option<u64> {
-    match u64::from(cfg.led_stream_hz) {
-        0 => None,
-        hz => Some((1000 / hz).max(1)),
-    }
-}
-
 /// (`main_profile`, overlays) baked rules ready for rendering.
 type BakedProfiles = (Option<(u8, BakedLedRules)>, Vec<(u8, BakedLedRules)>);
 
@@ -213,8 +200,6 @@ struct LedDisplayTaskState {
     /// When set, use `preview_value` override until this timestamp (ms)
     preview_override_until: Option<u64>,
     blink_interval_ms: Option<u64>,
-    /// Continuous re-send interval (ms); `None` = event-driven only
-    stream_interval_ms: Option<u64>,
     /// Baked rules for active normal profile: (pid, baked)
     main_baked: Option<(u8, BakedLedRules)>,
     /// Baked rules for overlay profiles: [(pid, baked), ...]
@@ -231,7 +216,6 @@ impl LedDisplayTaskState {
             last_blink_on: None,
             preview_override_until: None,
             blink_interval_ms: compute_blink_interval(cfg, triggered_enabled),
-            stream_interval_ms: stream_interval_from_config(cfg),
             main_baked,
             overlay_baked,
             stale_timeout: stale_timeout_from_config(cfg),
@@ -266,7 +250,6 @@ impl LedDisplayTaskState {
     /// Reload blink interval, baked rules, and stale timeout from config.
     fn reload_config(&mut self, cfg: &Config, triggered_enabled: &[bool]) {
         self.blink_interval_ms = compute_blink_interval(cfg, triggered_enabled);
-        self.stream_interval_ms = stream_interval_from_config(cfg);
         let (main_baked, overlay_baked) = Self::bake_profiles(cfg, triggered_enabled);
         self.main_baked = main_baked;
         self.overlay_baked = overlay_baked;
@@ -276,13 +259,11 @@ impl LedDisplayTaskState {
 
     /// Compute the receive timeout and whether to render on timeout.
     fn compute_timeout(&self) -> (Duration, bool) {
-        let blink_ms = self.blink_interval_ms.map(time_until_next_deadline);
-        let stream_ms = self.stream_interval_ms.map(time_until_next_deadline);
-        let (timeout_ms, should_render_on_timeout) = match (blink_ms, stream_ms) {
-            (Some(b), Some(s)) => (b.min(s), true),
-            (Some(ms), None) | (None, Some(ms)) => (ms, true),
-            (None, None) => (DEFAULT_TIMEOUT_MS, false),
-        };
+        let (timeout_ms, should_render_on_timeout) =
+            match self.blink_interval_ms.map(time_until_next_deadline) {
+                Some(blink_ms) => (blink_ms, true),
+                None => (DEFAULT_TIMEOUT_MS, false),
+            };
 
         // Also consider staleness deadlines for all tracked PIDs
         let timeout_ms = if let Some(stale_dur) = self.stale_timeout {

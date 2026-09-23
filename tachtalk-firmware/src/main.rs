@@ -228,7 +228,6 @@ fn init_logging_and_config(nvs: EspDefaultNvsPartition) -> Result<Config> {
 fn init_led_controller<C: esp_idf_hal::rmt::RmtChannel>(
     led_gpio: u8,
     brightness: u8,
-    drive_ma: u8,
     rmt_channel: impl esp_idf_hal::peripheral::Peripheral<P = C> + 'static,
 ) -> Result<LedController> {
     info!("Initializing LED controller on GPIO {led_gpio} with brightness {brightness}...");
@@ -241,25 +240,7 @@ fn init_led_controller<C: esp_idf_hal::rmt::RmtChannel>(
 
     // SAFETY: We trust the user-configured GPIO pin number is valid for this board
     let led_pin = unsafe { AnyIOPin::new(i32::from(led_gpio)) };
-    let controller = LedController::new(led_pin, rmt_channel, brightness)?;
-
-    // Apply pad drive strength last so the RMT pin setup can't reset it.
-    // Config::validate() guarantees drive_ma is one of 5/10/20/40.
-    let cap = match drive_ma {
-        5 => esp_idf_svc::sys::gpio_drive_cap_t_GPIO_DRIVE_CAP_0,
-        10 => esp_idf_svc::sys::gpio_drive_cap_t_GPIO_DRIVE_CAP_1,
-        40 => esp_idf_svc::sys::gpio_drive_cap_t_GPIO_DRIVE_CAP_3,
-        _ => esp_idf_svc::sys::gpio_drive_cap_t_GPIO_DRIVE_CAP_2, // 20 mA, chip default
-    };
-    // SAFETY: We trust the user-configured GPIO pin number is valid for this board
-    let err = unsafe { esp_idf_svc::sys::gpio_set_drive_capability(i32::from(led_gpio), cap) };
-    if err == esp_idf_svc::sys::ESP_OK {
-        info!("LED data pin drive strength set to {drive_ma} mA");
-    } else {
-        warn!("Failed to set LED data pin drive strength ({drive_ma} mA): esp_err {err}");
-    }
-
-    Ok(controller)
+    LedController::new(led_pin, rmt_channel, brightness)
 }
 
 /// Initialize the rotary encoder if configured (both pins must be non-zero).
@@ -393,11 +374,11 @@ fn spawn_background_tasks(
             thread_util::stack_size(c"led_disp", 4096),
             Internal,
             move || {
-                let (led_gpio, brightness, drive_ma) = {
+                let (led_gpio, brightness) = {
                     let cfg = state.config.lock().unwrap();
-                    (cfg.led_gpio, cfg.brightness, cfg.led_drive_ma)
+                    (cfg.led_gpio, cfg.brightness)
                 };
-                match init_led_controller(led_gpio, brightness, drive_ma, rev_rmt) {
+                match init_led_controller(led_gpio, brightness, rev_rmt) {
                     Ok(led_controller) => led_display_task(&state, led_controller, led_rx),
                     // Don't propagate: a bad LED GPIO saved in NVS must not
                     // reboot-loop the device — keep it up so the config can
