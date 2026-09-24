@@ -62,7 +62,7 @@ rsync -r --checksum --delete \
 # ---------- clippy: host crates ----------
 step "clippy (host crates)"
 if ! (cd "$staged_dir" && cargo clippy --all-targets --all-features \
-        --workspace --exclude tachtalk-firmware --exclude tachtalk-test-firmware \
+        --workspace --exclude tachtalk-firmware \
         -- -W clippy::pedantic -D warnings); then
     fail "clippy (host crates)"
 fi
@@ -74,17 +74,10 @@ if ! (cd "$staged_dir/tachtalk-firmware" && cargo clippy --all-targets --all-fea
     fail "clippy (tachtalk-firmware)"
 fi
 
-# ---------- clippy: tachtalk-test-firmware ----------
-step "clippy (tachtalk-test-firmware)"
-if ! (cd "$staged_dir/tachtalk-test-firmware" && cargo clippy --all-targets --all-features \
-        -- -W clippy::pedantic -D warnings); then
-    fail "clippy (tachtalk-test-firmware)"
-fi
-
 # ---------- tests: host crates ----------
 step "cargo test (host crates)"
 if ! (cd "$staged_dir" && cargo test --all-features \
-        --workspace --exclude tachtalk-firmware --exclude tachtalk-test-firmware); then
+        --workspace --exclude tachtalk-firmware); then
     fail "cargo test (host crates)"
 fi
 

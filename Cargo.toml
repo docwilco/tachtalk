@@ -8,7 +8,6 @@ members = [
     "tachtalk-shift-lights-lib",
     "tachtalk-firmware",
     "tachtalk-mock-elm327-server",
-    "tachtalk-test-firmware",
 ]
 
 [workspace.package]

@@ -1328,13 +1328,6 @@
                         <select id="otaVersionSelect"></select>
                     </div>
                     <div class="form-group">
-                        <label>Variant:</label>
-                        <select id="otaVariantSelect">
-                            <option value="regular">Regular</option>
-                            <option value="test">Test</option>
-                        </select>
-                    </div>
-                    <div class="form-group">
                         <label style="width: auto;">
                             <input type="checkbox" id="otaShowPrerelease" onchange="otaFilterReleases()">
                             Show pre-releases
@@ -3270,8 +3263,6 @@
                 const info = await resp.json();
                 document.getElementById('otaCurrentVersion').textContent = info.version;
                 document.getElementById('otaCurrentVariant').textContent = info.variant;
-                // Default the variant selector to whatever is currently running
-                document.getElementById('otaVariantSelect').value = info.variant;
             } catch (e) {
                 document.getElementById('otaCurrentVersion').textContent = '(error)';
             }
@@ -3325,31 +3316,27 @@
             }
         }
 
-        function otaFindAsset(tagName, variant) {
+        function otaFindAsset(tagName) {
             const release = otaReleases.find(r => r.tag_name === tagName);
             if (!release) return null;
-            const prefix = variant === 'test' ? 'tachtalk-test-firmware-' : 'tachtalk-firmware-';
-            return release.assets.find(a => a.name === prefix + tagName + '.bin') || null;
+            return release.assets.find(a => a.name === 'tachtalk-firmware-' + tagName + '.bin') || null;
         }
 
         async function otaStartUpdate() {
             const tag = document.getElementById('otaVersionSelect').value;
-            const variant = document.getElementById('otaVariantSelect').value;
-            const asset = otaFindAsset(tag, variant);
+            const asset = otaFindAsset(tag);
             const statusEl = document.getElementById('otaStatus');
             const progressEl = document.getElementById('otaProgress');
             const barEl = document.getElementById('otaProgressBar');
 
             if (!asset) {
                 statusEl.className = 'ota-status error';
-                statusEl.textContent = 'No firmware binary found for ' + variant + ' ' + tag;
+                statusEl.textContent = 'No firmware binary found for ' + tag;
                 statusEl.style.display = 'block';
                 return;
             }
 
-            const currentVariant = document.getElementById('otaCurrentVariant').textContent;
-            const msg = 'Flash ' + variant + ' firmware ' + tag + ' (' + (asset.size / 1024).toFixed(0) + ' KB)?'
-                + (variant !== currentVariant ? '\n\nWarning: you are switching from ' + currentVariant + ' to ' + variant + ' firmware!' : '')
+            const msg = 'Flash firmware ' + tag + ' (' + (asset.size / 1024).toFixed(0) + ' KB)?'
                 + '\n\nThe device will reboot after the update.';
             if (!confirm(msg)) return;
 
