@@ -1,3 +1,5 @@
+> **Historical document** — this plan was executed; `tachtalk-test-firmware`, referenced below, was removed afterwards (2026-09-24, #7).
+
 # Plan: Profile-Driven LED Display with PID Binding
 
 ## TL;DR

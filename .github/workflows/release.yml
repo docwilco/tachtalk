@@ -61,11 +61,11 @@ jobs:
           restore-keys: |
             espressif-
 
-      - name: Build regular firmware
+      - name: Build firmware
         working-directory: tachtalk-firmware
         run: cargo build --release
 
-      - name: Convert to binary images
+      - name: Convert to binary image
         if: startsWith(github.ref, 'refs/tags/')
         run: |
           espflash save-image --chip esp32s3 --flash-size 16mb \

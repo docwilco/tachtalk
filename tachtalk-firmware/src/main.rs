@@ -4,7 +4,9 @@ use esp_idf_hal::gpio::AnyIOPin;
 use esp_idf_hal::prelude::*;
 use esp_idf_svc::eventloop::EspSystemEventLoop;
 
-/// Firmware variant identifier for OTA: "regular" or "test"
+/// Firmware variant identifier reported via OTA info. Only "regular"
+/// exists since the test firmware's removal; kept so the web UI can spot
+/// an old test build still running on a device.
 pub const FIRMWARE_VARIANT: &str = "regular";
 use esp_idf_svc::mdns::EspMdns;
 use esp_idf_svc::nvs::EspDefaultNvsPartition;
