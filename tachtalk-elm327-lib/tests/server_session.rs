@@ -212,14 +212,14 @@ fn non_repeat_commands_pass_through_expansion_unchanged() {
 }
 
 #[test]
-fn format_message_uses_the_current_line_ending() {
+fn format_line_uses_the_current_line_ending() {
     let mut session = firmware_session();
     assert_eq!(
-        session.format_message("UNABLE TO CONNECT"),
+        session.format_line("UNABLE TO CONNECT"),
         b"\r\nUNABLE TO CONNECT\r\n>"
     );
     let _ = session.feed(b"ATL0\r");
-    assert_eq!(session.format_message("?"), b"\r?\r>");
+    assert_eq!(session.format_line("?"), b"\r?\r>");
 }
 
 #[test]

@@ -35,7 +35,8 @@ pub enum Action {
     Send(Vec<u8>),
     /// An AT command was handled internally; its response is already
     /// emitted as [`Action::Send`]. Carries the command as received
-    /// (trimmed, original case) so the adapter can log it.
+    /// (trimmed, original case) so the adapter can log it; the firmware
+    /// logs it uppercased, so its adapter must uppercase.
     At(String),
     /// A non-AT command for the adapter to answer. `command` is the
     /// trimmed line; `raw` is the framed bytes as received (untrimmed,
@@ -140,6 +141,9 @@ impl ServerSession {
     /// Expand the invented `1` repeat command against the last recorded
     /// OBD command. Call after any adapter-side gating (the firmware
     /// checks readiness before expanding), and before forwarding.
+    ///
+    /// Transitional: `1` is not ELM327 (see ADR 0001) and this method
+    /// leaves with the datasheet bare-CR repeat spec fix (#23).
     #[must_use]
     pub fn expand_repeat(&self, command: &str, raw: &[u8]) -> RepeatExpansion {
         if command == "1" {
@@ -148,7 +152,7 @@ impl ServerSession {
                     command: last.clone(),
                     raw: last.as_bytes().to_vec(),
                 },
-                None => RepeatExpansion::NoLastCommand(self.format_message("?")),
+                None => RepeatExpansion::NoLastCommand(self.format_line("?")),
             }
         } else {
             RepeatExpansion::Command {
@@ -158,11 +162,11 @@ impl ServerSession {
         }
     }
 
-    /// Format a message line with the current line ending and prompt:
+    /// Format a text line with the current line ending and prompt:
     /// `{le}{text}{le}>`. This is how the adapter formats rejections
     /// (`UNABLE TO CONNECT`, `?`, dongle error strings).
     #[must_use]
-    pub fn format_message(&self, text: &str) -> Vec<u8> {
+    pub fn format_line(&self, text: &str) -> Vec<u8> {
         let le = self.state.line_ending();
         format!("{le}{text}{le}>").into_bytes()
     }

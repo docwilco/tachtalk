@@ -109,8 +109,8 @@ impl ClientState {
         server_session::handle_at_command(self, &Identity::default(), command)
     }
 
-    /// Override this to provide a custom device description for AT@1
-    /// Default implementation returns generic ELM327
+    /// The generic ELM327 device description response for AT@1.
+    /// `ServerSession` answers AT@1 from its `Identity` instead.
     #[must_use]
     pub fn device_description(&self) -> String {
         let le = self.line_ending();
