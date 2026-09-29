@@ -78,6 +78,25 @@ fn rate_limit_wait(min_interval: Option<Duration>, last_response_time: Option<In
     }
 }
 
+/// Stamp the response time, log TX, and write the response to the client;
+/// an `Err` is a dead socket and ends the connection.
+fn send_response(
+    stream: &mut TcpStream,
+    quiet: bool,
+    response: &[u8],
+    last_response_time: &mut Option<Instant>,
+) -> Result<(), ()> {
+    *last_response_time = Some(Instant::now());
+    if !quiet {
+        println!("TX: {}", String::from_utf8_lossy(response).escape_debug());
+    }
+    if let Err(e) = stream.write_all(response) {
+        eprintln!("Write error: {e}");
+        return Err(());
+    }
+    Ok(())
+}
+
 fn handle_client(
     mut stream: TcpStream,
     quiet: bool,
@@ -112,28 +131,26 @@ fn handle_client(
                             let Some(Action::Send(response)) = actions.next() else {
                                 unreachable!("Action::At is always followed by its response Send");
                             };
-                            last_response_time = Some(Instant::now());
-                            if !quiet {
-                                let response = String::from_utf8_lossy(&response);
-                                println!("TX: {}", response.escape_debug());
-                            }
-                            if let Err(e) = stream.write_all(&response) {
-                                eprintln!("Write error: {e}");
+                            if send_response(&mut stream, quiet, &response, &mut last_response_time)
+                                .is_err()
+                            {
                                 break 'connection;
                             }
                         }
-                        Action::Obd { command, .. } => {
+                        Action::Obd { command, raw } => {
                             if !quiet {
                                 println!("RX: {}", command.to_uppercase());
                             }
                             rate_limit_wait(min_interval, last_response_time);
-                            let response = respond_obd(&mut session, &command, &start_time);
-                            last_response_time = Some(Instant::now());
-                            if !quiet {
-                                println!("TX: {}", response.escape_debug());
-                            }
-                            if let Err(e) = stream.write_all(response.as_bytes()) {
-                                eprintln!("Write error: {e}");
+                            let response = respond_obd(&mut session, &command, &raw, &start_time);
+                            if send_response(
+                                &mut stream,
+                                quiet,
+                                response.as_bytes(),
+                                &mut last_response_time,
+                            )
+                            .is_err()
+                            {
                                 break 'connection;
                             }
                         }
@@ -276,14 +293,20 @@ fn get_pid_response(pid: &str, start_time: &Instant) -> Option<String> {
 
 /// Answer a non-AT command ([`Action::Obd`]): repeat expansion, PID
 /// dispatch, and response formatting against the session's settings.
-/// Returns the full wire response including line endings and prompt.
-fn respond_obd(session: &mut ServerSession, command: &str, start_time: &Instant) -> String {
+/// `raw` is the untrimmed line the action carried. Returns the full wire
+/// response including line endings and prompt.
+fn respond_obd(
+    session: &mut ServerSession,
+    command: &str,
+    raw: &[u8],
+    start_time: &Instant,
+) -> String {
     let le = session.state().line_ending();
 
     // Expand the invented "1" repeat (transitional; leaves with #23). The
     // mock's no-last-command reply keeps its historical byte shape
     // (`?{le}{le}>`), not the firmware-shaped bytes the expansion carries.
-    let effective_cmd = match session.expand_repeat(command, command.as_bytes()) {
+    let effective_cmd = match session.expand_repeat(command, raw) {
         RepeatExpansion::Command { command, .. } => command,
         RepeatExpansion::NoLastCommand(_) => return format!("?{le}{le}>"),
     };
@@ -393,6 +416,11 @@ mod tests {
         ServerSession::new(identity())
     }
 
+    /// [`respond_obd`] for a trimmed command whose raw bytes are itself.
+    fn obd(session: &mut ServerSession, command: &str, start: &Instant) -> String {
+        respond_obd(session, command, command.as_bytes(), start)
+    }
+
     /// Feed one full AT command line and return its response bytes,
     /// skipping echo `Send`s (the response is the `Send` after `At`).
     fn at_response(session: &mut ServerSession, line: &[u8]) -> Vec<u8> {
@@ -435,10 +463,7 @@ mod tests {
     fn static_pid_with_response_count() {
         let mut session = session();
         let start = Instant::now();
-        assert_eq!(
-            respond_obd(&mut session, "0104 1", &start),
-            "41 04 64\r\n\r\n>"
-        );
+        assert_eq!(obd(&mut session, "0104 1", &start), "41 04 64\r\n\r\n>");
     }
 
     #[test]
@@ -446,7 +471,7 @@ mod tests {
         let mut session = session();
         let start = Instant::now();
         assert_eq!(
-            respond_obd(&mut session, "010420 1", &start),
+            obd(&mut session, "010420 1", &start),
             "41 04 64 20 80 00 00 01\r\n\r\n>"
         );
     }
@@ -455,7 +480,7 @@ mod tests {
     fn lowercase_pid_is_dispatched() {
         let mut session = session();
         let start = Instant::now();
-        let response = respond_obd(&mut session, "010c 1", &start);
+        let response = obd(&mut session, "010c 1", &start);
         assert!(response.starts_with("41 0C "), "got {response:?}");
         assert!(response.ends_with("\r\n\r\n>"), "got {response:?}");
     }
@@ -464,7 +489,7 @@ mod tests {
     fn mode_03_stored_dtcs() {
         let mut session = session();
         let start = Instant::now();
-        assert_eq!(respond_obd(&mut session, "03", &start), "43 00\r\n\r\n>");
+        assert_eq!(obd(&mut session, "03", &start), "43 00\r\n\r\n>");
     }
 
     #[test]
@@ -472,7 +497,7 @@ mod tests {
         let mut session = session();
         let start = Instant::now();
         assert_eq!(
-            respond_obd(&mut session, "0902", &start),
+            obd(&mut session, "0902", &start),
             "49 02 13 45 50 34 35 36 37 38 39 30\r\n\r\n>"
         );
     }
@@ -481,44 +506,41 @@ mod tests {
     fn unknown_pid_is_no_data() {
         let mut session = session();
         let start = Instant::now();
-        assert_eq!(
-            respond_obd(&mut session, "0199 1", &start),
-            "NO DATA\r\n\r\n>"
-        );
+        assert_eq!(obd(&mut session, "0199 1", &start), "NO DATA\r\n\r\n>");
     }
 
     #[test]
     fn unknown_command_is_question_mark() {
         let mut session = session();
         let start = Instant::now();
-        assert_eq!(respond_obd(&mut session, "FF", &start), "?\r\n\r\n>");
+        assert_eq!(obd(&mut session, "FF", &start), "?\r\n\r\n>");
     }
 
     #[test]
     fn repeat_replays_last_successful_command() {
         let mut session = session();
         let start = Instant::now();
-        respond_obd(&mut session, "0104 1", &start);
-        assert_eq!(respond_obd(&mut session, "1", &start), "41 04 64\r\n\r\n>");
+        obd(&mut session, "0104 1", &start);
+        assert_eq!(obd(&mut session, "1", &start), "41 04 64\r\n\r\n>");
         // A repeat leaves the memory in place: it can repeat again.
-        assert_eq!(respond_obd(&mut session, "1", &start), "41 04 64\r\n\r\n>");
+        assert_eq!(obd(&mut session, "1", &start), "41 04 64\r\n\r\n>");
     }
 
     #[test]
     fn failed_commands_do_not_clobber_repeat_memory() {
         let mut session = session();
         let start = Instant::now();
-        respond_obd(&mut session, "0104 1", &start);
-        respond_obd(&mut session, "0199 1", &start); // NO DATA
-        respond_obd(&mut session, "FF", &start); // ?
-        assert_eq!(respond_obd(&mut session, "1", &start), "41 04 64\r\n\r\n>");
+        obd(&mut session, "0104 1", &start);
+        obd(&mut session, "0199 1", &start); // NO DATA
+        obd(&mut session, "FF", &start); // ?
+        assert_eq!(obd(&mut session, "1", &start), "41 04 64\r\n\r\n>");
     }
 
     #[test]
     fn repeat_without_last_command_is_question_mark() {
         let mut session = session();
         let start = Instant::now();
-        assert_eq!(respond_obd(&mut session, "1", &start), "?\r\n\r\n>");
+        assert_eq!(obd(&mut session, "1", &start), "?\r\n\r\n>");
     }
 
     #[test]
@@ -527,21 +549,15 @@ mod tests {
         let start = Instant::now();
 
         at_response(&mut session, b"ATL0\r");
-        assert_eq!(respond_obd(&mut session, "0104 1", &start), "41 04 64\r\r>");
+        assert_eq!(obd(&mut session, "0104 1", &start), "41 04 64\r\r>");
 
         at_response(&mut session, b"ATS0\r");
-        assert_eq!(respond_obd(&mut session, "0104 1", &start), "410464\r\r>");
+        assert_eq!(obd(&mut session, "0104 1", &start), "410464\r\r>");
 
         at_response(&mut session, b"ATH1\r");
-        assert_eq!(
-            respond_obd(&mut session, "0104 1", &start),
-            "7E803410464\r\r>"
-        );
+        assert_eq!(obd(&mut session, "0104 1", &start), "7E803410464\r\r>");
 
         at_response(&mut session, b"ATS1\r");
-        assert_eq!(
-            respond_obd(&mut session, "0104 1", &start),
-            "7E8 03 41 04 64\r\r>"
-        );
+        assert_eq!(obd(&mut session, "0104 1", &start), "7E8 03 41 04 64\r\r>");
     }
 }
