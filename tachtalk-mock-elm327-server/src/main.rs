@@ -6,7 +6,7 @@ use std::net::{TcpListener, TcpStream};
 use std::time::{Duration, Instant};
 
 use clap::Parser;
-use tachtalk_elm327_lib::ClientState;
+use tachtalk_elm327_lib::{Action, Identity, RepeatExpansion, ServerSession};
 
 /// Mock ELM327 OBD2 adapter for testing TachTalk proxy.
 ///
@@ -21,6 +21,15 @@ struct Args {
     /// Maximum requests per second (throttle responses to this rate)
     #[arg(short = 'm', long, value_name = "RPS")]
     max_rps: Option<f64>,
+}
+
+/// The mock's identity strings: the stock ATI banner, a mock-specific
+/// device description so clients can tell it from real hardware.
+fn identity() -> Identity {
+    Identity {
+        ati: "ELM327 v1.5".to_string(),
+        device_description: "Mock ELM327".to_string(),
+    }
 }
 
 fn main() {
@@ -59,66 +68,76 @@ fn main() {
     }
 }
 
+/// Sleep out the remainder of the rate-limit interval since the last
+/// response, if a limit is set.
+fn rate_limit_wait(min_interval: Option<Duration>, last_response_time: Option<Instant>) {
+    if let (Some(interval), Some(last_time)) = (min_interval, last_response_time) {
+        if let Some(remaining) = interval.checked_sub(last_time.elapsed()) {
+            std::thread::sleep(remaining);
+        }
+    }
+}
+
 fn handle_client(
     mut stream: TcpStream,
     quiet: bool,
     start_time: Instant,
     min_interval: Option<Duration>,
 ) {
-    let mut buffer = Vec::new();
+    let mut session = ServerSession::new(identity());
     let mut byte = [0u8; 1];
-    let mut state = ClientState::new();
     let mut last_response_time: Option<Instant> = None;
 
-    loop {
+    'connection: loop {
         match stream.read(&mut byte) {
             Ok(0) => {
                 println!("Client disconnected");
                 break;
             }
             Ok(_) => {
-                let ch = byte[0];
-
-                // Echo character if enabled
-                if state.echo_enabled && stream.write_all(&byte).is_err() {
-                    break;
-                }
-
-                // Carriage return terminates command
-                if ch == b'\r' {
-                    let command = String::from_utf8_lossy(&buffer).trim().to_uppercase();
-
-                    if !command.is_empty() {
-                        if !quiet {
-                            println!("RX: {command}");
-                        }
-
-                        // Rate limiting: wait if needed before responding
-                        if let (Some(interval), Some(last_time)) =
-                            (min_interval, last_response_time)
-                        {
-                            if let Some(remaining) = interval.checked_sub(last_time.elapsed()) {
-                                std::thread::sleep(remaining);
+                let mut actions = session.feed(&byte).into_iter();
+                while let Some(action) = actions.next() {
+                    match action {
+                        // A Send not claimed by the At arm below is echo.
+                        Action::Send(bytes) => {
+                            if stream.write_all(&bytes).is_err() {
+                                break 'connection;
                             }
                         }
-
-                        let response = process_command(&command, &start_time, &mut state);
-                        last_response_time = Some(Instant::now());
-
-                        if !quiet {
-                            println!("TX: {}", response.escape_debug());
+                        Action::At(command) => {
+                            if !quiet {
+                                println!("RX: {}", command.to_uppercase());
+                            }
+                            rate_limit_wait(min_interval, last_response_time);
+                            let Some(Action::Send(response)) = actions.next() else {
+                                unreachable!("Action::At is always followed by its response Send");
+                            };
+                            last_response_time = Some(Instant::now());
+                            if !quiet {
+                                let response = String::from_utf8_lossy(&response);
+                                println!("TX: {}", response.escape_debug());
+                            }
+                            if let Err(e) = stream.write_all(&response) {
+                                eprintln!("Write error: {e}");
+                                break 'connection;
+                            }
                         }
-
-                        if let Err(e) = stream.write_all(response.as_bytes()) {
-                            eprintln!("Write error: {e}");
-                            break;
+                        Action::Obd { command, .. } => {
+                            if !quiet {
+                                println!("RX: {}", command.to_uppercase());
+                            }
+                            rate_limit_wait(min_interval, last_response_time);
+                            let response = respond_obd(&mut session, &command, &start_time);
+                            last_response_time = Some(Instant::now());
+                            if !quiet {
+                                println!("TX: {}", response.escape_debug());
+                            }
+                            if let Err(e) = stream.write_all(response.as_bytes()) {
+                                eprintln!("Write error: {e}");
+                                break 'connection;
+                            }
                         }
                     }
-
-                    buffer.clear();
-                } else if ch != b'\n' {
-                    // Accumulate command (ignore linefeeds)
-                    buffer.push(ch);
                 }
             }
             Err(e) => {
@@ -255,26 +274,18 @@ fn get_pid_response(pid: &str, start_time: &Instant) -> Option<String> {
     }
 }
 
-fn process_command(cmd: &str, start_time: &Instant, state: &mut ClientState) -> String {
-    let le = state.line_ending();
+/// Answer a non-AT command ([`Action::Obd`]): repeat expansion, PID
+/// dispatch, and response formatting against the session's settings.
+/// Returns the full wire response including line endings and prompt.
+fn respond_obd(session: &mut ServerSession, command: &str, start_time: &Instant) -> String {
+    let le = session.state().line_ending();
 
-    // Handle AT commands using the shared library
-    if cmd.starts_with("AT") {
-        // Override AT@1 for mock server identification
-        if cmd == "AT@1" {
-            return format!("{le}Mock ELM327{le}>");
-        }
-        return state.handle_at_command(cmd);
-    }
-
-    // Handle repeat last command ("1" or empty after CR)
-    let effective_cmd = if cmd == "1" {
-        match &state.last_obd_command {
-            Some(last) => last.clone(),
-            None => return format!("?{le}{le}>"),
-        }
-    } else {
-        cmd.to_string()
+    // Expand the invented "1" repeat (transitional; leaves with #23). The
+    // mock's no-last-command reply keeps its historical byte shape
+    // (`?{le}{le}>`), not the firmware-shaped bytes the expansion carries.
+    let effective_cmd = match session.expand_repeat(command, command.as_bytes()) {
+        RepeatExpansion::Command { command, .. } => command,
+        RepeatExpansion::NoLastCommand(_) => return format!("?{le}{le}>"),
     };
 
     // Handle OBD2 commands
@@ -342,15 +353,16 @@ fn process_command(cmd: &str, start_time: &Instant, state: &mut ClientState) -> 
     match obd_response {
         Some(hex_data) => {
             // Store this command for repeat functionality (but not if it was already a repeat)
-            if cmd != "1" {
-                state.last_obd_command = Some(effective_cmd);
+            if command != "1" {
+                session.state_mut().last_obd_command = Some(effective_cmd);
             }
 
             // Format the hex data with spaces if enabled
-            let formatted_data = state.format_response(hex_data.as_bytes());
+            let formatted_data = session.format_data_response(hex_data.as_bytes());
             let formatted_str = String::from_utf8_lossy(&formatted_data);
 
             // Add header if enabled (7E8 is standard ECM response address)
+            let state = session.state();
             let response = if state.headers_enabled {
                 // With headers: "7E8 06 41 00 BE 3F A8 13" (header + length + data)
                 // Header is 3 hex chars, not split. Length is data bytes.
@@ -367,5 +379,169 @@ fn process_command(cmd: &str, start_time: &Instant, state: &mut ClientState) -> 
             format!("{response}{le}{le}>")
         }
         None => format!("?{le}{le}>"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Expected bytes come from a live capture of the pre-ServerSession
+    // mock (issue #21); the adaptation must not change the wire.
+
+    fn session() -> ServerSession {
+        ServerSession::new(identity())
+    }
+
+    /// Feed one full AT command line and return its response bytes,
+    /// skipping echo `Send`s (the response is the `Send` after `At`).
+    fn at_response(session: &mut ServerSession, line: &[u8]) -> Vec<u8> {
+        let mut actions = session.feed(line).into_iter();
+        while let Some(action) = actions.next() {
+            if let Action::At(_) = action {
+                let Some(Action::Send(response)) = actions.next() else {
+                    panic!("Action::At not followed by its response Send");
+                };
+                return response;
+            }
+        }
+        panic!("no AT action for {:?}", String::from_utf8_lossy(line));
+    }
+
+    #[test]
+    fn identity_ati_and_reset_banner() {
+        let mut session = session();
+        assert_eq!(at_response(&mut session, b"ATI\r"), b"\r\nELM327 v1.5\r\n>");
+        assert_eq!(at_response(&mut session, b"ATZ\r"), b"\r\nELM327 v1.5\r\n>");
+    }
+
+    #[test]
+    fn identity_device_description() {
+        let mut session = session();
+        assert_eq!(
+            at_response(&mut session, b"AT@1\r"),
+            b"\r\nMock ELM327\r\n>"
+        );
+        // The hand-rolled loop's AT@1 override missed the spaced spelling
+        // and answered the generic "ELM327"; identity via the constructor
+        // covers it (the divergence #21 retires).
+        assert_eq!(
+            at_response(&mut session, b"AT @1\r"),
+            b"\r\nMock ELM327\r\n>"
+        );
+    }
+
+    #[test]
+    fn static_pid_with_response_count() {
+        let mut session = session();
+        let start = Instant::now();
+        assert_eq!(
+            respond_obd(&mut session, "0104 1", &start),
+            "41 04 64\r\n\r\n>"
+        );
+    }
+
+    #[test]
+    fn multi_pid_request() {
+        let mut session = session();
+        let start = Instant::now();
+        assert_eq!(
+            respond_obd(&mut session, "010420 1", &start),
+            "41 04 64 20 80 00 00 01\r\n\r\n>"
+        );
+    }
+
+    #[test]
+    fn lowercase_pid_is_dispatched() {
+        let mut session = session();
+        let start = Instant::now();
+        let response = respond_obd(&mut session, "010c 1", &start);
+        assert!(response.starts_with("41 0C "), "got {response:?}");
+        assert!(response.ends_with("\r\n\r\n>"), "got {response:?}");
+    }
+
+    #[test]
+    fn mode_03_stored_dtcs() {
+        let mut session = session();
+        let start = Instant::now();
+        assert_eq!(respond_obd(&mut session, "03", &start), "43 00\r\n\r\n>");
+    }
+
+    #[test]
+    fn mode_09_vehicle_info() {
+        let mut session = session();
+        let start = Instant::now();
+        assert_eq!(
+            respond_obd(&mut session, "0902", &start),
+            "49 02 13 45 50 34 35 36 37 38 39 30\r\n\r\n>"
+        );
+    }
+
+    #[test]
+    fn unknown_pid_is_no_data() {
+        let mut session = session();
+        let start = Instant::now();
+        assert_eq!(
+            respond_obd(&mut session, "0199 1", &start),
+            "NO DATA\r\n\r\n>"
+        );
+    }
+
+    #[test]
+    fn unknown_command_is_question_mark() {
+        let mut session = session();
+        let start = Instant::now();
+        assert_eq!(respond_obd(&mut session, "FF", &start), "?\r\n\r\n>");
+    }
+
+    #[test]
+    fn repeat_replays_last_successful_command() {
+        let mut session = session();
+        let start = Instant::now();
+        respond_obd(&mut session, "0104 1", &start);
+        assert_eq!(respond_obd(&mut session, "1", &start), "41 04 64\r\n\r\n>");
+        // A repeat leaves the memory in place: it can repeat again.
+        assert_eq!(respond_obd(&mut session, "1", &start), "41 04 64\r\n\r\n>");
+    }
+
+    #[test]
+    fn failed_commands_do_not_clobber_repeat_memory() {
+        let mut session = session();
+        let start = Instant::now();
+        respond_obd(&mut session, "0104 1", &start);
+        respond_obd(&mut session, "0199 1", &start); // NO DATA
+        respond_obd(&mut session, "FF", &start); // ?
+        assert_eq!(respond_obd(&mut session, "1", &start), "41 04 64\r\n\r\n>");
+    }
+
+    #[test]
+    fn repeat_without_last_command_is_question_mark() {
+        let mut session = session();
+        let start = Instant::now();
+        assert_eq!(respond_obd(&mut session, "1", &start), "?\r\n\r\n>");
+    }
+
+    #[test]
+    fn settings_shape_the_obd_response() {
+        let mut session = session();
+        let start = Instant::now();
+
+        at_response(&mut session, b"ATL0\r");
+        assert_eq!(respond_obd(&mut session, "0104 1", &start), "41 04 64\r\r>");
+
+        at_response(&mut session, b"ATS0\r");
+        assert_eq!(respond_obd(&mut session, "0104 1", &start), "410464\r\r>");
+
+        at_response(&mut session, b"ATH1\r");
+        assert_eq!(
+            respond_obd(&mut session, "0104 1", &start),
+            "7E803410464\r\r>"
+        );
+
+        at_response(&mut session, b"ATS1\r");
+        assert_eq!(
+            respond_obd(&mut session, "0104 1", &start),
+            "7E8 03 41 04 64\r\r>"
+        );
     }
 }
