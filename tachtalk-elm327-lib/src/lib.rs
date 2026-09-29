@@ -5,6 +5,10 @@
 
 use std::io::{self, Write};
 
+mod server_session;
+
+pub use server_session::{Action, Identity, RepeatExpansion, ServerSession};
+
 /// Per-connection client state (ELM327 settings)
 #[derive(Debug, Clone)]
 #[allow(clippy::struct_excessive_bools)] // These are independent ELM327 protocol flags
@@ -102,80 +106,7 @@ impl ClientState {
     /// Handle an AT command and return the response
     /// Mutates the state if the command changes settings
     pub fn handle_at_command(&mut self, command: &str) -> String {
-        // ELM327 ignores spaces in AT commands
-        let cmd: String = command
-            .to_uppercase()
-            .chars()
-            .filter(|c| *c != ' ')
-            .collect();
-        let le = self.line_ending();
-
-        // Determine response content (without line endings)
-        let response_text = match cmd.as_str() {
-            "ATZ" => {
-                // Reset all settings to defaults
-                *self = ClientState::default();
-                // Use new state's line ending for response
-                let le = self.line_ending();
-                return format!("{le}ELM327 v1.5{le}>");
-            }
-            "ATE0" => {
-                self.echo_enabled = false;
-                "OK"
-            }
-            "ATE1" => {
-                self.echo_enabled = true;
-                "OK"
-            }
-            "ATL0" => {
-                self.linefeeds_enabled = false;
-                "OK"
-            }
-            "ATL1" => {
-                self.linefeeds_enabled = true;
-                "OK"
-            }
-            "ATS0" => {
-                self.spaces_enabled = false;
-                "OK"
-            }
-            "ATS1" => {
-                self.spaces_enabled = true;
-                "OK"
-            }
-            "ATH0" => {
-                self.headers_enabled = false;
-                "OK"
-            }
-            "ATH1" => {
-                self.headers_enabled = true;
-                "OK"
-            }
-            "ATRV" => {
-                // Return simulated battery voltage (12.6V)
-                return format!("{le}12.6V{le}>");
-            }
-            "ATSP0" | "ATAT1" | "ATAT2" => "OK",
-            "ATDP" => {
-                // Describe protocol
-                return format!("{le}AUTO, ISO 15765-4 (CAN 11/500){le}>");
-            }
-            "ATDPN" => {
-                // Describe protocol number
-                return format!("{le}A6{le}>");
-            }
-            _ if cmd.starts_with("ATSP") => "OK",
-            _ if cmd.starts_with("ATST") => "OK",
-            _ if cmd.starts_with("ATAT") => "OK",
-            "ATI" => "ELM327 v1.5",
-            "AT@1" => return self.device_description(),
-            _ => "?",
-        };
-
-        // Build response with proper line endings (echo already sent)
-        // Note: for commands that change linefeed setting, we use the OLD setting
-        // since le was captured before the match
-        format!("{le}{response_text}{le}>")
+        server_session::handle_at_command(self, &Identity::default(), command)
     }
 
     /// Override this to provide a custom device description for AT@1
