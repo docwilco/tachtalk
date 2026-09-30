@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 use tachtalk_capture_format::{
     CaptureHeader, RecordType, FLAG_OVERFLOW, HEADER_SIZE, RECORD_HEADER_SIZE,
 };
-use tachtalk_elm327_lib::ClientState;
+use tachtalk_elm327_lib::{Action, ClientState, Identity, RepeatExpansion, ServerSession};
 
 use crate::config::{PidDataLengths, PidPriority, SlowPollMode, MODE01_PID_DATA_LENGTHS};
 use crate::led_display::LedTaskMessage;
@@ -2226,8 +2226,7 @@ impl Obd2Proxy {
 
         let mut reader = BufReader::new(&client_stream);
         let mut writer = &client_stream;
-        let mut client_state = ClientState::default();
-        let mut cmd_buffer = Vec::with_capacity(64);
+        let mut session = ServerSession::new(Identity::default());
 
         loop {
             watchdog.feed();
@@ -2239,31 +2238,29 @@ impl Obd2Proxy {
                     break;
                 }
                 Ok(_) => {
-                    let ch = byte[0];
-
-                    if client_state.echo_enabled {
-                        writer.write_all(&byte)?;
-                    }
-
-                    if ch == b'\r' {
-                        let command = String::from_utf8_lossy(&cmd_buffer);
-                        let command = command.trim();
-
-                        if !command.is_empty() {
-                            debug!("OBD2 client command: {command:?}");
-                            Self::process_command(
-                                command,
-                                &cmd_buffer,
-                                &mut writer,
-                                &mut client_state,
-                                state,
-                                &client_cache,
-                            )?;
+                    for action in session.feed(&byte) {
+                        match action {
+                            Action::Send(echo) => writer.write_all(&echo)?,
+                            Action::At { command, response } => {
+                                debug!("OBD2 client command: {command:?}");
+                                debug!("Handling AT command locally");
+                                if let Ok(mut log) = state.at_command_log.lock() {
+                                    log.insert(command.to_uppercase());
+                                }
+                                writer.write_all(&response)?;
+                            }
+                            Action::Obd { command, raw } => {
+                                debug!("OBD2 client command: {command:?}");
+                                Self::answer_obd(
+                                    &command,
+                                    &raw,
+                                    &mut writer,
+                                    &mut session,
+                                    state,
+                                    &client_cache,
+                                )?;
+                            }
                         }
-
-                        cmd_buffer.clear();
-                    } else if ch != b'\n' {
-                        cmd_buffer.push(ch);
                     }
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {}
@@ -2277,27 +2274,16 @@ impl Obd2Proxy {
         Ok(())
     }
 
-    fn process_command(
+    /// Answer a non-AT command ([`Action::Obd`]): readiness gate, repeat
+    /// expansion, supported-PID cache, then the client cache.
+    fn answer_obd(
         command: &str,
         raw_command: &[u8],
         writer: &mut &TcpStream,
-        client_state: &mut ClientState,
+        session: &mut ServerSession,
         state: &Arc<State>,
         client_cache: &Arc<Mutex<ClientCache>>,
     ) -> Result<()> {
-        // Handle AT commands locally
-        if command.to_uppercase().starts_with("AT") {
-            debug!("Handling AT command locally");
-
-            if let Ok(mut log) = state.at_command_log.lock() {
-                log.insert(command.to_uppercase());
-            }
-
-            let response = client_state.handle_at_command(command);
-            writer.write_all(response.as_bytes())?;
-            return Ok(());
-        }
-
         // Signal client activity for status LED (non-AT OBD2 command)
         let _ = state.status_led_tx.send(StatusLedMessage::ClientActivity);
 
@@ -2305,25 +2291,25 @@ impl Obd2Proxy {
         // Clients will see "UNABLE TO CONNECT" and should retry, which is the
         // same response they'd get from a real ELM327 before protocol detection.
         if !state.supported_pids.lock().unwrap().ready {
-            let le = client_state.line_ending();
-            let error_response = format!("{le}UNABLE TO CONNECT{le}>");
-            writer.write_all(error_response.as_bytes())?;
+            writer.write_all(&session.format_line("UNABLE TO CONNECT"))?;
             return Ok(());
         }
 
         // Handle "1" repeat command
-        let (effective_command, effective_raw): (String, Obd2Buffer) = if command == "1" {
-            if let Some(last) = &client_state.last_obd_command {
-                debug!("Expanding repeat command to: {last}");
-                (last.clone(), last.as_bytes().into())
-            } else {
-                let le = client_state.line_ending();
-                let error_response = format!("{le}?{le}>");
-                writer.write_all(error_response.as_bytes())?;
+        let (effective_command, effective_raw) = match session.expand_repeat(command, raw_command) {
+            RepeatExpansion::Command {
+                command: effective,
+                raw,
+            } => {
+                if effective != command {
+                    debug!("Expanding repeat command to: {effective}");
+                }
+                (effective, raw)
+            }
+            RepeatExpansion::NoLastCommand(response) => {
+                writer.write_all(&response)?;
                 return Ok(());
             }
-        } else {
-            (command.to_string(), raw_command.into())
         };
 
         // Record unique OBD2 PIDs
@@ -2338,25 +2324,21 @@ impl Obd2Proxy {
         if let Some(idx) = supported_pids_index(&normalized) {
             let supported_pids_guard = state.supported_pids.lock().unwrap();
             if let Some(ref cached_response) = supported_pids_guard.entries[idx] {
-                client_state.last_obd_command = Some(effective_command);
-                client_state.write_response(cached_response, writer)?;
+                session.state_mut().last_obd_command = Some(effective_command);
+                session.state().write_response(cached_response, writer)?;
                 drop(supported_pids_guard);
                 return Ok(());
             }
             drop(supported_pids_guard);
             // Not cached (dongle not connected yet?) - return error
-            let le = client_state.line_ending();
-            let error_response = format!("{le}UNABLE TO CONNECT{le}>");
-            writer.write_all(error_response.as_bytes())?;
+            writer.write_all(&session.format_line("UNABLE TO CONNECT"))?;
             return Ok(());
         }
 
         // Convert normalized command to PID
         let Some(pid) = wire_command_to_pid(&normalized) else {
             // Invalid command format - return error
-            let le = client_state.line_ending();
-            let error_response = format!("{le}?{le}>");
-            writer.write_all(error_response.as_bytes())?;
+            writer.write_all(&session.format_line("?"))?;
             return Ok(());
         };
 
@@ -2364,17 +2346,14 @@ impl Obd2Proxy {
         let timeout = Duration::from_millis(state.config.lock().unwrap().obd2_timeout_ms);
         match Self::get_cached_value(pid, client_cache, state, timeout) {
             Ok(response) => {
-                client_state.last_obd_command = Some(effective_command);
+                session.state_mut().last_obd_command = Some(effective_command);
 
-                let formatted = format_cached_for_client(pid, &response, client_state);
+                let formatted = format_cached_for_client(pid, &response, session.state());
                 writer.write_all(&formatted)?;
             }
             Err(e) => {
                 error!("Cache error: {e}");
-                let le = client_state.line_ending();
-                let error_msg = e.to_elm327_error();
-                let error_response = format!("{le}{error_msg}{le}>");
-                writer.write_all(error_response.as_bytes())?;
+                writer.write_all(&session.format_line(e.to_elm327_error()))?;
             }
         }
 
