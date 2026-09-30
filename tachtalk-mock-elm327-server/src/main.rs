@@ -114,23 +114,18 @@ fn handle_client(
                 break;
             }
             Ok(_) => {
-                let mut actions = session.feed(&byte).into_iter();
-                while let Some(action) = actions.next() {
+                for action in session.feed(&byte) {
                     match action {
-                        // A Send not claimed by the At arm below is echo.
-                        Action::Send(bytes) => {
-                            if stream.write_all(&bytes).is_err() {
+                        Action::Send(echo) => {
+                            if stream.write_all(&echo).is_err() {
                                 break 'connection;
                             }
                         }
-                        Action::At(command) => {
+                        Action::At { command, response } => {
                             if !quiet {
                                 println!("RX: {}", command.to_uppercase());
                             }
                             rate_limit_wait(min_interval, last_response_time);
-                            let Some(Action::Send(response)) = actions.next() else {
-                                unreachable!("Action::At is always followed by its response Send");
-                            };
                             if send_response(&mut stream, quiet, &response, &mut last_response_time)
                                 .is_err()
                             {
@@ -422,18 +417,16 @@ mod tests {
     }
 
     /// Feed one full AT command line and return its response bytes,
-    /// skipping echo `Send`s (the response is the `Send` after `At`).
+    /// skipping echo `Send`s.
     fn at_response(session: &mut ServerSession, line: &[u8]) -> Vec<u8> {
-        let mut actions = session.feed(line).into_iter();
-        while let Some(action) = actions.next() {
-            if let Action::At(_) = action {
-                let Some(Action::Send(response)) = actions.next() else {
-                    panic!("Action::At not followed by its response Send");
-                };
-                return response;
-            }
-        }
-        panic!("no AT action for {:?}", String::from_utf8_lossy(line));
+        session
+            .feed(line)
+            .into_iter()
+            .find_map(|action| match action {
+                Action::At { response, .. } => Some(response),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("no AT action for {:?}", String::from_utf8_lossy(line)))
     }
 
     #[test]

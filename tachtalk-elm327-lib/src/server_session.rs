@@ -31,13 +31,18 @@ impl Default for Identity {
 /// What a [`ServerSession`] returns to its adapter.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
-    /// Bytes to write to the client (echo, AT responses).
+    /// Bytes to write to the client (echo).
     Send(Vec<u8>),
-    /// An AT command was handled internally; its response is already
-    /// emitted as [`Action::Send`]. Carries the command as received
-    /// (trimmed, original case) so the adapter can log it; the firmware
-    /// logs it uppercased, so its adapter must uppercase.
-    At(String),
+    /// An AT command handled internally, with its full response (line
+    /// endings and prompt) for the adapter to write. No separate
+    /// [`Action::Send`] follows it.
+    At {
+        /// The command as received (trimmed, original case), for logging;
+        /// the firmware logs it uppercased, so its adapter must uppercase.
+        command: String,
+        /// Bytes to write to the client.
+        response: Vec<u8>,
+    },
     /// A non-AT command for the adapter to answer. `command` is the
     /// trimmed line; `raw` is the framed bytes as received (untrimmed,
     /// CR excluded). Run it through [`ServerSession::expand_repeat`]
@@ -128,8 +133,10 @@ impl ServerSession {
 
         if command.to_uppercase().starts_with("AT") {
             let response = handle_at_command(&mut self.state, &self.identity, command);
-            actions.push(Action::At(command.to_string()));
-            actions.push(Action::Send(response.into_bytes()));
+            actions.push(Action::At {
+                command: command.to_string(),
+                response: response.into_bytes(),
+            });
         } else {
             actions.push(Action::Obd {
                 command: command.to_string(),

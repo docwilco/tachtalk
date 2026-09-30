@@ -9,12 +9,19 @@
 
 use tachtalk_elm327_lib::{Action, Identity, RepeatExpansion, ServerSession};
 
-/// Concatenate all `Send` payloads: the byte stream a client would receive.
+/// Concatenate every `Send` payload and every `At` response, in order: the
+/// byte stream a client would receive.
 fn sent_bytes(actions: &[Action]) -> Vec<u8> {
     let mut out = Vec::new();
     for action in actions {
-        if let Action::Send(bytes) = action {
-            out.extend_from_slice(bytes);
+        match action {
+            Action::Send(bytes)
+            | Action::At {
+                response: bytes, ..
+            } => {
+                out.extend_from_slice(bytes);
+            }
+            Action::Obd { .. } => {}
         }
     }
     out
@@ -29,6 +36,14 @@ fn dispatches(actions: &[Action]) -> Vec<Action> {
         .collect()
 }
 
+/// An `At` action with the given command and response.
+fn at(command: &str, response: &[u8]) -> Action {
+    Action::At {
+        command: command.to_string(),
+        response: response.to_vec(),
+    }
+}
+
 fn firmware_session() -> ServerSession {
     ServerSession::new(Identity::default())
 }
@@ -40,7 +55,22 @@ fn atz_echoes_and_prints_banner() {
 
     // Echo is on by default: every byte comes back, then the banner.
     assert_eq!(sent_bytes(&actions), b"ATZ\r\r\nELM327 v1.5\r\n>");
-    assert_eq!(dispatches(&actions), vec![Action::At("ATZ".to_string())]);
+    assert_eq!(
+        dispatches(&actions),
+        vec![at("ATZ", b"\r\nELM327 v1.5\r\n>")]
+    );
+}
+
+#[test]
+fn at_line_is_echo_then_at_carrying_its_response() {
+    let mut session = firmware_session();
+    let actions = session.feed(b"ATE0\r");
+    // No separate response `Send` follows the `At`: the response rides
+    // inside it.
+    assert_eq!(
+        actions,
+        vec![Action::Send(b"ATE0\r".to_vec()), at("ATE0", b"\r\nOK\r\n>")]
+    );
 }
 
 #[test]
@@ -73,7 +103,10 @@ fn linefeeds_are_echoed_but_not_buffered() {
     assert_eq!(sent_bytes(&actions), b"ATI\r\r\nELM327 v1.5\r\n>\n");
     // And an LF inside a command does not split or pollute it.
     let actions = session.feed(b"AT\nI\r");
-    assert_eq!(dispatches(&actions), vec![Action::At("ATI".to_string())]);
+    assert_eq!(
+        dispatches(&actions),
+        vec![at("ATI", b"\r\nELM327 v1.5\r\n>")]
+    );
 }
 
 #[test]
@@ -99,7 +132,7 @@ fn at_commands_are_case_insensitive_and_ignore_spaces() {
     assert_eq!(sent_bytes(&actions), b"\r\nOK\r\n>");
     assert!(session.state().headers_enabled);
     // The At action carries the command as received (trimmed, original case).
-    assert_eq!(dispatches(&actions), vec![Action::At("AT H1".to_string())]);
+    assert_eq!(dispatches(&actions), vec![at("AT H1", b"\r\nOK\r\n>")]);
 }
 
 #[test]
@@ -260,15 +293,15 @@ fn torn_packet_feed_matches_whole_feed() {
     assert_eq!(
         dispatches(&whole_actions),
         vec![
-            Action::At("ATZ".to_string()),
-            Action::At("ATE0".to_string()),
+            at("ATZ", b"\r\nELM327 v1.5\r\n>"),
+            at("ATE0", b"\r\nOK\r\n>"),
             Action::Obd {
                 command: "010C".to_string(),
                 raw: b"010C".to_vec(),
             },
-            Action::At("AT H1".to_string()),
-            Action::At("ATL0".to_string()),
-            Action::At("atdp".to_string()),
+            at("AT H1", b"\r\nOK\r\n>"),
+            at("ATL0", b"\r\nOK\r\n>"),
+            at("atdp", b"\rAUTO, ISO 15765-4 (CAN 11/500)\r>"),
             Action::Obd {
                 command: "1".to_string(),
                 raw: b"1".to_vec(),
