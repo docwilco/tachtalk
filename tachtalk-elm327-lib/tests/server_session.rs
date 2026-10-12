@@ -275,6 +275,17 @@ fn format_data_response_spaces_hex_pairs() {
 }
 
 #[test]
+fn a_feed_applies_every_lines_settings_before_returning() {
+    let mut session = firmware_session();
+    let actions = session.feed(b"010C\rATS0\r");
+    // The OBD line comes first in the actions, but ATS0 has already taken
+    // effect: an adapter answering 010C now would format without spaces.
+    // This is why the firmware feeds one line per call.
+    assert!(matches!(actions[1], Action::Obd { .. }));
+    assert!(!session.state().spaces_enabled);
+}
+
+#[test]
 fn torn_packet_feed_matches_whole_feed() {
     let script: &[u8] = b"ATZ\rATE0\r010C\rAT H1\r\r  \rATL0\ratdp\r1\r\n010D\r";
 

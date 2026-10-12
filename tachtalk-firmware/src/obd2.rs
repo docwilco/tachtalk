@@ -79,7 +79,7 @@ type PidGroup = SmallVec<Pid, 8>;
 
 /// Convert a PID to wire-format Mode 01 command (e.g., `0x0C` → `b"010C"`).
 fn pid_to_wire_command(pid: Pid) -> WireBytes {
-    // Always 4 bytes ("01XX"), fits inline in WireBytes
+    // Always 4 bytes ("01XX"), fits the 16 inline bytes of WireBytes
     let mut buf = WireBytes::new();
     write!(buf, "01{pid:02X}").unwrap();
     buf
@@ -2218,44 +2218,47 @@ impl Obd2Proxy {
 
         let watchdog = WatchdogHandle::register(c"obd2_client");
 
-        let mut reader = &client_stream;
-        let mut writer = &client_stream;
+        let mut stream = &client_stream;
         let mut session = ServerSession::new(Identity::default());
-        // Clients send one short command line at a time; a chunk holding
-        // more than two lines makes `feed` spill its action list, nothing
-        // worse.
         let mut chunk = [0u8; 64];
 
         loop {
             watchdog.feed();
 
-            match reader.read(&mut chunk) {
+            match stream.read(&mut chunk) {
                 Ok(0) => {
                     info!("OBD2 client disconnected: {peer}");
                     break;
                 }
                 Ok(n) => {
-                    for action in session.feed(&chunk[..n]) {
-                        match action {
-                            Action::Send(echo) => writer.write_all(&echo)?,
-                            Action::At { command, response } => {
-                                debug!("OBD2 client command: {command:?}");
-                                debug!("Handling AT command locally");
-                                if let Ok(mut log) = state.at_command_log.lock() {
-                                    log.insert(command.to_uppercase());
+                    // Feed one line per call: an OBD line is answered from
+                    // the session's settings, which a later AT line in the
+                    // same chunk must not change first. Each line can wait
+                    // up to the OBD2 timeout, so feed the watchdog per line.
+                    for line in chunk[..n].split_inclusive(|&b| b == b'\r') {
+                        watchdog.feed();
+                        for action in session.feed(line) {
+                            match action {
+                                Action::Send(echo) => stream.write_all(&echo)?,
+                                Action::At { command, response } => {
+                                    debug!("OBD2 client command: {command:?}");
+                                    debug!("Handling AT command locally");
+                                    if let Ok(mut log) = state.at_command_log.lock() {
+                                        log.insert(command.to_uppercase());
+                                    }
+                                    stream.write_all(&response)?;
                                 }
-                                writer.write_all(&response)?;
-                            }
-                            Action::Obd { command, raw } => {
-                                debug!("OBD2 client command: {command:?}");
-                                Self::answer_obd(
-                                    &command,
-                                    &raw,
-                                    &mut writer,
-                                    &mut session,
-                                    state,
-                                    &client_cache,
-                                )?;
+                                Action::Obd { command, raw } => {
+                                    debug!("OBD2 client command: {command:?}");
+                                    Self::answer_obd(
+                                        &command,
+                                        &raw,
+                                        &mut stream,
+                                        &mut session,
+                                        state,
+                                        &client_cache,
+                                    )?;
+                                }
                             }
                         }
                     }

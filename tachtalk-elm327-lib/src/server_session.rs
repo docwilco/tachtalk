@@ -94,6 +94,12 @@ impl ServerSession {
     /// Feed bytes received from the client; returns the actions to execute,
     /// in order. Feeding one byte at a time yields the same byte stream and
     /// dispatches as feeding everything at once.
+    ///
+    /// Every line in `bytes` is processed before this returns, so an AT
+    /// line late in the call has already changed the settings by the time
+    /// the adapter answers an [`Action::Obd`] from earlier in the call. An
+    /// adapter that answers from [`state`](Self::state) or
+    /// [`format_line`](Self::format_line) feeds at most one line per call.
     #[must_use = "discarding the actions loses echo and responses"]
     pub fn feed(&mut self, bytes: &[u8]) -> SmallVec<Action, 4> {
         let mut actions = SmallVec::new();
