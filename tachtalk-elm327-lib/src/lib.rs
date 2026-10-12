@@ -9,6 +9,11 @@ mod server_session;
 
 pub use server_session::{Action, Identity, RepeatExpansion, ServerSession};
 
+/// Bytes the library hands to an adapter to write. Sixteen bytes inline
+/// covers echo, every OBD command, and the common replies; the rare longer
+/// lines (`UNABLE TO CONNECT`, the `ATDP` reply) spill to the heap.
+pub type WireBytes = smallvec::SmallVec<u8, 16>;
+
 /// Per-connection client state (ELM327 settings)
 #[derive(Debug, Clone)]
 #[allow(clippy::struct_excessive_bools)] // These are independent ELM327 protocol flags
@@ -91,14 +96,14 @@ impl ClientState {
     /// Format a dongle response according to client settings.
     ///
     /// Convenience wrapper around [`write_response`](Self::write_response)
-    /// that returns a new `Vec<u8>`.
+    /// that returns new [`WireBytes`].
     ///
     /// # Panics
-    /// Cannot panic: `Vec` implements infallible `Write`.
+    /// Cannot panic: `WireBytes` implements infallible `Write`.
     #[must_use]
-    pub fn format_response(&self, response: &[u8]) -> Vec<u8> {
-        let mut result = Vec::with_capacity(response.len() * 3 / 2);
-        // Vec::write_all is infallible
+    pub fn format_response(&self, response: &[u8]) -> WireBytes {
+        let mut result = WireBytes::with_capacity(response.len() * 3 / 2);
+        // WireBytes::write_all is infallible
         self.write_response(response, &mut result).unwrap();
         result
     }

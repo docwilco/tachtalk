@@ -6,3 +6,4 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+smallvec.workspace = true

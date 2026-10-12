@@ -7,7 +7,7 @@
 //! AT responses formatted with the line ending from before the command
 //! took effect, and the invented `1` repeat.
 
-use tachtalk_elm327_lib::{Action, Identity, RepeatExpansion, ServerSession};
+use tachtalk_elm327_lib::{Action, Identity, RepeatExpansion, ServerSession, WireBytes};
 
 /// Concatenate every `Send` payload and every `At` response, in order: the
 /// byte stream a client would receive.
@@ -36,11 +36,16 @@ fn dispatches(actions: &[Action]) -> Vec<Action> {
         .collect()
 }
 
+/// Bytes as the library hands them out.
+fn wire(bytes: &[u8]) -> WireBytes {
+    WireBytes::from(bytes)
+}
+
 /// An `At` action with the given command and response.
 fn at(command: &str, response: &[u8]) -> Action {
     Action::At {
         command: command.to_string(),
-        response: response.to_vec(),
+        response: wire(response),
     }
 }
 
@@ -68,8 +73,8 @@ fn at_line_is_echo_then_at_carrying_its_response() {
     // No separate response `Send` follows the `At`: the response rides
     // inside it.
     assert_eq!(
-        actions,
-        vec![Action::Send(b"ATE0\r".to_vec()), at("ATE0", b"\r\nOK\r\n>")]
+        actions[..],
+        [Action::Send(wire(b"ATE0\r")), at("ATE0", b"\r\nOK\r\n>")]
     );
 }
 
@@ -189,7 +194,7 @@ fn non_at_command_is_dispatched_trimmed_with_raw_bytes() {
         dispatches(&actions),
         vec![Action::Obd {
             command: "010c 1".to_string(),
-            raw: b" 010c 1 ".to_vec(),
+            raw: wire(b" 010c 1 "),
         }]
     );
     // The session sends nothing itself for an OBD command.
@@ -205,7 +210,7 @@ fn commands_split_across_feeds_are_reassembled() {
         dispatches(&session.feed(b"0C\r")),
         vec![Action::Obd {
             command: "010C".to_string(),
-            raw: b"010C".to_vec(),
+            raw: wire(b"010C"),
         }]
     );
 }
@@ -218,7 +223,7 @@ fn repeat_expands_to_the_last_recorded_command() {
         session.expand_repeat("1", b"1"),
         RepeatExpansion::Command {
             command: "010C".to_string(),
-            raw: b"010C".to_vec(),
+            raw: wire(b"010C"),
         }
     );
 }
@@ -228,7 +233,7 @@ fn repeat_without_history_formats_a_question_mark() {
     let session = firmware_session();
     assert_eq!(
         session.expand_repeat("1", b"1"),
-        RepeatExpansion::NoLastCommand(b"\r\n?\r\n>".to_vec())
+        RepeatExpansion::NoLastCommand(wire(b"\r\n?\r\n>"))
     );
 }
 
@@ -239,7 +244,7 @@ fn non_repeat_commands_pass_through_expansion_unchanged() {
         session.expand_repeat("010D", b" 010D"),
         RepeatExpansion::Command {
             command: "010D".to_string(),
-            raw: b" 010D".to_vec(),
+            raw: wire(b" 010D"),
         }
     );
 }
@@ -297,18 +302,18 @@ fn torn_packet_feed_matches_whole_feed() {
             at("ATE0", b"\r\nOK\r\n>"),
             Action::Obd {
                 command: "010C".to_string(),
-                raw: b"010C".to_vec(),
+                raw: wire(b"010C"),
             },
             at("AT H1", b"\r\nOK\r\n>"),
             at("ATL0", b"\r\nOK\r\n>"),
             at("atdp", b"\rAUTO, ISO 15765-4 (CAN 11/500)\r>"),
             Action::Obd {
                 command: "1".to_string(),
-                raw: b"1".to_vec(),
+                raw: wire(b"1"),
             },
             Action::Obd {
                 command: "010D".to_string(),
-                raw: b"010D".to_vec(),
+                raw: wire(b"010D"),
             },
         ]
     );

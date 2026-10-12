@@ -403,6 +403,7 @@ fn respond_obd(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tachtalk_elm327_lib::WireBytes;
 
     // Expected bytes come from a live capture of the pre-ServerSession
     // mock (issue #21); the adaptation must not change the wire.
@@ -418,7 +419,7 @@ mod tests {
 
     /// Feed one full AT command line and return its response bytes,
     /// skipping echo `Send`s.
-    fn at_response(session: &mut ServerSession, line: &[u8]) -> Vec<u8> {
+    fn at_response(session: &mut ServerSession, line: &[u8]) -> WireBytes {
         session
             .feed(line)
             .into_iter()

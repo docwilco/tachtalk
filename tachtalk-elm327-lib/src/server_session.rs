@@ -7,7 +7,9 @@
 //! Behavior is a faithful extraction of the firmware proxy's client loop,
 //! warts included; see the characterization tests for the details it locks.
 
-use crate::ClientState;
+use smallvec::SmallVec;
+
+use crate::{ClientState, WireBytes};
 
 /// Identity strings a server presents to clients.
 #[derive(Debug, Clone)]
@@ -32,7 +34,7 @@ impl Default for Identity {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
     /// Bytes to write to the client (echo).
-    Send(Vec<u8>),
+    Send(WireBytes),
     /// An AT command handled internally, with its full response (line
     /// endings and prompt) for the adapter to write. No separate
     /// [`Action::Send`] follows it.
@@ -41,7 +43,7 @@ pub enum Action {
         /// the firmware logs it uppercased, so its adapter must uppercase.
         command: String,
         /// Bytes to write to the client.
-        response: Vec<u8>,
+        response: WireBytes,
     },
     /// A non-AT command for the adapter to answer. `command` is the
     /// trimmed line; `raw` is the framed bytes as received (untrimmed,
@@ -51,7 +53,7 @@ pub enum Action {
         /// Trimmed command text.
         command: String,
         /// Raw command bytes as buffered (untrimmed, no CR/LF).
-        raw: Vec<u8>,
+        raw: WireBytes,
     },
 }
 
@@ -63,10 +65,10 @@ pub enum RepeatExpansion {
         /// Trimmed command text (the last command, if repeated).
         command: String,
         /// Raw bytes to forward.
-        raw: Vec<u8>,
+        raw: WireBytes,
     },
     /// `1` with no previous command: send these bytes (a `?` response).
-    NoLastCommand(Vec<u8>),
+    NoLastCommand(WireBytes),
 }
 
 /// Sans-io server-side session machine: CR framing, echo, the AT dialect,
@@ -93,9 +95,9 @@ impl ServerSession {
     /// in order. Feeding one byte at a time yields the same byte stream and
     /// dispatches as feeding everything at once.
     #[must_use = "discarding the actions loses echo and responses"]
-    pub fn feed(&mut self, bytes: &[u8]) -> Vec<Action> {
-        let mut actions = Vec::new();
-        let mut echo = Vec::new();
+    pub fn feed(&mut self, bytes: &[u8]) -> SmallVec<Action, 4> {
+        let mut actions = SmallVec::new();
+        let mut echo = WireBytes::new();
 
         for &byte in bytes {
             // Echo each byte as read, before any processing, as the
@@ -121,7 +123,7 @@ impl ServerSession {
         actions
     }
 
-    fn process_line(&mut self, actions: &mut Vec<Action>) {
+    fn process_line(&mut self, actions: &mut SmallVec<Action, 4>) {
         let command = String::from_utf8_lossy(&self.cmd_buffer);
         let command = command.trim();
 
@@ -135,12 +137,12 @@ impl ServerSession {
             let response = handle_at_command(&mut self.state, &self.identity, command);
             actions.push(Action::At {
                 command: command.to_string(),
-                response: response.into_bytes(),
+                response: WireBytes::from(response.as_bytes()),
             });
         } else {
             actions.push(Action::Obd {
                 command: command.to_string(),
-                raw: self.cmd_buffer.clone(),
+                raw: WireBytes::from(self.cmd_buffer.as_slice()),
             });
         }
     }
@@ -157,14 +159,14 @@ impl ServerSession {
             match &self.state.last_obd_command {
                 Some(last) => RepeatExpansion::Command {
                     command: last.clone(),
-                    raw: last.as_bytes().to_vec(),
+                    raw: WireBytes::from(last.as_bytes()),
                 },
                 None => RepeatExpansion::NoLastCommand(self.format_line("?")),
             }
         } else {
             RepeatExpansion::Command {
                 command: command.to_string(),
-                raw: raw.to_vec(),
+                raw: WireBytes::from(raw),
             }
         }
     }
@@ -173,15 +175,20 @@ impl ServerSession {
     /// `{le}{text}{le}>`. This is how the adapter formats rejections
     /// (`UNABLE TO CONNECT`, `?`, dongle error strings).
     #[must_use]
-    pub fn format_line(&self, text: &str) -> Vec<u8> {
-        let le = self.state.line_ending();
-        format!("{le}{text}{le}>").into_bytes()
+    pub fn format_line(&self, text: &str) -> WireBytes {
+        let le = self.state.line_ending().as_bytes();
+        let mut line = WireBytes::new();
+        line.extend_from_slice(le);
+        line.extend_from_slice(text.as_bytes());
+        line.extend_from_slice(le);
+        line.push(b'>');
+        line
     }
 
     /// Format a dongle data response according to the client's space
     /// setting; see [`ClientState::format_response`].
     #[must_use]
-    pub fn format_data_response(&self, response: &[u8]) -> Vec<u8> {
+    pub fn format_data_response(&self, response: &[u8]) -> WireBytes {
         self.state.format_response(response)
     }
 

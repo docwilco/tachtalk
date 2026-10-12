@@ -11,7 +11,7 @@ use indexmap::IndexSet;
 use log::{debug, error, info, warn};
 use smallvec::SmallVec;
 use std::collections::HashMap;
-use std::io::{BufReader, Read, Write};
+use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::{Receiver, Sender};
@@ -21,7 +21,9 @@ use std::time::{Duration, Instant};
 use tachtalk_capture_format::{
     CaptureHeader, RecordType, FLAG_OVERFLOW, HEADER_SIZE, RECORD_HEADER_SIZE,
 };
-use tachtalk_elm327_lib::{Action, ClientState, Identity, RepeatExpansion, ServerSession};
+use tachtalk_elm327_lib::{
+    Action, ClientState, Identity, RepeatExpansion, ServerSession, WireBytes,
+};
 
 use crate::config::{PidDataLengths, PidPriority, SlowPollMode, MODE01_PID_DATA_LENGTHS};
 use crate::led_display::LedTaskMessage;
@@ -57,10 +59,6 @@ const RECONNECT_DELAY: Duration = Duration::from_secs(1);
 /// Maintenance interval for checking promotion/demotion/removal
 const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(2);
 
-/// Type alias for small OBD2 wire-format buffers (ASCII hex commands/responses).
-/// 20 bytes on 32-bit; 16 inline bytes covers multi-PID commands without heap.
-type Obd2Buffer = SmallVec<u8, 16>;
-
 /// OBD2 PID byte. Mode is always 0x01 for this application.
 type Pid = u8;
 
@@ -80,9 +78,9 @@ type PidGroup = SmallVec<Pid, 8>;
 // ============================================================================
 
 /// Convert a PID to wire-format Mode 01 command (e.g., `0x0C` → `b"010C"`).
-fn pid_to_wire_command(pid: Pid) -> Obd2Buffer {
-    // Always 4 bytes ("01XX"), fits inline in SmallVec<u8, 16>
-    let mut buf = Obd2Buffer::new();
+fn pid_to_wire_command(pid: Pid) -> WireBytes {
+    // Always 4 bytes ("01XX"), fits inline in WireBytes
+    let mut buf = WireBytes::new();
     write!(buf, "01{pid:02X}").unwrap();
     buf
 }
@@ -92,10 +90,10 @@ fn pid_to_wire_command(pid: Pid) -> Obd2Buffer {
 /// Appends the ECU `response_count` suffix so the adapter knows how many
 /// responses to wait for. All PIDs in a batch must share the same ECU count
 /// (callers group by count before calling this).
-fn build_multi_pid_wire_command(pids: &[Pid], response_count: u8) -> Obd2Buffer {
+fn build_multi_pid_wire_command(pids: &[Pid], response_count: u8) -> WireBytes {
     // Maximum 6 PIDs: "01" + 6×"XX" + " N" = 16 bytes, fits inline
-    // in SmallVec<u8, 16>
-    let mut cmd = Obd2Buffer::new();
+    // in WireBytes
+    let mut cmd = WireBytes::new();
     cmd.extend_from_slice(b"01");
     for &pid in pids {
         write!(cmd, "{pid:02X}").unwrap();
@@ -134,15 +132,15 @@ fn format_cached_for_client(
     pid: Pid,
     values: &CachedResponse,
     client_state: &ClientState,
-) -> Obd2Buffer {
+) -> WireBytes {
     let le = client_state.line_ending();
-    let mut result = Obd2Buffer::new();
+    let mut result = WireBytes::new();
 
     for data in values {
         result.extend_from_slice(le.as_bytes());
         // Build hex response "41{pid:02X}{data hex}" into a temp buffer,
         // then write_response formats it (adding spaces) directly into result.
-        let mut hex = Obd2Buffer::new();
+        let mut hex = WireBytes::new();
         write!(hex, "41{pid:02X}").unwrap();
         for &b in data.as_slice() {
             write!(hex, "{b:02X}").unwrap();
@@ -160,7 +158,7 @@ fn format_cached_for_client(
 /// `true` once all 8 supported-PID queries have been attempted.
 #[derive(Default)]
 pub struct SupportedPidsCache {
-    pub entries: [Option<Obd2Buffer>; 8],
+    pub entries: [Option<WireBytes>; 8],
     pub ready: bool,
 }
 
@@ -281,7 +279,7 @@ fn supported_pids_index(cmd: &[u8]) -> Option<usize> {
 /// **Known limitation:** stripping `" 1"` discards the client's response count
 /// hint, and commands with other counts (e.g., `" 2"`) are kept as-is. This
 /// will be replaced by proper command parsing (see TODO: `ParsedClientCommand`).
-fn normalize_obd_command(cmd: &[u8]) -> Obd2Buffer {
+fn normalize_obd_command(cmd: &[u8]) -> WireBytes {
     // Strip trailing " 1" first, while the space boundary distinguishes it
     // from hex data (e.g., "01 0C 1" → "01 0C", but "0100" stays "0100").
     let cmd = if cmd.len() >= 2 && cmd.ends_with(b" 1") {
@@ -303,7 +301,7 @@ struct ParsedLine {
     /// Parsed 11-bit CAN ID when framing is enabled (e.g., `0x7E8`).
     ecu_id: Option<u16>,
     /// OBD data bytes (after PCI byte when framing, or raw hex bytes when not).
-    data: Obd2Buffer,
+    data: WireBytes,
 }
 
 /// Parse a raw dongle response into structured lines.
@@ -359,7 +357,7 @@ fn parse_response_framed(response: &[u8], framing_enabled: bool) -> SmallVec<Par
             }
 
             // Parse the data hex bytes
-            let mut data: Obd2Buffer = Obd2Buffer::new();
+            let mut data: WireBytes = WireBytes::new();
             let mut i = 0;
             while i + 1 < data_hex.len() {
                 if let Ok(b) =
@@ -377,7 +375,7 @@ fn parse_response_framed(response: &[u8], framing_enabled: bool) -> SmallVec<Par
         } else {
             // Framing off: raw hex line, parse bytes
             let hex_str = trimmed.replace(' ', "");
-            let mut data: Obd2Buffer = Obd2Buffer::new();
+            let mut data: WireBytes = WireBytes::new();
             let hex_bytes = hex_str.as_bytes();
             let mut i = 0;
             while i + 1 < hex_bytes.len() {
@@ -496,7 +494,7 @@ fn extract_pids_from_response(data: &[u8], pid_lengths: &PidDataLengths) -> PidG
 /// Returns a map of PID to `CachedResponse` (data per ECU).
 /// Only parses Mode 01 (0x41) responses.
 fn parse_response_to_cache(
-    raw: &Obd2Buffer,
+    raw: &WireBytes,
     pid_lengths: &PidDataLengths,
 ) -> HashMap<Pid, CachedResponse> {
     let mut result: HashMap<Pid, CachedResponse> = HashMap::new();
@@ -710,9 +708,9 @@ struct DongleState {
     supports_repeat: FeatureSupport,
     /// The repeat command to send (e.g. b"1" or empty for bare CR).
     /// Only meaningful when `supports_repeat != No`.
-    repeat_cmd: Obd2Buffer,
+    repeat_cmd: WireBytes,
     /// Last wire command sent to the dongle (includes response count suffix if learned)
-    last_command: Option<Obd2Buffer>,
+    last_command: Option<WireBytes>,
     /// Learned ECU counts per PID (how many ECUs respond to each PID).
     /// On first request for a PID, we send without a count to learn it.
     /// Subsequent requests append the count for faster dongle response.
@@ -732,7 +730,7 @@ struct DongleState {
 
 impl DongleState {
     /// Build the wire command for a PID, appending the learned response count if known.
-    fn build_wire_command(&self, pid: Pid) -> Obd2Buffer {
+    fn build_wire_command(&self, pid: Pid) -> WireBytes {
         let mut cmd = pid_to_wire_command(pid);
         if let Some(&count) = self.response_counts.get(&pid) {
             write!(cmd, " {count}").unwrap();
@@ -743,7 +741,7 @@ impl DongleState {
     /// Send a command to the dongle without waiting for response.
     /// Records to capture buffer if capture is enabled.
     fn send_command(&mut self, command: &[u8]) -> Result<(), DongleError> {
-        let mut cmd_with_cr: Obd2Buffer = command.into();
+        let mut cmd_with_cr: WireBytes = command.into();
         if !cmd_with_cr.ends_with(b"\r") {
             cmd_with_cr.push(b'\r');
         }
@@ -771,9 +769,9 @@ impl DongleState {
 
     /// Receive response from dongle until `>` prompt.
     /// Records to capture buffer if capture is enabled.
-    fn recv_response(&mut self, timeout: Duration) -> Result<Obd2Buffer, DongleError> {
+    fn recv_response(&mut self, timeout: Duration) -> Result<WireBytes, DongleError> {
         let mut buffer = [0u8; 128];
-        let mut response = Obd2Buffer::new();
+        let mut response = WireBytes::new();
         let start = Instant::now();
 
         loop {
@@ -819,11 +817,7 @@ impl DongleState {
     }
 
     /// Send a command and receive the response (raw send + receive with capture recording).
-    fn raw_execute(
-        &mut self,
-        command: &[u8],
-        timeout: Duration,
-    ) -> Result<Obd2Buffer, DongleError> {
+    fn raw_execute(&mut self, command: &[u8], timeout: Duration) -> Result<WireBytes, DongleError> {
         self.send_command(command)?;
         self.recv_response(timeout)
     }
@@ -832,7 +826,7 @@ impl DongleState {
     ///
     /// Parses the response to extract per-PID ECU counts and stores them.
     /// Works for both single-PID and multi-PID responses.
-    fn learn_response_counts(&mut self, response: &Obd2Buffer) {
+    fn learn_response_counts(&mut self, response: &WireBytes) {
         let parsed = parse_response_framed(response, self.framing_enabled);
         let counts = count_ecus_per_pid(&parsed, self.framing_enabled, &self.pid_lengths);
 
@@ -849,7 +843,7 @@ impl DongleState {
     /// For a single-PID query `01XX`, each ECU response line has format:
     /// `41 XX DD DD DD...` — the bytes after service byte + PID are data bytes.
     /// Verifies all ECU responses agree on the length before storing.
-    fn learn_pid_data_length(&mut self, pid: Pid, response: &Obd2Buffer) {
+    fn learn_pid_data_length(&mut self, pid: Pid, response: &WireBytes) {
         // Skip if already known (static table or previously learned)
         if resolve_pid_data_length(pid, &self.pid_lengths).is_some() {
             return;
@@ -897,9 +891,9 @@ impl DongleState {
     /// on the returned response.
     fn execute(
         &mut self,
-        wire_cmd: Obd2Buffer,
+        wire_cmd: WireBytes,
         timeout: Duration,
-    ) -> Result<Obd2Buffer, DongleError> {
+    ) -> Result<WireBytes, DongleError> {
         let can_try_repeat = self.supports_repeat != FeatureSupport::No
             && self.last_command.as_ref() == Some(&wire_cmd);
 
@@ -939,7 +933,7 @@ impl DongleState {
     /// Builds the wire command (with learned response count if known), sends
     /// via [`execute`], then learns data length and ECU counts from
     /// the response.
-    fn query_single_pid(&mut self, pid: Pid, timeout: Duration) -> Result<Obd2Buffer, DongleError> {
+    fn query_single_pid(&mut self, pid: Pid, timeout: Duration) -> Result<WireBytes, DongleError> {
         let wire_cmd = self.build_wire_command(pid);
         let result = self.execute(wire_cmd, timeout);
         if let Ok(ref resp) = result {
@@ -958,7 +952,7 @@ impl DongleState {
         pids: &[Pid],
         response_count: u8,
         timeout: Duration,
-    ) -> Result<Obd2Buffer, DongleError> {
+    ) -> Result<WireBytes, DongleError> {
         let wire_cmd = build_multi_pid_wire_command(pids, response_count);
         let result = self.execute(wire_cmd, timeout);
         if let Ok(ref resp) = result {
@@ -973,7 +967,7 @@ impl DongleState {
     /// Sets `supports_multi_pid` to `Yes` or `No`; no-ops if already known.
     fn validate_multi_pid_support(
         &mut self,
-        result: &Result<Obd2Buffer, DongleError>,
+        result: &Result<WireBytes, DongleError>,
         queried_pids: &[Pid],
     ) {
         if self.supports_multi_pid != FeatureSupport::Unknown {
@@ -1493,7 +1487,7 @@ fn try_reconnect(
 /// Handle a dongle result: parse the response on success, tear down the
 /// connection on fatal errors, and forward parsed data to the cache manager.
 fn handle_dongle_result(
-    result: Result<Obd2Buffer, DongleError>,
+    result: Result<WireBytes, DongleError>,
     connection: &mut Option<DongleState>,
     state: &Arc<State>,
 ) {
@@ -2042,7 +2036,7 @@ fn try_connect(
     let capture_buffer_size = cfg.obd2.capture_buffer_size;
     let use_framing = cfg.obd2.use_framing;
     let use_repeat = cfg.obd2.use_repeat;
-    let repeat_cmd: Obd2Buffer = cfg.obd2.repeat_string.as_bytes().into();
+    let repeat_cmd: WireBytes = cfg.obd2.repeat_string.as_bytes().into();
     drop(cfg);
 
     // Create DongleState for init and queries
@@ -2224,21 +2218,24 @@ impl Obd2Proxy {
 
         let watchdog = WatchdogHandle::register(c"obd2_client");
 
-        let mut reader = BufReader::new(&client_stream);
+        let mut reader = &client_stream;
         let mut writer = &client_stream;
         let mut session = ServerSession::new(Identity::default());
+        // Clients send one short command line at a time; a chunk holding
+        // more than two lines makes `feed` spill its action list, nothing
+        // worse.
+        let mut chunk = [0u8; 64];
 
         loop {
             watchdog.feed();
 
-            let mut byte = [0u8; 1];
-            match reader.read(&mut byte) {
+            match reader.read(&mut chunk) {
                 Ok(0) => {
                     info!("OBD2 client disconnected: {peer}");
                     break;
                 }
-                Ok(_) => {
-                    for action in session.feed(&byte) {
+                Ok(n) => {
+                    for action in session.feed(&chunk[..n]) {
                         match action {
                             Action::Send(echo) => writer.write_all(&echo)?,
                             Action::At { command, response } => {
