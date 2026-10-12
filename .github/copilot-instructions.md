@@ -49,6 +49,10 @@ These are of course the sizes of the `SmallVec` struct itself, not the total mem
 
 So be mindful of the inline size you choose, as choosing too small may actually be wasting memory due to heap allocations, while choosing too large may waste memory due to the larger struct size.
 
+### In `tachtalk-elm327-lib`
+
+The guidance covers the ELM327 library too, since the firmware runs it on every client connection: the library returns no `Vec`. Every byte payload it hands out is `WireBytes`, its exported alias for `SmallVec<u8, 16>`, which the firmware also uses for its own wire buffers. Every list it returns is a `SmallVec` (`feed` returns `SmallVec<Action, 4>`). Sixteen bytes inline covers echo, every OBD command, and the common replies (`OK`, `?`, the `ATI` banner, `NO DATA`). Two rare lines spill to the heap and that is accepted: `UNABLE TO CONNECT`, sent only while the dongle is not ready, and the `ATDP` reply, asked once while an app connects. Command text stays `String`. Decided in issue #28.
+
 # Configuration
 
 Anything related to configuration should be added to the Web UI and stored in NVS. The `Config` struct in `tachtalk-firmware/src/config.rs` is the single source of truth for all configuration options. 
