@@ -5,7 +5,9 @@ The ELM327 wire protocol was implemented five times across the workspace
 benchmark client), with only a thin AT-command slice shared. Decision
 (issue #6, design grill confirmed 2026-09-29): `tachtalk-elm327-lib` grows
 into the whole protocol as two sans-io session machines — `ServerSession`
-(server side) and `DongleClient` (client side) — fed bytes and returning
+(server side) and `ClientSession` (client side; named `DongleClient` until
+2026-10-13, renamed because the client side also speaks to the TachTalk proxy
+and the mock server, not only to dongles) — fed bytes and returning
 actions, with sockets, timeouts, and business rules staying in each
 consumer's adapter. Chosen over per-consumer loops because the duplication
 had already diverged (normalization differed between firmware and mock) and

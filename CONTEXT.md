@@ -19,15 +19,17 @@ framing, echo, the AT dialect, response formatting, the prompt.
 _Avoid_: proxy side, emulation
 
 **Client side**:
-The role that speaks to a real dongle: command encoding, prompt-terminated
-receive, multi-ECU response parsing, PID data-length learning.
+The role that speaks to an ELM327, real or emulated (a dongle, the TachTalk
+proxy, the mock server): command encoding, prompt-terminated receive,
+multi-ECU response parsing, PID data-length learning.
 _Avoid_: dongle side
 
 **Session machine**:
 A sans-io state machine for one role of the wire protocol (`ServerSession`,
-`DongleClient`): fed raw bytes, returns actions, never touches a socket or
-clock.
-_Avoid_: handler, driver, codec
+`ClientSession`): fed raw bytes, returns actions, never touches a socket or
+clock. What a session keeps about its peer is named for the peer:
+`ServerSession` holds `ClientState`, `ClientSession` holds `ServerState`.
+_Avoid_: handler, driver, codec, DongleClient
 
 **Action**:
 What a session machine returns to its adapter: bytes to write, a command to
