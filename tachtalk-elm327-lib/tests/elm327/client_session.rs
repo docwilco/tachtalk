@@ -10,6 +10,7 @@ use std::io::ErrorKind;
 use std::time::Duration;
 
 use tachtalk_elm327_lib::{ClientConfig, ClientSession, FeatureSupport, Lines, Pid, ReplyLine};
+use test_case::test_case;
 
 use crate::support::{FakeStream, Step};
 
@@ -285,6 +286,38 @@ fn an_error_forgets_the_last_command() {
 }
 
 #[test]
+fn a_command_in_between_is_not_repeated_as_the_query() {
+    // A bare CR would re-run 0100, so the query after it goes out in full.
+    let mut client = session_with(
+        vec![
+            sent(b"010C\r"),
+            received(b"410C1AF8\r\r>"),
+            sent(b"0100\r"),
+            received(b"4100BE3FA813\r\r>"),
+            sent(b"010C\r"),
+            received(b"410C1B00\r\r>"),
+        ],
+        repeat_on(),
+    );
+    client.query_pid(0x0C, None).unwrap();
+    client.command(b"0100").unwrap();
+    client.query_pid(0x0C, None).unwrap();
+}
+
+#[test]
+fn atz_turns_framing_off() {
+    let mut client = session(vec![
+        sent(b"ATH1\r"),
+        received(b"OK\r\r>"),
+        sent(b"ATZ\r"),
+        received(b"\r\rELM327 v2.3\r\r>"),
+    ]);
+    client.command(b"ATH1").unwrap();
+    client.command(b"ATZ").unwrap();
+    assert!(!client.server_state().framing());
+}
+
+#[test]
 fn repeat_off_always_sends_the_full_query() {
     let mut client = session(vec![
         sent(b"010C\r"),
@@ -377,21 +410,19 @@ fn replay(name: &str) -> (ClientSession<FakeStream>, Vec<HashMap<Pid, Lines>>) {
     (client, parsed)
 }
 
-#[test]
-fn replays_every_captured_session() {
-    for name in [
-        "2026-02-10T13-15-24-056Z",
-        "2026-02-10T13-19-43-520Z",
-        "2026-02-10T13-20-12-385Z",
-        "2026-02-10T13-23-44-721Z",
-        "2026-02-10T13-24-36-102Z",
-        "2026-02-10T13-25-29-928Z",
-        "2026-02-10T13-25-49-728Z",
-        "2026-02-10T13-26-56-363Z",
-    ] {
-        let (client, _) = replay(name);
-        assert!(!client.get_ref().written().is_empty(), "{name}");
-    }
+#[test_case("2026-02-10T13-15-24-056Z")]
+#[test_case("2026-02-10T13-19-43-520Z")]
+#[test_case("2026-02-10T13-20-12-385Z")]
+#[test_case("2026-02-10T13-23-44-721Z")]
+#[test_case("2026-02-10T13-24-36-102Z")]
+#[test_case("2026-02-10T13-25-29-928Z")]
+#[test_case("2026-02-10T13-25-49-728Z")]
+#[test_case("2026-02-10T13-26-56-363Z")]
+fn replays_a_captured_session(name: &str) {
+    // Every query in the capture got a reply that parses.
+    let (client, parsed) = replay(name);
+    assert!(!client.get_ref().written().is_empty());
+    assert!(!parsed.is_empty());
 }
 
 #[test]

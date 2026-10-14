@@ -92,7 +92,6 @@ impl<S: Read + Write> Drop for AtCommand<'_, S> {
 pub struct ObdCommand<'a, S: Read + Write> {
     session: &'a mut ServerSession<S>,
     command: String,
-    raw: WireBytes,
     answered: bool,
 }
 
@@ -104,25 +103,24 @@ impl<S: Read + Write> ObdCommand<'_, S> {
         &self.command
     }
 
-    /// The command bytes as received (untrimmed, no CR or LF).
-    #[must_use]
-    pub fn raw(&self) -> &[u8] {
-        &self.raw
-    }
-
     /// The client's settings (echo, line feeds, spaces, headers).
     #[must_use]
     pub fn client_state(&self) -> &ClientState {
         &self.session.state
     }
 
-    /// Answer with one line per ECU, formatted to the client's settings.
-    /// The command becomes the one a later bare carriage return repeats.
+    /// Answer with one line per ECU, formatted to the client's settings;
+    /// no lines at all is `NO DATA`. The command becomes the one a later
+    /// bare carriage return repeats.
     ///
     /// # Errors
     /// Returns the stream's error if writing fails.
     pub fn reply(mut self, lines: &[ReplyLine]) -> io::Result<()> {
         self.answered = true;
+        if lines.is_empty() {
+            // No ECU answered: what a real ELM327 says then.
+            return self.session.write_line("NO DATA");
+        }
         let state = &self.session.state;
         let le = state.line_ending().as_bytes();
         let mut out: SmallVec<u8, 64> = SmallVec::new();
@@ -164,7 +162,7 @@ impl<S: Read + Write> Drop for ObdCommand<'_, S> {
 /// A complete line read from the client, before it is handed out.
 enum Line {
     At(String),
-    Obd(String, WireBytes),
+    Obd(String),
 }
 
 /// Server side of the wire protocol over a stream it owns: CR framing,
@@ -250,10 +248,9 @@ impl<S: Read + Write> ServerSession<S> {
                 command,
                 answered: false,
             }),
-            Line::Obd(command, raw) => Command::Obd(ObdCommand {
+            Line::Obd(command) => Command::Obd(ObdCommand {
                 session: self,
                 command,
-                raw,
                 answered: false,
             }),
         })
@@ -296,7 +293,7 @@ impl<S: Read + Write> ServerSession<S> {
             // The datasheet's repeat: a bare carriage return re-runs the
             // last command replied to; with none, it is answered `?`.
             if let Some(last) = &self.state.last_obd_command {
-                Some(Line::Obd(last.clone(), WireBytes::from(last.as_bytes())))
+                Some(Line::Obd(last.clone()))
             } else {
                 self.line.clear();
                 self.write_line("?")?;
@@ -305,7 +302,7 @@ impl<S: Read + Write> ServerSession<S> {
         } else if command.starts_with("AT") {
             Some(Line::At(command))
         } else {
-            Some(Line::Obd(command, WireBytes::from(self.line.as_slice())))
+            Some(Line::Obd(command))
         };
         self.line.clear();
         Ok(line)
@@ -321,21 +318,40 @@ impl<S: Read + Write> ServerSession<S> {
     }
 
     fn answer_at(&mut self, command: &str) -> io::Result<()> {
-        let response = handle_at_command(&mut self.state, &self.identity, command);
-        self.stream.write_all(response.as_bytes())
+        let answer = handle_at_command(&mut self.state, &self.identity, command);
+        // The line ending in force now: ATL0 and ATL1 answer with the one
+        // they just chose.
+        let le = self.state.line_ending();
+        write_reply_line(&mut self.stream, le, answer.reset, answer.text)
     }
 
-    /// Write `{text}{le}{le}>`, a real ELM327's shape for a one-line reply.
     fn write_line(&mut self, text: &str) -> io::Result<()> {
-        let le = self.state.line_ending().as_bytes();
-        let mut out = WireBytes::new();
-        out.extend_from_slice(text.as_bytes());
-        out.extend_from_slice(le);
-        out.extend_from_slice(le);
-        out.push(b'>');
-        self.stream.write_all(&out)
+        write_reply_line(&mut self.stream, self.state.line_ending(), false, text)
     }
 }
+
+/// Write `{text}{le}{le}>`, a real ELM327's shape for a one-line reply,
+/// after two blank lines when `blank_lines_first` (the reset banner).
+fn write_reply_line(
+    stream: &mut impl Write,
+    le: &str,
+    blank_lines_first: bool,
+    text: &str,
+) -> io::Result<()> {
+    let le = le.as_bytes();
+    let mut out = WireBytes::new();
+    if blank_lines_first {
+        out.extend_from_slice(le);
+        out.extend_from_slice(le);
+    }
+    out.extend_from_slice(text.as_bytes());
+    out.extend_from_slice(le);
+    out.extend_from_slice(le);
+    out.push(b'>');
+    stream.write_all(&out)
+}
+
+const HEX: &[u8; 16] = b"0123456789ABCDEF";
 
 /// The CAN id a line is headed with when its ECU is unknown: 7E8, the
 /// engine ECU's usual reply id.
@@ -344,7 +360,6 @@ const DEFAULT_ECU: u16 = 0x7E8;
 /// Append a line's `ATH1` header: the 3-digit CAN id and the data length,
 /// each followed by a space when `spaces`.
 fn push_header(out: &mut SmallVec<u8, 64>, line: &ReplyLine, spaces: bool) {
-    const HEX: &[u8; 16] = b"0123456789ABCDEF";
     let ecu = line.ecu.unwrap_or(DEFAULT_ECU);
     for shift in [8, 4, 0] {
         out.push(HEX[usize::from((ecu >> shift) & 0x0F)]);
@@ -362,7 +377,6 @@ fn push_header(out: &mut SmallVec<u8, 64>, line: &ReplyLine, spaces: bool) {
 
 /// Append `data` as uppercase hex, a space between bytes when `spaces`.
 fn push_hex(out: &mut SmallVec<u8, 64>, data: &[u8], spaces: bool) {
-    const HEX: &[u8; 16] = b"0123456789ABCDEF";
     for (i, &b) in data.iter().enumerate() {
         if spaces && i > 0 {
             out.push(b' ');
@@ -372,29 +386,28 @@ fn push_hex(out: &mut SmallVec<u8, 64>, data: &[u8], spaces: bool) {
     }
 }
 
-/// Handle an AT command against `state`, answering identity queries from
-/// `identity`. Returns the full response including line endings and prompt.
-///
-/// This is the firmware's AT dialect, in the shape of a real ELM327's replies.
-fn handle_at_command(state: &mut ClientState, identity: &Identity, command: &str) -> String {
-    // ELM327 ignores spaces in AT commands
-    let cmd: String = command
-        .to_uppercase()
-        .chars()
-        .filter(|c| *c != ' ')
-        .collect();
-    let le = state.line_ending();
+/// An AT command's answer, before line endings and the prompt.
+struct AtAnswer<'a> {
+    text: &'a str,
+    /// The command was `ATZ`: a real ELM327 prints blank lines before its
+    /// reset banner.
+    reset: bool,
+}
 
-    // Determine response content (without line endings)
-    let response_text = match cmd.as_str() {
+/// Apply a canonical AT command to `state` and return its answer, taking
+/// identity strings from `identity`. This is the firmware's AT dialect.
+fn handle_at_command<'a>(
+    state: &mut ClientState,
+    identity: &'a Identity,
+    command: &str,
+) -> AtAnswer<'a> {
+    let mut reset = false;
+    let text = match command {
         "ATZ" => {
             // Reset all settings to defaults
             *state = ClientState::default();
-            // Use new state's line ending for response
-            // A real ELM327 prints blank lines before its reset banner.
-            let le = state.line_ending();
-            let ati = &identity.ati;
-            return format!("{le}{le}{ati}{le}{le}>");
+            reset = true;
+            identity.ati.as_str()
         }
         "ATE0" => {
             state.echo_enabled = false;
@@ -428,29 +441,18 @@ fn handle_at_command(state: &mut ClientState, identity: &Identity, command: &str
             state.headers_enabled = true;
             "OK"
         }
-        "ATRV" => {
-            // Return simulated battery voltage (12.6V)
-            return format!("12.6V{le}{le}>");
-        }
+        // Simulated battery voltage
+        "ATRV" => "12.6V",
         "ATSP0" | "ATAT1" | "ATAT2" => "OK",
-        "ATDP" => {
-            // Describe protocol
-            return format!("AUTO, ISO 15765-4 (CAN 11/500){le}{le}>");
-        }
-        "ATDPN" => {
-            // Describe protocol number
-            return format!("A6{le}{le}>");
-        }
-        _ if cmd.starts_with("ATSP") => "OK",
-        _ if cmd.starts_with("ATST") => "OK",
-        _ if cmd.starts_with("ATAT") => "OK",
-        "ATI" => return format!("{}{le}{le}>", identity.ati),
-        "AT@1" => return format!("{}{le}{le}>", identity.device_description),
+        // Describe protocol, and its number
+        "ATDP" => "AUTO, ISO 15765-4 (CAN 11/500)",
+        "ATDPN" => "A6",
+        _ if command.starts_with("ATSP") => "OK",
+        _ if command.starts_with("ATST") => "OK",
+        _ if command.starts_with("ATAT") => "OK",
+        "ATI" => identity.ati.as_str(),
+        "AT@1" => identity.device_description.as_str(),
         _ => "?",
     };
-
-    // Answer with the line ending in force now, so ATL0 and ATL1 answer
-    // with the one they just chose.
-    let le = state.line_ending();
-    format!("{response_text}{le}{le}>")
+    AtAnswer { text, reset }
 }

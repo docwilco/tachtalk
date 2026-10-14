@@ -99,7 +99,7 @@ fn handle_client(
         let result = match session.next_command() {
             Ok(Command::At(at)) => {
                 if !quiet {
-                    println!("RX: {}", at.command().to_uppercase());
+                    println!("RX: {}", at.command());
                 }
                 rate_limit_wait(min_interval, last_response_time);
                 last_response_time = Some(Instant::now());
@@ -107,7 +107,7 @@ fn handle_client(
             }
             Ok(Command::Obd(obd)) => {
                 if !quiet {
-                    println!("RX: {}", obd.command().to_uppercase());
+                    println!("RX: {}", obd.command());
                 }
                 rate_limit_wait(min_interval, last_response_time);
                 let answer = respond_obd(obd.command(), &start_time);
@@ -296,7 +296,7 @@ fn respond_obd(command: &str, start_time: &Instant) -> Answer {
 
             let mut response = String::from("41");
             for pid in pid_data.as_bytes().chunks_exact(2) {
-                let pid = String::from_utf8_lossy(pid).to_uppercase();
+                let pid = String::from_utf8_lossy(pid);
                 let Some(data) = get_pid_response(&pid, start_time) else {
                     // Unknown PID
                     return Answer::Reject("NO DATA");

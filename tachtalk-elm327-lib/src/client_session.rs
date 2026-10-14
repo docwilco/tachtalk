@@ -111,8 +111,8 @@ pub struct ClientSession<S> {
 }
 
 impl<S: Read + Write> ClientSession<S> {
-    /// A session over `stream`; call [`init`](Self::init) before querying a
-    /// dongle that was just connected.
+    /// A session over `stream`; call [`init`](Self::init) first when the
+    /// peer was just connected.
     #[must_use]
     pub fn new(stream: S, config: ClientConfig) -> Self {
         let repeat = if config.repeat {
@@ -161,15 +161,18 @@ impl<S: Read + Write> ClientSession<S> {
     }
 
     /// Send any command and return its raw reply, up to and including the
-    /// `>` prompt. A completed `ATH1` or `ATH0` sets framing.
+    /// `>` prompt. A completed `ATH1` sets framing; `ATH0` and `ATZ` clear
+    /// it. The next query goes out in full, since a bare CR would now
+    /// repeat this command.
     ///
     /// # Errors
     /// Returns the stream's errors; a closed connection is `UnexpectedEof`.
     pub fn command(&mut self, command: &[u8]) -> io::Result<WireBytes> {
+        self.last_command = None;
         let reply = self.round_trip(command)?;
         if command.eq_ignore_ascii_case(b"ATH1") {
             self.server.framing = true;
-        } else if command.eq_ignore_ascii_case(b"ATH0") {
+        } else if command.eq_ignore_ascii_case(b"ATH0") || command.eq_ignore_ascii_case(b"ATZ") {
             self.server.framing = false;
         }
         Ok(reply)
@@ -243,24 +246,20 @@ impl<S: Read + Write> ClientSession<S> {
             && self.last_command.as_ref() == Some(&command);
 
         if !can_try_repeat {
-            let result = self.round_trip(&command);
-            self.last_command = result.is_ok().then_some(command);
-            return result;
+            return self.send_query(command);
         }
 
         debug!("Trying repeat command");
         let repeat_result = self.round_trip(b"");
         match &repeat_result {
             Ok(reply) if reply.contains(&b'?') => {
-                info!("Dongle does not support repeat command");
+                info!("ELM327 does not support the repeat command");
                 self.server.repeat = FeatureSupport::No;
-                let result = self.round_trip(&command);
-                self.last_command = result.is_ok().then_some(command);
-                result
+                self.send_query(command)
             }
             Ok(_) => {
                 if self.server.repeat == FeatureSupport::Unknown {
-                    info!("Dongle supports repeat command");
+                    info!("ELM327 supports the repeat command");
                     self.server.repeat = FeatureSupport::Yes;
                 }
                 repeat_result
@@ -272,6 +271,14 @@ impl<S: Read + Write> ClientSession<S> {
         }
     }
 
+    /// Send a query in full; it becomes the one a repeat stands for if it
+    /// succeeds.
+    fn send_query(&mut self, command: WireBytes) -> io::Result<WireBytes> {
+        let result = self.round_trip(&command);
+        self.last_command = result.is_ok().then_some(command);
+        result
+    }
+
     /// Write `command` with a carriage return and read the reply up to the
     /// `>` prompt.
     fn round_trip(&mut self, command: &[u8]) -> io::Result<WireBytes> {
@@ -279,7 +286,7 @@ impl<S: Read + Write> ClientSession<S> {
         if !line.ends_with(b"\r") {
             line.push(b'\r');
         }
-        debug!("Sending to dongle: {:?}", String::from_utf8_lossy(&line));
+        debug!("Sending to ELM327: {:?}", String::from_utf8_lossy(&line));
         self.stream.write_all(&line)?;
         self.read_reply()
     }
@@ -294,7 +301,7 @@ impl<S: Read + Write> ClientSession<S> {
                 Ok(0) => return Err(io::ErrorKind::UnexpectedEof.into()),
                 Ok(n) => {
                     reply.extend_from_slice(&buffer[..n]);
-                    debug!("Read {} bytes from dongle, total: {}", n, reply.len());
+                    debug!("Read {} bytes from ELM327, total: {}", n, reply.len());
                     if reply.contains(&b'>') {
                         debug!("Complete response: {:?}", String::from_utf8_lossy(&reply));
                         return Ok(reply);
@@ -437,7 +444,7 @@ fn parse_lines(reply: &[u8], framing: bool) -> SmallVec<ReplyLine, 4> {
         if trimmed.is_empty() || trimmed.contains('>') {
             continue;
         }
-        let hex: SmallVec<u8, 24> = trimmed.replace(' ', "").into_bytes().into();
+        let hex: SmallVec<u8, 24> = trimmed.bytes().filter(|&b| b != b' ').collect();
 
         if !framing {
             lines.push(ReplyLine {

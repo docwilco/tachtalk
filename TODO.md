@@ -18,13 +18,11 @@
 ## OBD2 Proxy
 - [ ] Pipelined dongle queries — port the pipelining strategy from the removed test firmware's Mode 4 (git history at v0.3.1, `tachtalk-test-firmware/src/obd2.rs`) to the main firmware's dongle task for higher query throughput
 - [ ] Properly parse client commands into mode, PIDs, and optional response count — currently `wire_command_to_pid` only extracts the first PID and ignores both multi-PID requests (e.g., `010C0D05`) and the trailing response count hint (e.g., `010C2`, which `strip_response_count` drops from the cache key). Needs a `ParsedClientCommand { mode, pids, max_responses }` struct so that: (a) multi-PID requests return combined responses, (b) response count limits how many ECU lines are returned.
-- [ ] Store ECU CAN IDs with cached responses (currently `CachedResponse` is `SmallVec<PidData, 1>` — data only, ECU IDs are parsed transiently for learning but discarded before caching)
-- [ ] Support client-side framing (ATH1/ATH0) — currently `format_cached_for_client` always emits bare `41{PID}{DATA}` without CAN headers, regardless of client ATH state. Requires ECU ID storage first.
-- [ ] Support 29-bit extended CAN IDs — currently `ecu_id` in `ParsedLine` is `u16` (11-bit only) and `parse_response_framed` hardcodes a 3 hex char CAN ID prefix. Needs widening to `u32` and detection from protocol or line length.
+- [ ] Support 29-bit extended CAN IDs — currently `ReplyLine::ecu` in `tachtalk-elm327-lib` is `u16` (11-bit only), and its reply parser and `ATH1` header writer hardcode a 3 hex char CAN ID. Needs widening to `u32` and detection from protocol or line length.
 
 ## Performance
 - [x] Pre-compute LED color gradients per threshold once on config change, not every render cycle (`interpolate_color` is called per-LED per-frame in `compute_led_state`)
-- [ ] Rewrite `parse_response_framed` and `parse_response_to_cache` to operate on `&[u8]` directly instead of converting through `String`/`str`. Both currently allocate intermediate `String`s for hex parsing. `parse_response_framed` does `String::from_utf8_lossy` → `.split('\r')` → `.replace(' ', "")` → hex parse; `parse_response_to_cache` does `.filter` → `.map` → `collect::<String>` → chunk hex pairs. Can split on `b'\r'`, skip `b' '` in place, and decode hex pairs with a small inline helper — avoids all intermediate allocations.
+- [ ] Rewrite `ClientSession`'s reply parsing (`parse_lines` in `tachtalk-elm327-lib`) to operate on `&[u8]` directly: it still goes through `String::from_utf8_lossy` and `.split('\r')` before decoding hex pairs.
 
 ## Infrastructure
 - [x] Upgrade to ESP-IDF 5.4

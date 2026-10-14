@@ -8,3 +8,6 @@ rust-version.workspace = true
 [dependencies]
 log.workspace = true
 smallvec.workspace = true
+
+[dev-dependencies]
+test-case = "3"

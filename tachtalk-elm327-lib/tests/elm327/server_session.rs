@@ -21,7 +21,7 @@ enum Answer {
     Reject(&'static str),
 }
 
-/// The commands a session handed out, as `AT ATZ` or `OBD 010C | raw`.
+/// The commands a session handed out, as `AT ATZ` or `OBD 010C`.
 type Seen = Vec<String>;
 
 /// Serve the whole stream, answering AT commands and every OBD command with
@@ -38,11 +38,7 @@ fn serve(
                 at.answer().unwrap();
             }
             Ok(Command::Obd(obd)) => {
-                seen.push(format!(
-                    "OBD {} | {}",
-                    obd.command(),
-                    String::from_utf8_lossy(obd.raw())
-                ));
+                seen.push(format!("OBD {}", obd.command()));
                 match answer(&obd) {
                     Answer::Reply(lines) => obd.reply(&lines).unwrap(),
                     Answer::Reject(text) => obd.reject(text).unwrap(),
@@ -184,22 +180,16 @@ fn identity_strings_come_from_the_constructor() {
 fn commands_are_handed_out_canonical() {
     // Changed from the firmware, which forwarded OBD commands as typed: the
     // ELM327 ignores case and spaces, so every command is handed out
-    // uppercase with spaces removed; raw() keeps the bytes as received.
+    // uppercase with spaces removed.
     let (_, seen) = serve_input(b"ATE0\r01 0c\rat sp 0\r");
-    assert_eq!(seen, ["AT ATE0", "OBD 010C | 01 0c", "AT ATSP0"]);
-}
-
-#[test]
-fn obd_command_is_handed_out_trimmed_with_raw_bytes() {
-    let (_, seen) = serve_input(b"ATE0\r 010c 1 \r");
-    assert_eq!(seen, ["AT ATE0", "OBD 010C1 |  010c 1 "]);
+    assert_eq!(seen, ["AT ATE0", "OBD 010C", "AT ATSP0"]);
 }
 
 #[test]
 fn commands_torn_across_reads_are_reassembled() {
     let mut session = firmware_session(FakeStream::torn(b"ATE0\r010C\r"));
     let seen = serve(&mut session, |_| Answer::Reject("?"));
-    assert_eq!(seen, ["AT ATE0", "OBD 010C | 010C"]);
+    assert_eq!(seen, ["AT ATE0", "OBD 010C"]);
 }
 
 #[test]
@@ -217,7 +207,7 @@ fn a_read_timeout_keeps_the_partial_line() {
     let err = session.next_command().expect_err("a timeout");
     assert_eq!(err.kind(), ErrorKind::TimedOut);
     let seen = serve(&mut session, |_| Answer::Reject("?"));
-    assert_eq!(seen, ["OBD 010C | 010C"]);
+    assert_eq!(seen, ["OBD 010C"]);
 }
 
 #[test]
@@ -276,6 +266,16 @@ fn atl0_and_atl1_answer_with_the_line_ending_they_chose() {
 }
 
 #[test]
+fn a_reply_with_no_lines_is_no_data() {
+    let mut session = firmware_session(FakeStream::new(b"ATE0\r010C\r"));
+    serve(&mut session, |_| Answer::Reply(vec![]));
+    assert_eq!(
+        session.get_ref().written_text(),
+        "ATE0\\rOK\\r\\n\\r\\n>NO DATA\\r\\n\\r\\n>"
+    );
+}
+
+#[test]
 fn reject_writes_a_line_with_the_current_line_ending() {
     let (written, _) = serve_input(b"ATE0\r010C\rATL0\r010C\r");
     assert_eq!(
@@ -306,15 +306,7 @@ fn a_bare_cr_repeats_the_last_replied_command() {
     let seen = serve(&mut session, |_| {
         Answer::Reply(vec![line(&[0x41, 0x0C, 0x1A, 0xF8])])
     });
-    assert_eq!(
-        seen,
-        [
-            "AT ATE0",
-            "OBD 010C1 | 010C 1",
-            "OBD 010C1 | 010C1",
-            "OBD 010C1 | 010C1"
-        ]
-    );
+    assert_eq!(seen, ["AT ATE0", "OBD 010C1", "OBD 010C1", "OBD 010C1"]);
 }
 
 #[test]
@@ -322,7 +314,7 @@ fn a_bare_cr_after_a_rejected_command_answers_a_question_mark() {
     // A rejected command is not recorded, so there is nothing to repeat;
     // the session answers the CR itself without handing anything out.
     let (written, seen) = serve_input(b"ATE0\r010C\r\r");
-    assert_eq!(seen, ["AT ATE0", "OBD 010C | 010C"]);
+    assert_eq!(seen, ["AT ATE0", "OBD 010C"]);
     assert_eq!(
         written,
         "ATE0\\rOK\\r\\n\\r\\n>?\\r\\n\\r\\n>?\\r\\n\\r\\n>"
@@ -333,7 +325,7 @@ fn a_bare_cr_after_a_rejected_command_answers_a_question_mark() {
 fn a_1_is_an_ordinary_command() {
     // The invented `1` repeat is retired (ADR 0001): it reaches the program.
     let (_, seen) = serve_input(b"ATE0\r1\r");
-    assert_eq!(seen, ["AT ATE0", "OBD 1 | 1"]);
+    assert_eq!(seen, ["AT ATE0", "OBD 1"]);
 }
 
 #[test]
@@ -352,16 +344,8 @@ fn torn_reads_write_the_same_bytes_as_whole_reads() {
     assert_eq!(
         whole_seen,
         [
-            "AT ATZ",
-            "AT ATE0",
-            "OBD 010C | 010C",
-            "AT ATH1",
-            "OBD 010C | 010C",
-            "OBD 010C | 010C",
-            "AT ATL0",
-            "AT ATDP",
-            "OBD 010C | 010C",
-            "OBD 010D | 010D",
+            "AT ATZ", "AT ATE0", "OBD 010C", "AT ATH1", "OBD 010C", "OBD 010C", "AT ATL0",
+            "AT ATDP", "OBD 010C", "OBD 010D",
         ]
     );
 }

@@ -582,7 +582,7 @@ impl PollingState {
         let try_multi = use_multi_pid
             && connection
                 .as_ref()
-                .is_some_and(|ds| ds.server_state().multi_pid() != FeatureSupport::No);
+                .is_some_and(|dongle| dongle.server_state().multi_pid() != FeatureSupport::No);
 
         if try_multi {
             self.poll_pids_multi(connection, state, max_pids_per_query)
@@ -606,7 +606,7 @@ impl PollingState {
         slow_poll_interval: Duration,
         slow_poll_ratio: u32,
     ) -> u32 {
-        let Some(dongle_state) = connection.as_mut() else {
+        let Some(dongle) = connection.as_mut() else {
             return 0;
         };
 
@@ -614,7 +614,7 @@ impl PollingState {
 
         // Always try to poll a fast PID
         if let Some(pid) = self.next_fast_pid() {
-            let result = self.query_single(dongle_state, pid);
+            let result = self.query_single(dongle, pid);
             handle_dongle_result(result, connection, state);
 
             requests += 1;
@@ -635,8 +635,8 @@ impl PollingState {
         if should_poll_slow {
             if let Some(pid) = self.next_slow_pid() {
                 // Re-check connection after potential fast poll failure
-                if let Some(ref mut dongle_state) = connection {
-                    let result = self.query_single(dongle_state, pid);
+                if let Some(ref mut dongle) = connection {
+                    let result = self.query_single(dongle, pid);
                     handle_dongle_result(result, connection, state);
 
                     requests += 1;
@@ -672,11 +672,11 @@ impl PollingState {
         state: &Arc<State>,
         max_pids: u8,
     ) -> u32 {
-        let Some(dongle_state) = connection.as_mut() else {
+        let Some(dongle) = connection.as_mut() else {
             return 0;
         };
 
-        let pid_groups = self.partition_pids_by_ecu_count(dongle_state);
+        let pid_groups = self.partition_pids_by_ecu_count(dongle);
 
         let mut requests: u32 = 0;
         let chunk_size = usize::from(max_pids.clamp(2, 6));
@@ -686,22 +686,22 @@ impl PollingState {
                 // Known ECU count: batch into multi-PID commands
                 Some(count) => {
                     for chunk in group.chunks(chunk_size) {
-                        let Some(ref mut ds) = connection else {
+                        let Some(ref mut dongle) = connection else {
                             break;
                         };
 
                         if chunk.len() == 1 {
-                            let result = self.query_single(ds, chunk[0]);
+                            let result = self.query_single(dongle, chunk[0]);
                             handle_dongle_result(result, connection, state);
                         } else {
-                            let result = ds.query_pids(chunk, Some(*count));
-                            self.keep_ecu_counts(ds, chunk);
+                            let result = dongle.query_pids(chunk, Some(*count));
+                            self.keep_ecu_counts(dongle, chunk);
                             handle_dongle_result(result, connection, state);
 
                             // If multi-PID was just rejected, stop sending more chunks —
                             // the next poll_pids call will use single-PID mode.
-                            if connection.as_ref().map_or(true, |ds| {
-                                ds.server_state().multi_pid() == FeatureSupport::No
+                            if connection.as_ref().map_or(true, |dongle| {
+                                dongle.server_state().multi_pid() == FeatureSupport::No
                             }) {
                                 requests += 1;
                                 state
@@ -724,10 +724,10 @@ impl PollingState {
                 // Unknown ECU count or data length: query individually to learn
                 None => {
                     for &pid in group {
-                        let Some(ref mut ds) = connection else {
+                        let Some(ref mut dongle) = connection else {
                             break;
                         };
-                        let result = self.query_single(ds, pid);
+                        let result = self.query_single(dongle, pid);
                         handle_dongle_result(result, connection, state);
 
                         requests += 1;
@@ -838,10 +838,10 @@ fn try_reconnect(
     };
     if should_try {
         *last_connect_attempt = Some(Instant::now());
-        if let Some((dongle_state, local_addr, remote_addr)) =
+        if let Some((dongle, local_addr, remote_addr)) =
             try_connect(dongle_ip, dongle_port, timeout, watchdog, state)
         {
-            *connection = Some(dongle_state);
+            *connection = Some(dongle);
             state
                 .dongle_tcp_state
                 .store(DongleTcpState::Ready, Ordering::Relaxed);
@@ -1583,7 +1583,7 @@ impl Obd2Proxy {
                     debug!("OBD2 client command: {:?}", at.command());
                     debug!("Handling AT command locally");
                     if let Ok(mut log) = state.at_command_log.lock() {
-                        log.insert(at.command().to_uppercase());
+                        log.insert(at.command().to_string());
                     }
                     at.answer()?;
                 }
@@ -1626,7 +1626,7 @@ impl Obd2Proxy {
 
         // Record unique OBD2 PIDs
         if let Ok(mut log) = state.pid_log.lock() {
-            log.insert(obd.command().to_uppercase());
+            log.insert(obd.command().to_string());
         }
 
         // The cache key is the command without its response count

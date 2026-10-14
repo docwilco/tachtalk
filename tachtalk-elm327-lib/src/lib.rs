@@ -11,9 +11,9 @@ pub use client_session::{ClientConfig, ClientSession, FeatureSupport, ServerStat
 pub use pid::{Pid, PidDataLengths, PidGroup, MODE01_PID_DATA_LENGTHS};
 pub use server_session::{AtCommand, Command, Identity, ObdCommand, ServerSession};
 
-/// Bytes the library hands to an adapter to write. Sixteen bytes inline
-/// covers echo, every OBD command, and the common replies; the rare longer
-/// lines (`UNABLE TO CONNECT`, the `ATDP` reply) spill to the heap.
+/// Bytes the library hands out or buffers: a reply line's data, a raw
+/// reply, echo, a command. Sixteen bytes inline covers echo, every OBD
+/// command and the common one-line replies; longer ones spill to the heap.
 pub type WireBytes = smallvec::SmallVec<u8, 16>;
 
 /// One ECU's answer to an OBD command: the ECU's id when known, and the
