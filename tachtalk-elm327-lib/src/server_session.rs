@@ -375,7 +375,7 @@ fn push_hex(out: &mut SmallVec<u8, 64>, data: &[u8], spaces: bool) {
 /// Handle an AT command against `state`, answering identity queries from
 /// `identity`. Returns the full response including line endings and prompt.
 ///
-/// This is the firmware's AT dialect, moved verbatim.
+/// This is the firmware's AT dialect, in the shape of a real ELM327's replies.
 fn handle_at_command(state: &mut ClientState, identity: &Identity, command: &str) -> String {
     // ELM327 ignores spaces in AT commands
     let cmd: String = command
@@ -449,8 +449,8 @@ fn handle_at_command(state: &mut ClientState, identity: &Identity, command: &str
         _ => "?",
     };
 
-    // Build response with proper line endings (echo already sent)
-    // Note: for commands that change linefeed setting, we use the OLD setting
-    // since le was captured before the match
+    // Answer with the line ending in force now, so ATL0 and ATL1 answer
+    // with the one they just chose.
+    let le = state.line_ending();
     format!("{response_text}{le}{le}>")
 }

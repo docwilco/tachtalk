@@ -2,13 +2,12 @@
 //!
 //! Expected bytes are transcribed from the firmware proxy's client loop
 //! (tachtalk-firmware/src/obd2.rs, `handle_client` + `process_command` as of
-//! bcaa695) and lock its behavior byte-for-byte, warts included: echo per
-//! byte read, CR framing with LF dropped, empty commands silently ignored,
-//! and AT responses formatted with the line ending from before the command
-//! took effect. Deliberate changes since are noted at their tests: the
-//! datasheet's bare-CR repeat replaced the invented `1`, and every reply
-//! takes a real ELM327's shape, `{line}{le}{le}>`, as the captures in
-//! `fixtures/` show it (was the firmware's `{le}{line}{le}>`).
+//! bcaa695) and lock its behavior byte-for-byte: echo per byte read, CR
+//! framing with LF dropped, the AT dialect. Deliberate changes since are noted at their tests: the datasheet's
+//! bare-CR repeat replaced the invented `1`, every reply takes a real
+//! ELM327's shape, `{line}{le}{le}>`, as the captures in `fixtures/` show it
+//! (was the firmware's `{le}{line}{le}>`), ATH1 headers, canonical commands,
+//! and ATL0/ATL1 answering with the line ending they chose.
 
 use std::io::ErrorKind;
 
@@ -269,12 +268,19 @@ fn with_headers_each_line_carries_its_ecu_and_length() {
 }
 
 #[test]
+fn atl0_and_atl1_answer_with_the_line_ending_they_chose() {
+    // Changed from the firmware, which answered with the line ending from
+    // before the command took effect.
+    let (written, _) = serve_input(b"ATE0\rATL0\rATL1\r");
+    assert_eq!(written, "ATE0\\rOK\\r\\n\\r\\n>OK\\r\\r>OK\\r\\n\\r\\n>");
+}
+
+#[test]
 fn reject_writes_a_line_with_the_current_line_ending() {
     let (written, _) = serve_input(b"ATE0\r010C\rATL0\r010C\r");
     assert_eq!(
         written,
-        // ATL0's own reply still uses the old CRLF; the reject after it, CR.
-        "ATE0\\rOK\\r\\n\\r\\n>?\\r\\n\\r\\n>OK\\r\\n\\r\\n>?\\r\\r>"
+        "ATE0\\rOK\\r\\n\\r\\n>?\\r\\n\\r\\n>OK\\r\\r>?\\r\\r>"
     );
 }
 

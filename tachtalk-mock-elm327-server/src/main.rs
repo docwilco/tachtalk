@@ -459,7 +459,7 @@ mod tests {
             serve(b"ATE0\r0104 1\rATL0\rATS0\r0104 1\r0199 1\r"),
             "ATE0\rOK\r\n\r\n>\
              41 04 64\r\n\r\n>\
-             OK\r\n\r\n>\
+             OK\r\r>\
              OK\r\r>\
              410464\r\r>\
              NO DATA\r\r>"
