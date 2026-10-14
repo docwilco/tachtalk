@@ -24,26 +24,22 @@ proxy, the mock server): command encoding, prompt-terminated receive,
 multi-ECU response parsing, PID data-length learning.
 _Avoid_: dongle side
 
-**Session machine**:
-A sans-io state machine for one role of the wire protocol (`ServerSession`,
-`ClientSession`): fed raw bytes, returns actions, never touches a socket or
-clock. What a session keeps about its peer is named for the peer:
-`ServerSession` holds `ClientState`, `ClientSession` holds `ServerState`.
-_Avoid_: handler, driver, codec, DongleClient
-
-**Action**:
-What a session machine returns to its adapter: bytes to write, a command to
-forward, a response to deliver.
-_Avoid_: event, message (both taken by other parts of the system)
+**Session**:
+One role of the wire protocol (`ServerSession`, `ClientSession`) over a
+stream it owns: it reads and writes the bytes and keeps the protocol state;
+the program decides what to answer and when. What a session keeps about its
+peer is named for the peer: `ServerSession` holds `ClientState`,
+`ClientSession` holds `ServerState`.
+_Avoid_: session machine, handler, driver, codec, DongleClient, action
 
 **Adapter**:
-The consumer-side loop that owns the socket, timeouts, reconnects, and
-business rules, and executes a session machine's actions.
+A program's loop around a session: the stream's settings, timeouts,
+reconnects, and business rules (what to answer, when to poll).
 _Avoid_: wrapper, driver
 
 **Repeat**:
 The ELM327 datasheet's repeat mechanism: a bare carriage return re-runs the
-last command. The bare `1` found in pre-2026-09 history was an invention and
+last command. The bare `1` found in pre-2026-10 history was an invention and
 is retired.
 
 ### Vehicle data

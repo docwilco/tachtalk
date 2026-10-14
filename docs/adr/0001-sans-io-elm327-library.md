@@ -1,5 +1,8 @@
 # Sans-io ELM327 library; the invented `1` repeat is retired
 
+Status: the sans-io part is superseded by ADR 0002 (the library works over
+`std::io::Read + Write`); the retirement of the invented `1` repeat stands.
+
 The ELM327 wire protocol was implemented five times across the workspace
 (firmware proxy, firmware dongle client, test firmware, mock server,
 benchmark client), with only a thin AT-command slice shared. Decision
