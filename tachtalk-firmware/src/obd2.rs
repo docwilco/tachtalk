@@ -21,9 +21,7 @@ use std::time::{Duration, Instant};
 use tachtalk_capture_format::{
     CaptureHeader, RecordType, FLAG_OVERFLOW, HEADER_SIZE, RECORD_HEADER_SIZE,
 };
-use tachtalk_elm327_lib::{
-    Action, ClientState, Identity, RepeatExpansion, ServerSession, WireBytes,
-};
+use tachtalk_elm327_lib::{Command, Identity, ObdCommand, ReplyLine, ServerSession, WireBytes};
 
 use crate::config::{PidDataLengths, PidPriority, SlowPollMode, MODE01_PID_DATA_LENGTHS};
 use crate::led_display::LedTaskMessage;
@@ -124,32 +122,21 @@ fn wire_command_to_pid(cmd: &[u8]) -> Option<Pid> {
     Some(pid)
 }
 
-/// Format a cached response back to wire format for a client.
-///
-/// Produces the format clients expect: `{le}{line1}{le}{line2}...{le}>`
-/// where each line is `41{pid}{data hex}` formatted per client settings.
-fn format_cached_for_client(
-    pid: Pid,
-    values: &CachedResponse,
-    client_state: &ClientState,
-) -> WireBytes {
-    let le = client_state.line_ending();
-    let mut result = WireBytes::new();
-
-    for data in values {
-        result.extend_from_slice(le.as_bytes());
-        // Build hex response "41{pid:02X}{data hex}" into a temp buffer,
-        // then write_response formats it (adding spaces) directly into result.
-        let mut hex = WireBytes::new();
-        write!(hex, "41{pid:02X}").unwrap();
-        for &b in data.as_slice() {
-            write!(hex, "{b:02X}").unwrap();
-        }
-        client_state.write_response(&hex, &mut result).unwrap();
-    }
-    result.extend_from_slice(le.as_bytes());
-    result.push(b'>');
-    result
+/// A cached PID value as reply lines for a client, one per ECU:
+/// `41 {pid} {data}`. The cache keeps no ECU ids yet.
+fn cached_lines(pid: Pid, values: &CachedResponse) -> SmallVec<ReplyLine, 1> {
+    values
+        .iter()
+        .map(|data| {
+            let mut line = WireBytes::new();
+            line.extend_from_slice(&[0x41, pid]);
+            line.extend_from_slice(data);
+            ReplyLine {
+                ecu: None,
+                data: line,
+            }
+        })
+        .collect()
 }
 
 /// Cached supported-PID query responses plus a readiness flag.
@@ -2218,52 +2205,29 @@ impl Obd2Proxy {
 
         let watchdog = WatchdogHandle::register(c"obd2_client");
 
-        let mut stream = &client_stream;
-        let mut session = ServerSession::new(Identity::default());
-        let mut chunk = [0u8; 64];
+        let mut session = ServerSession::new(&client_stream, Identity::default());
 
         loop {
             watchdog.feed();
 
-            match stream.read(&mut chunk) {
-                Ok(0) => {
+            match session.next_command() {
+                Ok(Command::At(at)) => {
+                    debug!("OBD2 client command: {:?}", at.command());
+                    debug!("Handling AT command locally");
+                    if let Ok(mut log) = state.at_command_log.lock() {
+                        log.insert(at.command().to_uppercase());
+                    }
+                    at.answer()?;
+                }
+                Ok(Command::Obd(obd)) => {
+                    debug!("OBD2 client command: {:?}", obd.command());
+                    Self::answer_obd(obd, state, &client_cache)?;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {}
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
                     info!("OBD2 client disconnected: {peer}");
                     break;
                 }
-                Ok(n) => {
-                    // Feed one line per call: an OBD line is answered from
-                    // the session's settings, which a later AT line in the
-                    // same chunk must not change first. Each line can wait
-                    // up to the OBD2 timeout, so feed the watchdog per line.
-                    for line in chunk[..n].split_inclusive(|&b| b == b'\r') {
-                        watchdog.feed();
-                        for action in session.feed(line) {
-                            match action {
-                                Action::Send(echo) => stream.write_all(&echo)?,
-                                Action::At { command, response } => {
-                                    debug!("OBD2 client command: {command:?}");
-                                    debug!("Handling AT command locally");
-                                    if let Ok(mut log) = state.at_command_log.lock() {
-                                        log.insert(command.to_uppercase());
-                                    }
-                                    stream.write_all(&response)?;
-                                }
-                                Action::Obd { command, raw } => {
-                                    debug!("OBD2 client command: {command:?}");
-                                    Self::answer_obd(
-                                        &command,
-                                        &raw,
-                                        &mut stream,
-                                        &mut session,
-                                        state,
-                                        &client_cache,
-                                    )?;
-                                }
-                            }
-                        }
-                    }
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {}
                 Err(e) => {
                     error!("Error reading from client: {e:?}");
                     break;
@@ -2274,13 +2238,10 @@ impl Obd2Proxy {
         Ok(())
     }
 
-    /// Answer a non-AT command ([`Action::Obd`]): readiness gate, repeat
-    /// expansion, supported-PID cache, then the client cache.
+    /// Answer a non-AT command: readiness gate, supported-PID cache, then
+    /// the client cache. The session has already expanded a `1` repeat.
     fn answer_obd(
-        command: &str,
-        raw_command: &[u8],
-        writer: &mut &TcpStream,
-        session: &mut ServerSession,
+        obd: ObdCommand<'_, &TcpStream>,
         state: &Arc<State>,
         client_cache: &Arc<Mutex<ClientCache>>,
     ) -> Result<()> {
@@ -2291,69 +2252,53 @@ impl Obd2Proxy {
         // Clients will see "UNABLE TO CONNECT" and should retry, which is the
         // same response they'd get from a real ELM327 before protocol detection.
         if !state.supported_pids.lock().unwrap().ready {
-            writer.write_all(&session.format_line("UNABLE TO CONNECT"))?;
+            obd.reject("UNABLE TO CONNECT")?;
             return Ok(());
         }
 
-        // Handle "1" repeat command
-        let (effective_command, effective_raw) = match session.expand_repeat(command, raw_command) {
-            RepeatExpansion::Command {
-                command: effective,
-                raw,
-            } => {
-                if effective != command {
-                    debug!("Expanding repeat command to: {effective}");
-                }
-                (effective, raw)
-            }
-            RepeatExpansion::NoLastCommand(response) => {
-                writer.write_all(&response)?;
-                return Ok(());
-            }
-        };
-
         // Record unique OBD2 PIDs
         if let Ok(mut log) = state.pid_log.lock() {
-            log.insert(effective_command.to_uppercase());
+            log.insert(obd.command().to_uppercase());
         }
 
         // Normalize command for cache key (strips trailing " 1" response count)
-        let normalized = normalize_obd_command(effective_raw.as_ref());
+        let normalized = normalize_obd_command(obd.raw());
 
         // Check if this is a supported PIDs query - return from State cache
         if let Some(idx) = supported_pids_index(&normalized) {
             let supported_pids_guard = state.supported_pids.lock().unwrap();
             if let Some(ref cached_response) = supported_pids_guard.entries[idx] {
-                session.state_mut().last_obd_command = Some(effective_command);
-                session.state().write_response(cached_response, writer)?;
-                drop(supported_pids_guard);
+                let framing = state.config.lock().unwrap().obd2.use_framing;
+                let lines: SmallVec<ReplyLine, 4> = parse_response_framed(cached_response, framing)
+                    .into_iter()
+                    .map(|line| ReplyLine {
+                        ecu: line.ecu_id,
+                        data: line.data,
+                    })
+                    .collect();
+                obd.reply(&lines)?;
                 return Ok(());
             }
             drop(supported_pids_guard);
             // Not cached (dongle not connected yet?) - return error
-            writer.write_all(&session.format_line("UNABLE TO CONNECT"))?;
+            obd.reject("UNABLE TO CONNECT")?;
             return Ok(());
         }
 
         // Convert normalized command to PID
         let Some(pid) = wire_command_to_pid(&normalized) else {
             // Invalid command format - return error
-            writer.write_all(&session.format_line("?"))?;
+            obd.reject("?")?;
             return Ok(());
         };
 
         // Get value from cache
         let timeout = Duration::from_millis(state.config.lock().unwrap().obd2_timeout_ms);
         match Self::get_cached_value(pid, client_cache, state, timeout) {
-            Ok(response) => {
-                session.state_mut().last_obd_command = Some(effective_command);
-
-                let formatted = format_cached_for_client(pid, &response, session.state());
-                writer.write_all(&formatted)?;
-            }
+            Ok(response) => obd.reply(&cached_lines(pid, &response))?,
             Err(e) => {
                 error!("Cache error: {e}");
-                writer.write_all(&session.format_line(e.to_elm327_error()))?;
+                obd.reject(e.to_elm327_error())?;
             }
         }
 

@@ -1,12 +1,11 @@
 //! Mock ELM327 OBD2 adapter for testing TachTalk proxy
 
-use std::fmt::Write as _;
-use std::io::{Read, Write};
+use std::io::{self, ErrorKind};
 use std::net::{TcpListener, TcpStream};
 use std::time::{Duration, Instant};
 
 use clap::Parser;
-use tachtalk_elm327_lib::{Action, Identity, RepeatExpansion, ServerSession};
+use tachtalk_elm327_lib::{Command, Identity, ReplyLine, ServerSession};
 
 /// Mock ELM327 OBD2 adapter for testing TachTalk proxy.
 ///
@@ -78,85 +77,69 @@ fn rate_limit_wait(min_interval: Option<Duration>, last_response_time: Option<In
     }
 }
 
-/// Stamp the response time, log TX, and write the response to the client;
-/// an `Err` is a dead socket and ends the connection.
-fn send_response(
-    stream: &mut TcpStream,
-    quiet: bool,
-    response: &[u8],
-    last_response_time: &mut Option<Instant>,
-) -> Result<(), ()> {
-    *last_response_time = Some(Instant::now());
-    if !quiet {
-        println!("TX: {}", String::from_utf8_lossy(response).escape_debug());
-    }
-    if let Err(e) = stream.write_all(response) {
-        eprintln!("Write error: {e}");
-        return Err(());
-    }
-    Ok(())
+/// How the mock answers an OBD command.
+#[derive(Debug, PartialEq, Eq)]
+enum Answer {
+    /// One line from the engine ECU.
+    Reply(ReplyLine),
+    /// A rejection line such as `?` or `NO DATA`.
+    Reject(&'static str),
 }
 
 fn handle_client(
-    mut stream: TcpStream,
+    stream: TcpStream,
     quiet: bool,
     start_time: Instant,
     min_interval: Option<Duration>,
 ) {
-    let mut session = ServerSession::new(identity());
-    let mut byte = [0u8; 1];
+    let mut session = ServerSession::new(stream, identity());
     let mut last_response_time: Option<Instant> = None;
 
-    'connection: loop {
-        match stream.read(&mut byte) {
-            Ok(0) => {
+    loop {
+        let result = match session.next_command() {
+            Ok(Command::At(at)) => {
+                if !quiet {
+                    println!("RX: {}", at.command().to_uppercase());
+                }
+                rate_limit_wait(min_interval, last_response_time);
+                last_response_time = Some(Instant::now());
+                at.answer()
+            }
+            Ok(Command::Obd(obd)) => {
+                if !quiet {
+                    println!("RX: {}", obd.command().to_uppercase());
+                }
+                rate_limit_wait(min_interval, last_response_time);
+                let answer = respond_obd(obd.command(), &start_time);
+                last_response_time = Some(Instant::now());
+                if !quiet {
+                    println!("TX: {answer:?}");
+                }
+                answer_with(obd, answer)
+            }
+            Err(e) if e.kind() == ErrorKind::UnexpectedEof => {
                 println!("Client disconnected");
                 break;
-            }
-            Ok(_) => {
-                for action in session.feed(&byte) {
-                    match action {
-                        Action::Send(echo) => {
-                            if stream.write_all(&echo).is_err() {
-                                break 'connection;
-                            }
-                        }
-                        Action::At { command, response } => {
-                            if !quiet {
-                                println!("RX: {}", command.to_uppercase());
-                            }
-                            rate_limit_wait(min_interval, last_response_time);
-                            if send_response(&mut stream, quiet, &response, &mut last_response_time)
-                                .is_err()
-                            {
-                                break 'connection;
-                            }
-                        }
-                        Action::Obd { command, raw } => {
-                            if !quiet {
-                                println!("RX: {}", command.to_uppercase());
-                            }
-                            rate_limit_wait(min_interval, last_response_time);
-                            let response = respond_obd(&mut session, &command, &raw, &start_time);
-                            if send_response(
-                                &mut stream,
-                                quiet,
-                                response.as_bytes(),
-                                &mut last_response_time,
-                            )
-                            .is_err()
-                            {
-                                break 'connection;
-                            }
-                        }
-                    }
-                }
             }
             Err(e) => {
                 eprintln!("Read error: {e}");
                 break;
             }
+        };
+        if let Err(e) = result {
+            eprintln!("Write error: {e}");
+            break;
         }
+    }
+}
+
+fn answer_with<S: io::Read + io::Write>(
+    obd: tachtalk_elm327_lib::ObdCommand<'_, S>,
+    answer: Answer,
+) -> io::Result<()> {
+    match answer {
+        Answer::Reply(line) => obd.reply(&[line]),
+        Answer::Reject(text) => obd.reject(text),
     }
 }
 
@@ -286,33 +269,15 @@ fn get_pid_response(pid: &str, start_time: &Instant) -> Option<String> {
     }
 }
 
-/// Answer a non-AT command ([`Action::Obd`]): repeat expansion, PID
-/// dispatch, and response formatting against the session's settings.
-/// `raw` is the untrimmed line the action carried. Returns the full wire
-/// response including line endings and prompt.
-fn respond_obd(
-    session: &mut ServerSession,
-    command: &str,
-    raw: &[u8],
-    start_time: &Instant,
-) -> String {
-    let le = session.state().line_ending();
-
-    // Expand the invented "1" repeat (transitional; leaves with #23). The
-    // mock's no-last-command reply keeps its historical byte shape
-    // (`?{le}{le}>`), not the firmware-shaped bytes the expansion carries.
-    let effective_cmd = match session.expand_repeat(command, raw) {
-        RepeatExpansion::Command { command, .. } => command,
-        RepeatExpansion::NoLastCommand(_) => return format!("?{le}{le}>"),
-    };
-
-    // Handle OBD2 commands
-    let obd_response = match effective_cmd.as_str() {
+/// The mock engine ECU's answer to a non-AT command (already expanded if
+/// the client sent the `1` repeat): PID dispatch over simulated values.
+fn respond_obd(command: &str, start_time: &Instant) -> Answer {
+    let hex_data = match command {
         // Mode 03 - Show stored DTCs
-        "03" => Some("4300".to_string()),
+        "03" => "4300".to_string(),
 
         // Mode 09 - Vehicle info
-        "0902" => Some("490213455034353637383930".to_string()),
+        "0902" => "490213455034353637383930".to_string(),
 
         // Mode 01 - Current data (single or multi-PID)
         c if c.starts_with("01") && c.len() >= 4 => {
@@ -329,229 +294,188 @@ fn respond_obd(
             // The number after space tells ELM327 how many responses to wait for
             let pid_data = pid_data.split_whitespace().next().unwrap_or(pid_data);
 
-            // Parse PIDs (pairs of hex digits)
-            let mut pids = Vec::new();
-            let mut chars = pid_data.chars().peekable();
-
-            while chars.peek().is_some() {
-                let mut pid = String::new();
-
-                // Get next two characters
-                if let Some(c1) = chars.next() {
-                    if let Some(c2) = chars.next() {
-                        pid.push(c1);
-                        pid.push(c2);
-                        pids.push(pid.to_uppercase());
-                    }
-                }
-            }
-
-            // Build response
-            let mut response = String::new();
-            for pid in pids {
-                if let Some(data) = get_pid_response(&pid, start_time) {
-                    write!(response, "{pid}{data}").unwrap();
-                } else {
+            let mut response = String::from("41");
+            for pid in pid_data.as_bytes().chunks_exact(2) {
+                let pid = String::from_utf8_lossy(pid).to_uppercase();
+                let Some(data) = get_pid_response(&pid, start_time) else {
                     // Unknown PID
-                    return format!("NO DATA{le}{le}>");
-                }
+                    return Answer::Reject("NO DATA");
+                };
+                response.push_str(&pid);
+                response.push_str(&data);
             }
-
-            if response.is_empty() {
-                None
-            } else {
-                Some(format!("41{response}"))
-            }
+            response
         }
 
         // Unknown command
-        _ => None,
+        _ => return Answer::Reject("?"),
     };
 
-    match obd_response {
-        Some(hex_data) => {
-            // Store this command for repeat functionality (but not if it was already a repeat)
-            if command != "1" {
-                session.state_mut().last_obd_command = Some(effective_cmd);
-            }
+    Answer::Reply(ReplyLine {
+        // 7E8 is the engine ECU's usual reply address.
+        ecu: Some(0x7E8),
+        data: hex_to_bytes(&hex_data),
+    })
+}
 
-            // Format the hex data with spaces if enabled
-            let formatted_data = session.format_data_response(hex_data.as_bytes());
-            let formatted_str = String::from_utf8_lossy(&formatted_data);
-
-            // Add header if enabled (7E8 is standard ECM response address)
-            let state = session.state();
-            let response = if state.headers_enabled {
-                // With headers: "7E8 06 41 00 BE 3F A8 13" (header + length + data)
-                // Header is 3 hex chars, not split. Length is data bytes.
-                let data_bytes = hex_data.len() / 2;
-                if state.spaces_enabled {
-                    format!("7E8 {data_bytes:02X} {formatted_str}")
-                } else {
-                    format!("7E8{data_bytes:02X}{formatted_str}")
-                }
-            } else {
-                formatted_str.to_string()
-            };
-
-            format!("{response}{le}{le}>")
-        }
-        None => format!("?{le}{le}>"),
-    }
+/// Decode an even-length uppercase hex string.
+fn hex_to_bytes(hex: &str) -> tachtalk_elm327_lib::WireBytes {
+    hex.as_bytes()
+        .chunks_exact(2)
+        .map(|pair| {
+            let pair = std::str::from_utf8(pair).expect("ASCII hex");
+            u8::from_str_radix(pair, 16).expect("valid hex")
+        })
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tachtalk_elm327_lib::WireBytes;
+    use std::io::{Cursor, Read, Write};
 
-    // Expected bytes come from a live capture of the pre-ServerSession
-    // mock (issue #21); the adaptation must not change the wire.
-
-    fn session() -> ServerSession {
-        ServerSession::new(identity())
+    /// A client connection in memory: scripted input, collected output.
+    struct Duplex {
+        input: Cursor<Vec<u8>>,
+        output: Vec<u8>,
     }
 
-    /// [`respond_obd`] for a trimmed command whose raw bytes are itself.
-    fn obd(session: &mut ServerSession, command: &str, start: &Instant) -> String {
-        respond_obd(session, command, command.as_bytes(), start)
+    impl Read for Duplex {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            self.input.read(buf)
+        }
     }
 
-    /// Feed one full AT command line and return its response bytes,
-    /// skipping echo `Send`s.
-    fn at_response(session: &mut ServerSession, line: &[u8]) -> WireBytes {
-        session
-            .feed(line)
-            .into_iter()
-            .find_map(|action| match action {
-                Action::At { response, .. } => Some(response),
-                _ => None,
-            })
-            .unwrap_or_else(|| panic!("no AT action for {:?}", String::from_utf8_lossy(line)))
+    impl Write for Duplex {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.output.write(buf)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Serve `input` the way `handle_client` does, without rate limiting,
+    /// and return what the client received.
+    fn serve(input: &[u8]) -> String {
+        let duplex = Duplex {
+            input: Cursor::new(input.to_vec()),
+            output: Vec::new(),
+        };
+        let mut session = ServerSession::new(duplex, identity());
+        let start = Instant::now();
+        loop {
+            match session.next_command() {
+                Ok(Command::At(at)) => at.answer().unwrap(),
+                Ok(Command::Obd(obd)) => {
+                    let answer = respond_obd(obd.command(), &start);
+                    answer_with(obd, answer).unwrap();
+                }
+                Err(e) if e.kind() == ErrorKind::UnexpectedEof => break,
+                Err(e) => panic!("unexpected error: {e}"),
+            }
+        }
+        String::from_utf8(session.into_inner().output).unwrap()
+    }
+
+    fn reply(hex: &str) -> Answer {
+        Answer::Reply(ReplyLine {
+            ecu: Some(0x7E8),
+            data: hex_to_bytes(hex),
+        })
     }
 
     #[test]
     fn identity_ati_and_reset_banner() {
-        let mut session = session();
-        assert_eq!(at_response(&mut session, b"ATI\r"), b"\r\nELM327 v1.5\r\n>");
-        assert_eq!(at_response(&mut session, b"ATZ\r"), b"\r\nELM327 v1.5\r\n>");
+        assert_eq!(
+            serve(b"ATE0\rATI\rATZ\r"),
+            "ATE0\r\r\nOK\r\n>\r\nELM327 v1.5\r\n>\r\nELM327 v1.5\r\n>"
+        );
     }
 
     #[test]
     fn identity_device_description() {
-        let mut session = session();
+        // The spaced spelling reaches the same answer (the divergence #21
+        // retired).
         assert_eq!(
-            at_response(&mut session, b"AT@1\r"),
-            b"\r\nMock ELM327\r\n>"
-        );
-        // The hand-rolled loop's AT@1 override missed the spaced spelling
-        // and answered the generic "ELM327"; identity via the constructor
-        // covers it (the divergence #21 retires).
-        assert_eq!(
-            at_response(&mut session, b"AT @1\r"),
-            b"\r\nMock ELM327\r\n>"
+            serve(b"ATE0\rAT@1\rAT @1\r"),
+            "ATE0\r\r\nOK\r\n>\r\nMock ELM327\r\n>\r\nMock ELM327\r\n>"
         );
     }
 
     #[test]
     fn static_pid_with_response_count() {
-        let mut session = session();
         let start = Instant::now();
-        assert_eq!(obd(&mut session, "0104 1", &start), "41 04 64\r\n\r\n>");
+        assert_eq!(respond_obd("0104 1", &start), reply("410464"));
     }
 
     #[test]
     fn multi_pid_request() {
-        let mut session = session();
         let start = Instant::now();
-        assert_eq!(
-            obd(&mut session, "010420 1", &start),
-            "41 04 64 20 80 00 00 01\r\n\r\n>"
-        );
+        assert_eq!(respond_obd("010420 1", &start), reply("4104642080000001"));
     }
 
     #[test]
     fn lowercase_pid_is_dispatched() {
-        let mut session = session();
         let start = Instant::now();
-        let response = obd(&mut session, "010c 1", &start);
-        assert!(response.starts_with("41 0C "), "got {response:?}");
-        assert!(response.ends_with("\r\n\r\n>"), "got {response:?}");
+        let Answer::Reply(line) = respond_obd("010c 1", &start) else {
+            panic!("expected a reply");
+        };
+        assert_eq!(&line.data[..2], &[0x41, 0x0C]);
     }
 
     #[test]
     fn mode_03_stored_dtcs() {
-        let mut session = session();
         let start = Instant::now();
-        assert_eq!(obd(&mut session, "03", &start), "43 00\r\n\r\n>");
+        assert_eq!(respond_obd("03", &start), reply("4300"));
     }
 
     #[test]
     fn mode_09_vehicle_info() {
-        let mut session = session();
         let start = Instant::now();
         assert_eq!(
-            obd(&mut session, "0902", &start),
-            "49 02 13 45 50 34 35 36 37 38 39 30\r\n\r\n>"
+            respond_obd("0902", &start),
+            reply("490213455034353637383930")
         );
     }
 
     #[test]
     fn unknown_pid_is_no_data() {
-        let mut session = session();
         let start = Instant::now();
-        assert_eq!(obd(&mut session, "0199 1", &start), "NO DATA\r\n\r\n>");
+        assert_eq!(respond_obd("0199 1", &start), Answer::Reject("NO DATA"));
     }
 
     #[test]
     fn unknown_command_is_question_mark() {
-        let mut session = session();
         let start = Instant::now();
-        assert_eq!(obd(&mut session, "FF", &start), "?\r\n\r\n>");
+        assert_eq!(respond_obd("FF", &start), Answer::Reject("?"));
     }
 
     #[test]
-    fn repeat_replays_last_successful_command() {
-        let mut session = session();
-        let start = Instant::now();
-        obd(&mut session, "0104 1", &start);
-        assert_eq!(obd(&mut session, "1", &start), "41 04 64\r\n\r\n>");
-        // A repeat leaves the memory in place: it can repeat again.
-        assert_eq!(obd(&mut session, "1", &start), "41 04 64\r\n\r\n>");
+    fn replies_take_the_session_shape() {
+        assert_eq!(
+            serve(b"ATE0\r0104 1\rATL0\rATS0\r0104 1\r0199 1\r"),
+            "ATE0\r\r\nOK\r\n>\
+             \r\n41 04 64\r\n>\
+             \r\nOK\r\n>\
+             \rOK\r>\
+             \r410464\r>\
+             \rNO DATA\r>"
+        );
     }
 
     #[test]
-    fn failed_commands_do_not_clobber_repeat_memory() {
-        let mut session = session();
-        let start = Instant::now();
-        obd(&mut session, "0104 1", &start);
-        obd(&mut session, "0199 1", &start); // NO DATA
-        obd(&mut session, "FF", &start); // ?
-        assert_eq!(obd(&mut session, "1", &start), "41 04 64\r\n\r\n>");
-    }
-
-    #[test]
-    fn repeat_without_last_command_is_question_mark() {
-        let mut session = session();
-        let start = Instant::now();
-        assert_eq!(obd(&mut session, "1", &start), "?\r\n\r\n>");
-    }
-
-    #[test]
-    fn settings_shape_the_obd_response() {
-        let mut session = session();
-        let start = Instant::now();
-
-        at_response(&mut session, b"ATL0\r");
-        assert_eq!(obd(&mut session, "0104 1", &start), "41 04 64\r\r>");
-
-        at_response(&mut session, b"ATS0\r");
-        assert_eq!(obd(&mut session, "0104 1", &start), "410464\r\r>");
-
-        at_response(&mut session, b"ATH1\r");
-        assert_eq!(obd(&mut session, "0104 1", &start), "7E803410464\r\r>");
-
-        at_response(&mut session, b"ATS1\r");
-        assert_eq!(obd(&mut session, "0104 1", &start), "7E8 03 41 04 64\r\r>");
+    fn repeat_replays_the_last_replied_command() {
+        // A rejected command does not replace what 1 repeats.
+        assert_eq!(
+            serve(b"ATE0\rATS0\r0104 1\r0199 1\r1\r1\r"),
+            "ATE0\r\r\nOK\r\n>\
+             \r\nOK\r\n>\
+             \r\n410464\r\n>\
+             \r\nNO DATA\r\n>\
+             \r\n410464\r\n>\
+             \r\n410464\r\n>"
+        );
     }
 }

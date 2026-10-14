@@ -1,15 +1,19 @@
-//! Server-side session machine for the ELM327 wire protocol.
+//! Server side of the ELM327 wire protocol.
 //!
-//! [`ServerSession`] is sans-io: it is fed raw bytes from the transport and
-//! returns [`Action`]s for the adapter to execute. Sockets, timeouts, and
-//! business rules (readiness gates, caches) stay in the adapter.
+//! [`ServerSession`] owns the stream to a client that speaks to us as if we
+//! were an ELM327. It reads, echoes, frames commands at the carriage return,
+//! and answers AT commands; the program answers OBD commands through the
+//! [`ObdCommand`] it is handed. Timeouts, readiness and where answers come
+//! from stay with the program.
 //!
-//! Behavior is a faithful extraction of the firmware proxy's client loop,
-//! warts included; see the characterization tests for the details it locks.
+//! Behavior is a faithful move of the firmware proxy's client loop, warts
+//! included; see the characterization tests for the details it locks.
+
+use std::io::{self, Read, Write};
 
 use smallvec::SmallVec;
 
-use crate::{ClientState, WireBytes};
+use crate::{ClientState, ReplyLine, WireBytes};
 
 /// Identity strings a server presents to clients.
 #[derive(Debug, Clone)]
@@ -30,199 +34,323 @@ impl Default for Identity {
     }
 }
 
-/// What a [`ServerSession`] returns to its adapter.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Action {
-    /// Bytes to write to the client (echo).
-    Send(WireBytes),
-    /// An AT command handled internally, with its full response (line
-    /// endings and prompt) for the adapter to write. No separate
-    /// [`Action::Send`] follows it.
-    At {
-        /// The command as received (trimmed, original case), for logging;
-        /// the firmware logs it uppercased, so its adapter must uppercase.
-        command: String,
-        /// Bytes to write to the client.
-        response: WireBytes,
-    },
-    /// A non-AT command for the adapter to answer. `command` is the
-    /// trimmed line; `raw` is the framed bytes as received (untrimmed,
-    /// CR excluded). Run it through [`ServerSession::expand_repeat`]
-    /// before forwarding.
-    Obd {
-        /// Trimmed command text.
-        command: String,
-        /// Raw command bytes as buffered (untrimmed, no CR/LF).
-        raw: WireBytes,
-    },
-}
-
-/// Result of expanding the invented `1` repeat command.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RepeatExpansion {
-    /// The command to forward: unchanged, or the repeated last command.
-    Command {
-        /// Trimmed command text (the last command, if repeated).
-        command: String,
-        /// Raw bytes to forward.
-        raw: WireBytes,
-    },
-    /// `1` with no previous command: send these bytes (a `?` response).
-    NoLastCommand(WireBytes),
-}
-
-/// Sans-io server-side session machine: CR framing, echo, the AT dialect,
-/// repeat expansion, response formatting, the `>` prompt.
+/// A command read from the client, to be answered before the next one is
+/// read. It borrows the session; answering consumes it.
 #[derive(Debug)]
-pub struct ServerSession {
-    state: ClientState,
-    identity: Identity,
-    cmd_buffer: Vec<u8>,
+pub enum Command<'a, S: Read + Write> {
+    /// An AT command; the session knows the answer.
+    At(AtCommand<'a, S>),
+    /// Anything else; the program answers it.
+    Obd(ObdCommand<'a, S>),
 }
 
-impl ServerSession {
-    /// Create a session with default client settings and the given identity.
+/// An AT command read from the client. Dropping it unanswered writes the
+/// answer anyway; a write error then is returned by the next
+/// [`ServerSession::next_command`].
+#[derive(Debug)]
+pub struct AtCommand<'a, S: Read + Write> {
+    session: &'a mut ServerSession<S>,
+    command: String,
+    answered: bool,
+}
+
+impl<S: Read + Write> AtCommand<'_, S> {
+    /// The command as received: trimmed, original case.
     #[must_use]
-    pub fn new(identity: Identity) -> Self {
-        Self {
-            state: ClientState::default(),
-            identity,
-            cmd_buffer: Vec::with_capacity(64),
-        }
+    pub fn command(&self) -> &str {
+        &self.command
     }
 
-    /// Feed bytes received from the client; returns the actions to execute,
-    /// in order. Feeding one byte at a time yields the same byte stream and
-    /// dispatches as feeding everything at once.
+    /// Apply the command to the session's settings and write its answer.
     ///
-    /// Every line in `bytes` is processed before this returns, so an AT
-    /// line late in the call has already changed the settings by the time
-    /// the adapter answers an [`Action::Obd`] from earlier in the call. An
-    /// adapter that answers from [`state`](Self::state) or
-    /// [`format_line`](Self::format_line) feeds at most one line per call.
-    #[must_use = "discarding the actions loses echo and responses"]
-    pub fn feed(&mut self, bytes: &[u8]) -> SmallVec<Action, 4> {
-        let mut actions = SmallVec::new();
-        let mut echo = WireBytes::new();
-
-        for &byte in bytes {
-            // Echo each byte as read, before any processing, as the
-            // firmware's byte-at-a-time loop does.
-            if self.state.echo_enabled {
-                echo.push(byte);
-            }
-
-            if byte == b'\r' {
-                if !echo.is_empty() {
-                    actions.push(Action::Send(std::mem::take(&mut echo)));
-                }
-                self.process_line(&mut actions);
-                self.cmd_buffer.clear();
-            } else if byte != b'\n' {
-                self.cmd_buffer.push(byte);
-            }
-        }
-
-        if !echo.is_empty() {
-            actions.push(Action::Send(echo));
-        }
-        actions
+    /// # Errors
+    /// Returns the stream's error if writing fails.
+    pub fn answer(mut self) -> io::Result<()> {
+        self.answered = true;
+        self.session.answer_at(&self.command)
     }
+}
 
-    fn process_line(&mut self, actions: &mut SmallVec<Action, 4>) {
-        let command = String::from_utf8_lossy(&self.cmd_buffer);
-        let command = command.trim();
-
-        // Empty commands are silently ignored (firmware behavior; the
-        // datasheet's bare-CR repeat is a later, deliberate change).
-        if command.is_empty() {
+impl<S: Read + Write> Drop for AtCommand<'_, S> {
+    fn drop(&mut self) {
+        if self.answered || std::thread::panicking() {
             return;
         }
-
-        if command.to_uppercase().starts_with("AT") {
-            let response = handle_at_command(&mut self.state, &self.identity, command);
-            actions.push(Action::At {
-                command: command.to_string(),
-                response: WireBytes::from(response.as_bytes()),
-            });
-        } else {
-            actions.push(Action::Obd {
-                command: command.to_string(),
-                raw: WireBytes::from(self.cmd_buffer.as_slice()),
-            });
+        if let Err(e) = self.session.answer_at(&self.command) {
+            self.session.pending_error = Some(e);
         }
     }
+}
 
-    /// Expand the invented `1` repeat command against the last recorded
-    /// OBD command. Call after any adapter-side gating (the firmware
-    /// checks readiness before expanding), and before forwarding.
+/// A non-AT command read from the client, for the program to answer with
+/// [`reply`](Self::reply) or [`reject`](Self::reject).
+///
+/// # Panics
+/// Dropping it unanswered panics: every command gets exactly one reply, and
+/// a program that forgets one has a bug.
+#[derive(Debug)]
+pub struct ObdCommand<'a, S: Read + Write> {
+    session: &'a mut ServerSession<S>,
+    command: String,
+    raw: WireBytes,
+    answered: bool,
+}
+
+impl<S: Read + Write> ObdCommand<'_, S> {
+    /// The command, trimmed (the repeated command if the client sent `1`).
+    #[must_use]
+    pub fn command(&self) -> &str {
+        &self.command
+    }
+
+    /// The command bytes as received (untrimmed, no CR or LF).
+    #[must_use]
+    pub fn raw(&self) -> &[u8] {
+        &self.raw
+    }
+
+    /// The client's settings (echo, line feeds, spaces, headers).
+    #[must_use]
+    pub fn client_state(&self) -> &ClientState {
+        &self.session.state
+    }
+
+    /// Answer with one line per ECU, formatted to the client's settings.
+    /// The command becomes the one a later `1` repeats.
     ///
-    /// Transitional: `1` is not ELM327 (see ADR 0001) and this method
-    /// leaves with the datasheet bare-CR repeat spec fix (#23).
+    /// # Errors
+    /// Returns the stream's error if writing fails.
+    pub fn reply(mut self, lines: &[ReplyLine]) -> io::Result<()> {
+        self.answered = true;
+        let state = &self.session.state;
+        let le = state.line_ending().as_bytes();
+        let mut out: SmallVec<u8, 64> = SmallVec::new();
+        for line in lines {
+            out.extend_from_slice(le);
+            push_hex(&mut out, &line.data, state.spaces_enabled);
+        }
+        out.extend_from_slice(le);
+        out.push(b'>');
+        self.session.stream.write_all(&out)?;
+        self.session.state.last_obd_command = Some(std::mem::take(&mut self.command));
+        Ok(())
+    }
+
+    /// Answer with a rejection line such as `?`, `NO DATA` or
+    /// `UNABLE TO CONNECT`.
+    ///
+    /// # Errors
+    /// Returns the stream's error if writing fails.
+    pub fn reject(mut self, text: &str) -> io::Result<()> {
+        self.answered = true;
+        self.session.write_line(text)
+    }
+}
+
+impl<S: Read + Write> Drop for ObdCommand<'_, S> {
+    fn drop(&mut self) {
+        assert!(
+            self.answered || std::thread::panicking(),
+            "OBD command {:?} dropped unanswered",
+            self.command
+        );
+    }
+}
+
+/// A complete line read from the client, before it is handed out.
+enum Line {
+    At(String),
+    Obd(String, WireBytes),
+}
+
+/// Server side of the wire protocol over a stream it owns: CR framing,
+/// echo, the AT dialect, the `1` repeat, reply formatting, the `>` prompt.
+#[derive(Debug)]
+pub struct ServerSession<S> {
+    stream: S,
+    state: ClientState,
+    identity: Identity,
+    /// The command being read, up to its carriage return.
+    line: Vec<u8>,
+    /// Bytes read but not yet processed, `buf[pos..len]`.
+    buf: [u8; 64],
+    pos: usize,
+    len: usize,
+    /// Echo of processed bytes, not yet written.
+    echo: WireBytes,
+    /// A write error from an AT command answered on drop.
+    pending_error: Option<io::Error>,
+}
+
+impl<S: Read + Write> ServerSession<S> {
+    /// A session over `stream` with default client settings.
     #[must_use]
-    pub fn expand_repeat(&self, command: &str, raw: &[u8]) -> RepeatExpansion {
-        if command == "1" {
-            match &self.state.last_obd_command {
-                Some(last) => RepeatExpansion::Command {
-                    command: last.clone(),
-                    raw: WireBytes::from(last.as_bytes()),
-                },
-                None => RepeatExpansion::NoLastCommand(self.format_line("?")),
-            }
-        } else {
-            RepeatExpansion::Command {
-                command: command.to_string(),
-                raw: WireBytes::from(raw),
-            }
+    pub fn new(stream: S, identity: Identity) -> Self {
+        Self {
+            stream,
+            state: ClientState::default(),
+            identity,
+            line: Vec::with_capacity(64),
+            buf: [0; 64],
+            pos: 0,
+            len: 0,
+            echo: WireBytes::new(),
+            pending_error: None,
         }
     }
 
-    /// Format a text line with the current line ending and prompt:
-    /// `{le}{text}{le}>`. This is how the adapter formats rejections
-    /// (`UNABLE TO CONNECT`, `?`, dongle error strings).
-    #[must_use]
-    pub fn format_line(&self, text: &str) -> WireBytes {
-        let le = self.state.line_ending().as_bytes();
-        let mut line = WireBytes::new();
-        line.extend_from_slice(le);
-        line.extend_from_slice(text.as_bytes());
-        line.extend_from_slice(le);
-        line.push(b'>');
-        line
+    /// Read until the next command, echoing as the client's settings say,
+    /// and hand it out. Empty lines are ignored; a `1` with nothing to
+    /// repeat is answered `?` here.
+    ///
+    /// # Errors
+    /// Returns the stream's errors: a read timeout (`TimedOut` or
+    /// `WouldBlock`) leaves a partly read command in place for the next
+    /// call; a closed connection is `UnexpectedEof`. A write error from an
+    /// AT command answered on drop is returned first.
+    pub fn next_command(&mut self) -> io::Result<Command<'_, S>> {
+        if let Some(e) = self.pending_error.take() {
+            return Err(e);
+        }
+        let line = loop {
+            if self.pos == self.len {
+                self.write_echo()?;
+                let n = self.stream.read(&mut self.buf)?;
+                if n == 0 {
+                    return Err(io::ErrorKind::UnexpectedEof.into());
+                }
+                self.pos = 0;
+                self.len = n;
+            }
+            let byte = self.buf[self.pos];
+            self.pos += 1;
+            // Echo each byte as it is processed, with the settings in force
+            // at that point, as the firmware's byte-at-a-time loop did.
+            if self.state.echo_enabled {
+                self.echo.push(byte);
+            }
+            if byte == b'\r' {
+                self.write_echo()?;
+                let line = self.take_line()?;
+                if let Some(line) = line {
+                    break line;
+                }
+            } else if byte != b'\n' {
+                self.line.push(byte);
+            }
+        };
+        Ok(match line {
+            Line::At(command) => Command::At(AtCommand {
+                session: self,
+                command,
+                answered: false,
+            }),
+            Line::Obd(command, raw) => Command::Obd(ObdCommand {
+                session: self,
+                command,
+                raw,
+                answered: false,
+            }),
+        })
     }
 
-    /// Format a dongle data response according to the client's space
-    /// setting; see [`ClientState::format_response`].
+    /// The client's settings (echo, line feeds, spaces, headers, the last
+    /// replied OBD command).
     #[must_use]
-    pub fn format_data_response(&self, response: &[u8]) -> WireBytes {
-        self.state.format_response(response)
-    }
-
-    /// The session's client settings (echo, linefeeds, spaces, headers,
-    /// last OBD command).
-    #[must_use]
-    pub fn state(&self) -> &ClientState {
+    pub fn client_state(&self) -> &ClientState {
         &self.state
     }
 
-    /// Mutable client settings; the adapter records `last_obd_command`
-    /// here after a successful response, as the firmware does.
-    pub fn state_mut(&mut self) -> &mut ClientState {
-        &mut self.state
+    /// The stream.
+    #[must_use]
+    pub fn get_ref(&self) -> &S {
+        &self.stream
+    }
+
+    /// The stream, mutably. Reading or writing through it bypasses the
+    /// session.
+    pub fn get_mut(&mut self) -> &mut S {
+        &mut self.stream
+    }
+
+    /// The stream, giving up the session.
+    pub fn into_inner(self) -> S {
+        self.stream
+    }
+
+    /// Turn the buffered line into a command, or `None` for a line the
+    /// session handles itself.
+    fn take_line(&mut self) -> io::Result<Option<Line>> {
+        let text = String::from_utf8_lossy(&self.line);
+        let command = text.trim();
+        let line = if command.is_empty() {
+            // Empty commands are silently ignored (firmware behavior; the
+            // datasheet's bare-CR repeat is a later, deliberate change).
+            None
+        } else if command.to_uppercase().starts_with("AT") {
+            Some(Line::At(command.to_string()))
+        } else if command == "1" {
+            // The invented `1` repeat (transitional; see ADR 0001).
+            if let Some(last) = &self.state.last_obd_command {
+                Some(Line::Obd(last.clone(), WireBytes::from(last.as_bytes())))
+            } else {
+                self.line.clear();
+                self.write_line("?")?;
+                return Ok(None);
+            }
+        } else {
+            Some(Line::Obd(
+                command.to_string(),
+                WireBytes::from(self.line.as_slice()),
+            ))
+        };
+        self.line.clear();
+        Ok(line)
+    }
+
+    fn write_echo(&mut self) -> io::Result<()> {
+        if self.echo.is_empty() {
+            return Ok(());
+        }
+        let result = self.stream.write_all(&self.echo);
+        self.echo.clear();
+        result
+    }
+
+    fn answer_at(&mut self, command: &str) -> io::Result<()> {
+        let response = handle_at_command(&mut self.state, &self.identity, command);
+        self.stream.write_all(response.as_bytes())
+    }
+
+    /// Write `{le}{text}{le}>`.
+    fn write_line(&mut self, text: &str) -> io::Result<()> {
+        let le = self.state.line_ending().as_bytes();
+        let mut out = WireBytes::new();
+        out.extend_from_slice(le);
+        out.extend_from_slice(text.as_bytes());
+        out.extend_from_slice(le);
+        out.push(b'>');
+        self.stream.write_all(&out)
+    }
+}
+
+/// Append `data` as uppercase hex, a space between bytes when `spaces`.
+fn push_hex(out: &mut SmallVec<u8, 64>, data: &[u8], spaces: bool) {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    for (i, &b) in data.iter().enumerate() {
+        if spaces && i > 0 {
+            out.push(b' ');
+        }
+        out.push(HEX[usize::from(b >> 4)]);
+        out.push(HEX[usize::from(b & 0x0F)]);
     }
 }
 
 /// Handle an AT command against `state`, answering identity queries from
 /// `identity`. Returns the full response including line endings and prompt.
 ///
-/// This is the firmware's AT dialect, moved verbatim;
-/// [`ClientState::handle_at_command`] delegates here with the default
-/// (firmware) identity.
-pub(crate) fn handle_at_command(
-    state: &mut ClientState,
-    identity: &Identity,
-    command: &str,
-) -> String {
+/// This is the firmware's AT dialect, moved verbatim.
+fn handle_at_command(state: &mut ClientState, identity: &Identity, command: &str) -> String {
     // ELM327 ignores spaces in AT commands
     let cmd: String = command
         .to_uppercase()

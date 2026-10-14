@@ -3,16 +3,24 @@
 //! This library provides types and functions for implementing ELM327-compatible
 //! OBD2 adapters and clients.
 
-use std::io::{self, Write};
-
 mod server_session;
 
-pub use server_session::{Action, Identity, RepeatExpansion, ServerSession};
+pub use server_session::{AtCommand, Command, Identity, ObdCommand, ServerSession};
 
 /// Bytes the library hands to an adapter to write. Sixteen bytes inline
 /// covers echo, every OBD command, and the common replies; the rare longer
 /// lines (`UNABLE TO CONNECT`, the `ATDP` reply) spill to the heap.
 pub type WireBytes = smallvec::SmallVec<u8, 16>;
+
+/// One ECU's answer to an OBD command: the ECU's id when known, and the
+/// data bytes (`41 0C 1A F8` for an RPM reply).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplyLine {
+    /// The replying ECU's CAN id (`0x7E8`), when known.
+    pub ecu: Option<u16>,
+    /// The reply's data bytes, starting with the mode byte.
+    pub data: WireBytes,
+}
 
 /// Per-connection client state (ELM327 settings)
 #[derive(Debug, Clone)]
@@ -26,7 +34,7 @@ pub struct ClientState {
     pub spaces_enabled: bool,
     /// Show header bytes in responses (ATH0/ATH1)
     pub headers_enabled: bool,
-    /// Last OBD command for repeat ("1" command)
+    /// The last OBD command replied to, which a `1` repeats
     pub last_obd_command: Option<String>,
 }
 
@@ -43,83 +51,13 @@ impl Default for ClientState {
 }
 
 impl ClientState {
-    /// Create a new client state with default settings
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Format a line ending based on current settings
-    #[must_use]
-    pub fn line_ending(&self) -> &'static str {
+    /// The line ending the client chose: CR, or CR LF with line feeds on.
+    pub(crate) fn line_ending(&self) -> &'static str {
         if self.linefeeds_enabled {
             "\r\n"
         } else {
             "\r"
         }
-    }
-
-    /// Write a dongle response to `out`, formatted according to client settings.
-    ///
-    /// The dongle sends compact hex (no spaces); this inserts spaces between
-    /// hex byte pairs when `spaces_enabled` is true.
-    ///
-    /// # Errors
-    /// Returns `io::Error` if writing to `out` fails.
-    pub fn write_response(&self, response: &[u8], out: &mut impl Write) -> io::Result<()> {
-        if !self.spaces_enabled {
-            return out.write_all(response);
-        }
-
-        let mut hex_count = 0;
-
-        for &byte in response {
-            let is_hex = byte.is_ascii_hexdigit();
-
-            if is_hex {
-                // Add space before every pair of hex digits (except the first)
-                if hex_count > 0 && hex_count % 2 == 0 {
-                    out.write_all(b" ")?;
-                }
-                hex_count += 1;
-            } else {
-                // Reset hex count on non-hex (line endings, prompt, etc.)
-                hex_count = 0;
-            }
-
-            out.write_all(&[byte])?;
-        }
-
-        Ok(())
-    }
-
-    /// Format a dongle response according to client settings.
-    ///
-    /// Convenience wrapper around [`write_response`](Self::write_response)
-    /// that returns new [`WireBytes`].
-    ///
-    /// # Panics
-    /// Cannot panic: `WireBytes` implements infallible `Write`.
-    #[must_use]
-    pub fn format_response(&self, response: &[u8]) -> WireBytes {
-        let mut result = WireBytes::with_capacity(response.len() * 3 / 2);
-        // WireBytes::write_all is infallible
-        self.write_response(response, &mut result).unwrap();
-        result
-    }
-
-    /// Handle an AT command and return the response
-    /// Mutates the state if the command changes settings
-    pub fn handle_at_command(&mut self, command: &str) -> String {
-        server_session::handle_at_command(self, &Identity::default(), command)
-    }
-
-    /// The generic ELM327 device description response for AT@1.
-    /// `ServerSession` answers AT@1 from its `Identity` instead.
-    #[must_use]
-    pub fn device_description(&self) -> String {
-        let le = self.line_ending();
-        format!("{le}ELM327{le}>")
     }
 }
 
@@ -143,45 +81,5 @@ mod tests {
 
         state.linefeeds_enabled = false;
         assert_eq!(state.line_ending(), "\r");
-    }
-
-    #[test]
-    fn test_at_commands() {
-        let mut state = ClientState::default();
-
-        // Test echo off
-        let resp = state.handle_at_command("ATE0");
-        assert!(resp.contains("OK"));
-        assert!(!state.echo_enabled);
-
-        // Test spaces off
-        let resp = state.handle_at_command("ATS0");
-        assert!(resp.contains("OK"));
-        assert!(!state.spaces_enabled);
-
-        // Test reset
-        let resp = state.handle_at_command("ATZ");
-        assert!(resp.contains("ELM327"));
-        assert!(state.echo_enabled);
-        assert!(state.spaces_enabled);
-    }
-
-    #[test]
-    fn test_format_response_with_spaces() {
-        let state = ClientState::default();
-        let input = b"410C1AF8\r\r>";
-        let output = state.format_response(input);
-        assert_eq!(&output, b"41 0C 1A F8\r\r>");
-    }
-
-    #[test]
-    fn test_format_response_without_spaces() {
-        let state = ClientState {
-            spaces_enabled: false,
-            ..Default::default()
-        };
-        let input = b"410C1AF8\r\r>";
-        let output = state.format_response(input);
-        assert_eq!(&output, b"410C1AF8\r\r>");
     }
 }
