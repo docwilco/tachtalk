@@ -390,7 +390,7 @@ mod tests {
     fn identity_ati_and_reset_banner() {
         assert_eq!(
             serve(b"ATE0\rATI\rATZ\r"),
-            "ATE0\r\r\nOK\r\n>\r\nELM327 v1.5\r\n>\r\nELM327 v1.5\r\n>"
+            "ATE0\rOK\r\n\r\n>ELM327 v1.5\r\n\r\n>\r\n\r\nELM327 v1.5\r\n\r\n>"
         );
     }
 
@@ -400,7 +400,7 @@ mod tests {
         // retired).
         assert_eq!(
             serve(b"ATE0\rAT@1\rAT @1\r"),
-            "ATE0\r\r\nOK\r\n>\r\nMock ELM327\r\n>\r\nMock ELM327\r\n>"
+            "ATE0\rOK\r\n\r\n>Mock ELM327\r\n\r\n>Mock ELM327\r\n\r\n>"
         );
     }
 
@@ -456,12 +456,12 @@ mod tests {
     fn replies_take_the_session_shape() {
         assert_eq!(
             serve(b"ATE0\r0104 1\rATL0\rATS0\r0104 1\r0199 1\r"),
-            "ATE0\r\r\nOK\r\n>\
-             \r\n41 04 64\r\n>\
-             \r\nOK\r\n>\
-             \rOK\r>\
-             \r410464\r>\
-             \rNO DATA\r>"
+            "ATE0\rOK\r\n\r\n>\
+             41 04 64\r\n\r\n>\
+             OK\r\n\r\n>\
+             OK\r\r>\
+             410464\r\r>\
+             NO DATA\r\r>"
         );
     }
 
@@ -471,13 +471,13 @@ mod tests {
         // the retired `1` is just an unknown command.
         assert_eq!(
             serve(b"ATE0\rATS0\r0104 1\r0199 1\r\r\r1\r"),
-            "ATE0\r\r\nOK\r\n>\
-             \r\nOK\r\n>\
-             \r\n410464\r\n>\
-             \r\nNO DATA\r\n>\
-             \r\n410464\r\n>\
-             \r\n410464\r\n>\
-             \r\n?\r\n>"
+            "ATE0\rOK\r\n\r\n>\
+             OK\r\n\r\n>\
+             410464\r\n\r\n>\
+             NO DATA\r\n\r\n>\
+             410464\r\n\r\n>\
+             410464\r\n\r\n>\
+             ?\r\n\r\n>"
         );
     }
 }

@@ -4,10 +4,11 @@
 //! (tachtalk-firmware/src/obd2.rs, `handle_client` + `process_command` as of
 //! bcaa695) and lock its behavior byte-for-byte, warts included: echo per
 //! byte read, CR framing with LF dropped, empty commands silently ignored,
-//! replies formatted `{le}{line}{le}>`, and AT responses formatted with the
-//! line ending from before the command took effect. Deliberate changes since
-//! are noted at their tests: the datasheet's bare-CR repeat replaced the
-//! invented `1`.
+//! and AT responses formatted with the line ending from before the command
+//! took effect. Deliberate changes since are noted at their tests: the
+//! datasheet's bare-CR repeat replaced the invented `1`, and every reply
+//! takes a real ELM327's shape, `{line}{le}{le}>`, as the captures in
+//! `fixtures/` show it (was the firmware's `{le}{line}{le}>`).
 
 use std::io::ErrorKind;
 
@@ -78,7 +79,7 @@ fn line(data: &[u8]) -> ReplyLine {
 fn atz_echoes_and_prints_banner() {
     let (written, seen) = serve_input(b"ATZ\r");
     // Echo is on by default: every byte comes back, then the banner.
-    assert_eq!(written, "ATZ\\r\\r\\nELM327 v1.5\\r\\n>");
+    assert_eq!(written, "ATZ\\r\\r\\n\\r\\nELM327 v1.5\\r\\n\\r\\n>");
     assert_eq!(seen, ["AT ATZ"]);
 }
 
@@ -87,7 +88,7 @@ fn ate0_disables_echo_from_the_next_byte() {
     // The ATE0 command itself is still echoed (the CR is read before the
     // command is answered); ATI after it is not.
     let (written, _) = serve_input(b"ATE0\rATI\r");
-    assert_eq!(written, "ATE0\\r\\r\\nOK\\r\\n>\\r\\nELM327 v1.5\\r\\n>");
+    assert_eq!(written, "ATE0\\rOK\\r\\n\\r\\n>ELM327 v1.5\\r\\n\\r\\n>");
 }
 
 #[test]
@@ -95,7 +96,7 @@ fn echo_is_written_before_the_answer() {
     let mut session = firmware_session(FakeStream::script(vec![
         Step::Read(b"ATI\r".to_vec()),
         Step::Expect(b"ATI\r".to_vec()),
-        Step::Expect(b"\r\nELM327 v1.5\r\n>".to_vec()),
+        Step::Expect(b"ELM327 v1.5\r\n\r\n>".to_vec()),
     ]));
     serve(&mut session, |_| Answer::Reject("?"));
 }
@@ -104,7 +105,7 @@ fn echo_is_written_before_the_answer() {
 fn echo_stops_mid_read_when_ate0_lands() {
     // "ATE0\r" echoed, "AB" read after echo turned off, all in one read.
     let (written, _) = serve_input(b"ATE0\rAB");
-    assert_eq!(written, "ATE0\\r\\r\\nOK\\r\\n>");
+    assert_eq!(written, "ATE0\\rOK\\r\\n\\r\\n>");
 }
 
 #[test]
@@ -112,7 +113,7 @@ fn linefeeds_are_echoed_but_not_buffered() {
     // The trailing LF is echoed after the response, as the firmware's
     // byte-at-a-time loop does.
     let (written, _) = serve_input(b"ATI\r\n");
-    assert_eq!(written, "ATI\\r\\r\\nELM327 v1.5\\r\\n>\\n");
+    assert_eq!(written, "ATI\\rELM327 v1.5\\r\\n\\r\\n>\\n");
     // And an LF inside a command does not split or pollute it.
     let (_, seen) = serve_input(b"AT\nI\r");
     assert_eq!(seen, ["AT ATI"]);
@@ -122,7 +123,7 @@ fn linefeeds_are_echoed_but_not_buffered() {
 fn an_empty_line_with_nothing_to_repeat_answers_a_question_mark() {
     // Spaces are ignored, so a line of spaces is an empty line too.
     let (written, seen) = serve_input(b"\r   \r");
-    assert_eq!(written, "\\r\\r\\n?\\r\\n>   \\r\\r\\n?\\r\\n>");
+    assert_eq!(written, "\\r?\\r\\n\\r\\n>   \\r?\\r\\n\\r\\n>");
     assert!(seen.is_empty());
 }
 
@@ -132,7 +133,7 @@ fn at_commands_are_case_insensitive_and_ignore_spaces() {
     let seen = serve(&mut session, |_| Answer::Reject("?"));
     assert_eq!(
         session.get_ref().written_text(),
-        "ate0\\r\\r\\nOK\\r\\n>\\r\\nOK\\r\\n>"
+        "ate0\\rOK\\r\\n\\r\\n>OK\\r\\n\\r\\n>"
     );
     assert!(!session.client_state().echo_enabled);
     assert!(session.client_state().headers_enabled);
@@ -143,7 +144,7 @@ fn at_commands_are_case_insensitive_and_ignore_spaces() {
 #[test]
 fn unknown_at_command_gets_question_mark() {
     let (written, _) = serve_input(b"ATXX\r");
-    assert_eq!(written, "ATXX\\r\\r\\n?\\r\\n>");
+    assert_eq!(written, "ATXX\\r?\\r\\n\\r\\n>");
 }
 
 #[test]
@@ -156,7 +157,7 @@ fn atz_resets_settings_and_uses_the_new_line_ending() {
     assert!(session
         .get_ref()
         .written_text()
-        .ends_with("\\r\\nELM327 v1.5\\r\\n>"));
+        .ends_with("\\r\\n\\r\\nELM327 v1.5\\r\\n\\r\\n>"));
     let state = session.client_state();
     assert!(state.echo_enabled);
     assert!(state.linefeeds_enabled);
@@ -173,10 +174,10 @@ fn identity_strings_come_from_the_constructor() {
     serve(&mut session, |_| Answer::Reject("?"));
     assert_eq!(
         session.get_ref().written_text(),
-        "ATE0\\r\\r\\nOK\\r\\n>\
-         \\r\\nMOCK ELM327 v9.9\\r\\n>\
-         \\r\\ntachtalk mock\\r\\n>\
-         \\r\\nMOCK ELM327 v9.9\\r\\n>"
+        "ATE0\\rOK\\r\\n\\r\\n>\
+         MOCK ELM327 v9.9\\r\\n\\r\\n>\
+         tachtalk mock\\r\\n\\r\\n>\
+         \\r\\n\\r\\nMOCK ELM327 v9.9\\r\\n\\r\\n>"
     );
 }
 
@@ -222,10 +223,10 @@ fn reply_formats_one_line_per_ecu_with_spaces() {
     });
     assert_eq!(
         session.get_ref().written_text(),
-        "ATE0\\r\\r\\nOK\\r\\n>\
-         \\r\\n41 0C 1A F8\\r\\n41 0C 1B 00\\r\\n>\
-         \\r\\nOK\\r\\n>\
-         \\r\\n410C1AF8\\r\\n410C1B00\\r\\n>"
+        "ATE0\\rOK\\r\\n\\r\\n>\
+         41 0C 1A F8\\r\\n41 0C 1B 00\\r\\n\\r\\n>\
+         OK\\r\\n\\r\\n>\
+         410C1AF8\\r\\n410C1B00\\r\\n\\r\\n>"
     );
 }
 
@@ -235,7 +236,7 @@ fn reject_writes_a_line_with_the_current_line_ending() {
     assert_eq!(
         written,
         // ATL0's own reply still uses the old CRLF; the reject after it, CR.
-        "ATE0\\r\\r\\nOK\\r\\n>\\r\\n?\\r\\n>\\r\\nOK\\r\\n>\\r?\\r>"
+        "ATE0\\rOK\\r\\n\\r\\n>?\\r\\n\\r\\n>OK\\r\\n\\r\\n>?\\r\\r>"
     );
 }
 
@@ -249,7 +250,7 @@ fn each_command_is_answered_before_the_next_is_read() {
     });
     assert_eq!(
         session.get_ref().written_text(),
-        "ATE0\\r\\r\\nOK\\r\\n>\\r\\n41 0C 1A F8\\r\\n>\\r\\nOK\\r\\n>"
+        "ATE0\\rOK\\r\\n\\r\\n>41 0C 1A F8\\r\\n\\r\\n>OK\\r\\n\\r\\n>"
     );
 }
 
@@ -280,7 +281,7 @@ fn a_bare_cr_after_a_rejected_command_answers_a_question_mark() {
     assert_eq!(seen, ["AT ATE0", "OBD 010C | 010C"]);
     assert_eq!(
         written,
-        "ATE0\\r\\r\\nOK\\r\\n>\\r\\n?\\r\\n>\\r\\n?\\r\\n>"
+        "ATE0\\rOK\\r\\n\\r\\n>?\\r\\n\\r\\n>?\\r\\n\\r\\n>"
     );
 }
 
@@ -329,7 +330,7 @@ fn an_at_command_dropped_unanswered_is_answered() {
     }
     assert_eq!(
         session.get_ref().written_text(),
-        "ATE0\\r\\r\\nOK\\r\\n>\\r\\nELM327 v1.5\\r\\n>"
+        "ATE0\\rOK\\r\\n\\r\\n>ELM327 v1.5\\r\\n\\r\\n>"
     );
 }
 

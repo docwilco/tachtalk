@@ -127,8 +127,8 @@ impl<S: Read + Write> ObdCommand<'_, S> {
         let le = state.line_ending().as_bytes();
         let mut out: SmallVec<u8, 64> = SmallVec::new();
         for line in lines {
-            out.extend_from_slice(le);
             push_hex(&mut out, &line.data, state.spaces_enabled);
+            out.extend_from_slice(le);
         }
         out.extend_from_slice(le);
         out.push(b'>');
@@ -321,12 +321,12 @@ impl<S: Read + Write> ServerSession<S> {
         self.stream.write_all(response.as_bytes())
     }
 
-    /// Write `{le}{text}{le}>`.
+    /// Write `{text}{le}{le}>`, a real ELM327's shape for a one-line reply.
     fn write_line(&mut self, text: &str) -> io::Result<()> {
         let le = self.state.line_ending().as_bytes();
         let mut out = WireBytes::new();
-        out.extend_from_slice(le);
         out.extend_from_slice(text.as_bytes());
+        out.extend_from_slice(le);
         out.extend_from_slice(le);
         out.push(b'>');
         self.stream.write_all(&out)
@@ -364,9 +364,10 @@ fn handle_at_command(state: &mut ClientState, identity: &Identity, command: &str
             // Reset all settings to defaults
             *state = ClientState::default();
             // Use new state's line ending for response
+            // A real ELM327 prints blank lines before its reset banner.
             let le = state.line_ending();
             let ati = &identity.ati;
-            return format!("{le}{ati}{le}>");
+            return format!("{le}{le}{ati}{le}{le}>");
         }
         "ATE0" => {
             state.echo_enabled = false;
@@ -402,27 +403,27 @@ fn handle_at_command(state: &mut ClientState, identity: &Identity, command: &str
         }
         "ATRV" => {
             // Return simulated battery voltage (12.6V)
-            return format!("{le}12.6V{le}>");
+            return format!("12.6V{le}{le}>");
         }
         "ATSP0" | "ATAT1" | "ATAT2" => "OK",
         "ATDP" => {
             // Describe protocol
-            return format!("{le}AUTO, ISO 15765-4 (CAN 11/500){le}>");
+            return format!("AUTO, ISO 15765-4 (CAN 11/500){le}{le}>");
         }
         "ATDPN" => {
             // Describe protocol number
-            return format!("{le}A6{le}>");
+            return format!("A6{le}{le}>");
         }
         _ if cmd.starts_with("ATSP") => "OK",
         _ if cmd.starts_with("ATST") => "OK",
         _ if cmd.starts_with("ATAT") => "OK",
-        "ATI" => return format!("{le}{}{le}>", identity.ati),
-        "AT@1" => return format!("{le}{}{le}>", identity.device_description),
+        "ATI" => return format!("{}{le}{le}>", identity.ati),
+        "AT@1" => return format!("{}{le}{le}>", identity.device_description),
         _ => "?",
     };
 
     // Build response with proper line endings (echo already sent)
     // Note: for commands that change linefeed setting, we use the OLD setting
     // since le was captured before the match
-    format!("{le}{response_text}{le}>")
+    format!("{response_text}{le}{le}>")
 }
