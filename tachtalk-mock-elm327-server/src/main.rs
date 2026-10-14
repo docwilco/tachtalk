@@ -466,6 +466,14 @@ mod tests {
     }
 
     #[test]
+    fn headers_carry_the_engine_ecu() {
+        assert_eq!(
+            serve(b"ATE0\rATH1\r0104 1\r"),
+            "ATE0\rOK\r\n\r\n>OK\r\n\r\n>7E8 03 41 04 64\r\n\r\n>"
+        );
+    }
+
+    #[test]
     fn a_bare_cr_repeats_the_last_replied_command() {
         // A rejected command does not replace what a bare CR repeats, and
         // the retired `1` is just an unknown command.

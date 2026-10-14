@@ -127,6 +127,9 @@ impl<S: Read + Write> ObdCommand<'_, S> {
         let le = state.line_ending().as_bytes();
         let mut out: SmallVec<u8, 64> = SmallVec::new();
         for line in lines {
+            if state.headers_enabled {
+                push_header(&mut out, line, state.spaces_enabled);
+            }
             push_hex(&mut out, &line.data, state.spaces_enabled);
             out.extend_from_slice(le);
         }
@@ -330,6 +333,29 @@ impl<S: Read + Write> ServerSession<S> {
         out.extend_from_slice(le);
         out.push(b'>');
         self.stream.write_all(&out)
+    }
+}
+
+/// The CAN id a line is headed with when its ECU is unknown: 7E8, the
+/// engine ECU's usual reply id.
+const DEFAULT_ECU: u16 = 0x7E8;
+
+/// Append a line's `ATH1` header: the 3-digit CAN id and the data length,
+/// each followed by a space when `spaces`.
+fn push_header(out: &mut SmallVec<u8, 64>, line: &ReplyLine, spaces: bool) {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let ecu = line.ecu.unwrap_or(DEFAULT_ECU);
+    for shift in [8, 4, 0] {
+        out.push(HEX[usize::from((ecu >> shift) & 0x0F)]);
+    }
+    if spaces {
+        out.push(b' ');
+    }
+    // A CAN single frame carries at most 7 data bytes.
+    let len = u8::try_from(line.data.len()).unwrap_or(u8::MAX);
+    push_hex(out, &[len], false);
+    if spaces {
+        out.push(b' ');
     }
 }
 

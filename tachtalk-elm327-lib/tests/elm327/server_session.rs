@@ -231,6 +231,35 @@ fn reply_formats_one_line_per_ecu_with_spaces() {
 }
 
 #[test]
+fn with_headers_each_line_carries_its_ecu_and_length() {
+    // Changed from the firmware, which ignored ATH1: a real ELM327 prefixes
+    // each line with the CAN id and the data length (7E804410C0CD4 in the
+    // captures). A line with no known ECU gets 7E8, the engine's id.
+    let mut session = firmware_session(FakeStream::new(b"ATE0\rATH1\r010C\rATS0\r010C\r0199\r"));
+    let mut replies = vec![
+        Answer::Reply(vec![
+            ReplyLine {
+                ecu: Some(0x7E9),
+                data: [0x41, 0x0C, 0x1A, 0xF8].into(),
+            },
+            line(&[0x41, 0x0C, 0x1B, 0x00]),
+        ]),
+        Answer::Reply(vec![line(&[0x41, 0x0C, 0x1A, 0xF8])]),
+        Answer::Reject("NO DATA"),
+    ]
+    .into_iter();
+    serve(&mut session, |_| replies.next().unwrap());
+    assert_eq!(
+        session.get_ref().written_text(),
+        "ATE0\\rOK\\r\\n\\r\\n>OK\\r\\n\\r\\n>\
+         7E9 04 41 0C 1A F8\\r\\n7E8 04 41 0C 1B 00\\r\\n\\r\\n>\
+         OK\\r\\n\\r\\n>\
+         7E804410C1AF8\\r\\n\\r\\n>\
+         NO DATA\\r\\n\\r\\n>"
+    );
+}
+
+#[test]
 fn reject_writes_a_line_with_the_current_line_ending() {
     let (written, _) = serve_input(b"ATE0\r010C\rATL0\r010C\r");
     assert_eq!(
