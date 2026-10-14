@@ -51,7 +51,7 @@ So be mindful of the inline size you choose, as choosing too small may actually 
 
 ### In `tachtalk-elm327-lib`
 
-The guidance covers the ELM327 library too, since the firmware runs it on every client connection: the library returns no `Vec`. Every byte payload it hands out is `WireBytes`, its exported alias for `SmallVec<u8, 16>`, which the firmware also uses for its own wire buffers. Every list it returns is a `SmallVec`. Sixteen bytes inline covers echo, every OBD command, and the common replies (`OK`, `?`, the `ATI` banner, `NO DATA`). Two rare lines spill to the heap and that is accepted: `UNABLE TO CONNECT`, sent only while the dongle is not ready, and the `ATDP` reply, asked once while an app connects. Command text stays `String`. Decided in issue #28.
+The guidance covers the ELM327 library too, since the firmware runs it on every client and dongle connection: the library returns no `Vec`. Every byte payload it hands out or buffers is `WireBytes`, its exported alias for `SmallVec<u8, 16>` (a reply line's data, a raw reply, echo, a command). Every list it returns is a `SmallVec` (`Lines`, one `ReplyLine` per ECU). Sixteen bytes inline covers echo, every OBD command, and the common one-line replies. Longer ones spill to the heap and that is accepted: `UNABLE TO CONNECT`, sent only while the dongle is not ready, and a raw reply of several ECU lines. Command text stays `String`. Decided in issues #28 and #30.
 
 # Configuration
 
