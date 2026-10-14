@@ -269,8 +269,9 @@ fn get_pid_response(pid: &str, start_time: &Instant) -> Option<String> {
     }
 }
 
-/// The mock engine ECU's answer to a non-AT command (the repeated command
-/// if the client sent a bare CR): PID dispatch over simulated values.
+/// The mock engine ECU's answer to a non-AT command, canonical (uppercase,
+/// no spaces; the repeated command if the client sent a bare CR): PID
+/// dispatch over simulated values.
 fn respond_obd(command: &str, start_time: &Instant) -> Answer {
     let hex_data = match command {
         // Mode 03 - Show stored DTCs
@@ -283,16 +284,15 @@ fn respond_obd(command: &str, start_time: &Instant) -> Answer {
         c if c.starts_with("01") && c.len() >= 4 => {
             let pid_data = &c[2..]; // Everything after "01"
 
-            // Check if response count is specified (e.g., "0C 1" has a space)
-            // If no count specified, simulate adaptive timing wait
-            let has_response_count = pid_data.contains(' ');
-            if !has_response_count {
+            // A response count is one digit after the PID pairs ("0C1"):
+            // it tells the ELM327 how many ECU responses to wait for.
+            // Without one, simulate the adaptive timing wait.
+            let pid_data = if pid_data.len() % 2 == 1 {
+                &pid_data[..pid_data.len() - 1]
+            } else {
                 std::thread::sleep(Duration::from_millis(200));
-            }
-
-            // Strip optional response count (e.g., "0C 1" -> "0C")
-            // The number after space tells ELM327 how many responses to wait for
-            let pid_data = pid_data.split_whitespace().next().unwrap_or(pid_data);
+                pid_data
+            };
 
             let mut response = String::from("41");
             for pid in pid_data.as_bytes().chunks_exact(2) {
@@ -407,22 +407,23 @@ mod tests {
     #[test]
     fn static_pid_with_response_count() {
         let start = Instant::now();
-        assert_eq!(respond_obd("0104 1", &start), reply("410464"));
+        assert_eq!(respond_obd("01041", &start), reply("410464"));
     }
 
     #[test]
     fn multi_pid_request() {
         let start = Instant::now();
-        assert_eq!(respond_obd("010420 1", &start), reply("4104642080000001"));
+        assert_eq!(respond_obd("0104201", &start), reply("4104642080000001"));
     }
 
     #[test]
-    fn lowercase_pid_is_dispatched() {
-        let start = Instant::now();
-        let Answer::Reply(line) = respond_obd("010c 1", &start) else {
-            panic!("expected a reply");
-        };
-        assert_eq!(&line.data[..2], &[0x41, 0x0C]);
+    fn a_spaced_lowercase_command_is_dispatched() {
+        // The session hands the mock "010C1"; the reply is RPM.
+        let written = serve(b"ATE0\r01 0c 1\r");
+        assert!(
+            written.starts_with("ATE0\rOK\r\n\r\n>41 0C "),
+            "got {written:?}"
+        );
     }
 
     #[test]
@@ -443,7 +444,7 @@ mod tests {
     #[test]
     fn unknown_pid_is_no_data() {
         let start = Instant::now();
-        assert_eq!(respond_obd("0199 1", &start), Answer::Reject("NO DATA"));
+        assert_eq!(respond_obd("01991", &start), Answer::Reject("NO DATA"));
     }
 
     #[test]

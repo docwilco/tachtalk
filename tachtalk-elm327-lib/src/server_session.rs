@@ -55,7 +55,7 @@ pub struct AtCommand<'a, S: Read + Write> {
 }
 
 impl<S: Read + Write> AtCommand<'_, S> {
-    /// The command as received: trimmed, original case.
+    /// The command, canonical: uppercase, spaces removed.
     #[must_use]
     pub fn command(&self) -> &str {
         &self.command
@@ -97,8 +97,8 @@ pub struct ObdCommand<'a, S: Read + Write> {
 }
 
 impl<S: Read + Write> ObdCommand<'_, S> {
-    /// The command, trimmed (the repeated command for a bare carriage
-    /// return).
+    /// The command, canonical: uppercase, spaces removed (the repeated
+    /// command for a bare carriage return).
     #[must_use]
     pub fn command(&self) -> &str {
         &self.command
@@ -286,8 +286,12 @@ impl<S: Read + Write> ServerSession<S> {
     /// Turn the buffered line into a command, or `None` for a line the
     /// session handles itself.
     fn take_line(&mut self) -> io::Result<Option<Line>> {
-        let text = String::from_utf8_lossy(&self.line);
-        let command = text.trim();
+        // The ELM327 ignores case and spaces: hand commands out canonical.
+        let command: String = String::from_utf8_lossy(&self.line)
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .map(|c| c.to_ascii_uppercase())
+            .collect();
         let line = if command.is_empty() {
             // The datasheet's repeat: a bare carriage return re-runs the
             // last command replied to; with none, it is answered `?`.
@@ -298,13 +302,10 @@ impl<S: Read + Write> ServerSession<S> {
                 self.write_line("?")?;
                 return Ok(None);
             }
-        } else if command.to_uppercase().starts_with("AT") {
-            Some(Line::At(command.to_string()))
+        } else if command.starts_with("AT") {
+            Some(Line::At(command))
         } else {
-            Some(Line::Obd(
-                command.to_string(),
-                WireBytes::from(self.line.as_slice()),
-            ))
+            Some(Line::Obd(command, WireBytes::from(self.line.as_slice())))
         };
         self.line.clear();
         Ok(line)

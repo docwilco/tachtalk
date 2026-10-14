@@ -137,8 +137,8 @@ fn at_commands_are_case_insensitive_and_ignore_spaces() {
     );
     assert!(!session.client_state().echo_enabled);
     assert!(session.client_state().headers_enabled);
-    // The command is handed out as received (trimmed, original case).
-    assert_eq!(seen, ["AT ate0", "AT AT H1"]);
+    // The command is handed out canonical: uppercase, spaces removed.
+    assert_eq!(seen, ["AT ATE0", "AT ATH1"]);
 }
 
 #[test]
@@ -182,9 +182,18 @@ fn identity_strings_come_from_the_constructor() {
 }
 
 #[test]
+fn commands_are_handed_out_canonical() {
+    // Changed from the firmware, which forwarded OBD commands as typed: the
+    // ELM327 ignores case and spaces, so every command is handed out
+    // uppercase with spaces removed; raw() keeps the bytes as received.
+    let (_, seen) = serve_input(b"ATE0\r01 0c\rat sp 0\r");
+    assert_eq!(seen, ["AT ATE0", "OBD 010C | 01 0c", "AT ATSP0"]);
+}
+
+#[test]
 fn obd_command_is_handed_out_trimmed_with_raw_bytes() {
     let (_, seen) = serve_input(b"ATE0\r 010c 1 \r");
-    assert_eq!(seen, ["AT ATE0", "OBD 010c 1 |  010c 1 "]);
+    assert_eq!(seen, ["AT ATE0", "OBD 010C1 |  010c 1 "]);
 }
 
 #[test]
@@ -295,9 +304,9 @@ fn a_bare_cr_repeats_the_last_replied_command() {
         seen,
         [
             "AT ATE0",
-            "OBD 010C 1 | 010C 1",
-            "OBD 010C 1 | 010C 1",
-            "OBD 010C 1 | 010C 1"
+            "OBD 010C1 | 010C 1",
+            "OBD 010C1 | 010C1",
+            "OBD 010C1 | 010C1"
         ]
     );
 }
@@ -340,11 +349,11 @@ fn torn_reads_write_the_same_bytes_as_whole_reads() {
             "AT ATZ",
             "AT ATE0",
             "OBD 010C | 010C",
-            "AT AT H1",
+            "AT ATH1",
             "OBD 010C | 010C",
             "OBD 010C | 010C",
             "AT ATL0",
-            "AT atdp",
+            "AT ATDP",
             "OBD 010C | 010C",
             "OBD 010D | 010D",
         ]

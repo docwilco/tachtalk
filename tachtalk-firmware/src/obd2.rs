@@ -23,7 +23,7 @@ use tachtalk_capture_format::{
 };
 use tachtalk_elm327_lib::{
     ClientConfig, ClientSession, Command, FeatureSupport, Identity, Lines, ObdCommand, Pid,
-    PidGroup, ServerSession, WireBytes,
+    PidGroup, ServerSession,
 };
 
 use crate::config::{PidPriority, SlowPollMode};
@@ -208,25 +208,18 @@ fn supported_pids_index(cmd: &[u8]) -> Option<usize> {
         .position(|&q| cmd.eq_ignore_ascii_case(q))
 }
 
-/// Normalize an OBD2 command for caching and lookup.
+/// A canonical command (uppercase, no spaces) without its response count,
+/// for caching and lookup.
 ///
-/// Strips trailing `" 1"` (single response count) and removes all spaces to
-/// produce a canonical hex form, since the ELM327 accepts both `"010C"` and
-/// `"01 0C"`.
-///
-/// **Known limitation:** stripping `" 1"` discards the client's response count
-/// hint, and commands with other counts (e.g., `" 2"`) are kept as-is. This
-/// will be replaced by proper command parsing (see TODO: `ParsedClientCommand`).
-fn normalize_obd_command(cmd: &[u8]) -> WireBytes {
-    // Strip trailing " 1" first, while the space boundary distinguishes it
-    // from hex data (e.g., "01 0C 1" → "01 0C", but "0100" stays "0100").
-    let cmd = if cmd.len() >= 2 && cmd.ends_with(b" 1") {
-        &cmd[..cmd.len() - 2]
+/// A Mode 01 query is `01` and PID pairs; a single digit after them is the
+/// client's response-count hint (`010C1`), which the cache key leaves out,
+/// whatever the count.
+fn strip_response_count(cmd: &[u8]) -> &[u8] {
+    if cmd.len() % 2 == 1 {
+        &cmd[..cmd.len() - 1]
     } else {
         cmd
-    };
-    // Strip all spaces to get canonical hex form
-    cmd.iter().filter(|&&b| b != b' ').copied().collect()
+    }
 }
 
 // ============================================================================
@@ -1636,11 +1629,11 @@ impl Obd2Proxy {
             log.insert(obd.command().to_uppercase());
         }
 
-        // Normalize command for cache key (strips trailing " 1" response count)
-        let normalized = normalize_obd_command(obd.raw());
+        // The cache key is the command without its response count
+        let normalized = strip_response_count(obd.command().as_bytes());
 
         // Check if this is a supported PIDs query - return from State cache
-        if let Some(idx) = supported_pids_index(&normalized) {
+        if let Some(idx) = supported_pids_index(normalized) {
             let supported_pids_guard = state.supported_pids.lock().unwrap();
             if let Some(ref lines) = supported_pids_guard.entries[idx] {
                 // The dongle answered without a Mode 01 line.
@@ -1658,7 +1651,7 @@ impl Obd2Proxy {
         }
 
         // Convert normalized command to PID
-        let Some(pid) = wire_command_to_pid(&normalized) else {
+        let Some(pid) = wire_command_to_pid(normalized) else {
             // Invalid command format - return error
             obd.reject("?")?;
             return Ok(());
