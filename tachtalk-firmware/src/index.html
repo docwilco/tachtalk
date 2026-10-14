@@ -1154,12 +1154,7 @@
             <div class="form-group">
                 <label>Use Repeat:</label>
                 <input type="checkbox" id="obd2UseRepeat">
-                <small style="color: #888;">Repeat last command instead of resending (auto-detects support)</small>
-            </div>
-            <div class="form-group">
-                <label>Repeat String:</label>
-                <input type="text" id="obd2RepeatString" placeholder="" style="width: 80px;">
-                <small style="color: #888;">Repeat command (empty = bare CR per ELM327 spec)</small>
+                <small style="color: #888;">Repeat the last query with a bare CR instead of resending (auto-detects support)</small>
             </div>
             <div class="form-group">
                 <label>Use CAN Framing:</label>
@@ -1703,7 +1698,6 @@
             { id: 'obd2UseMultiPid', path: 'obd2.use_multi_pid', type: 'bool', default: 'obd2.use_multi_pid' },
             { id: 'obd2MaxPidsPerQuery', path: 'obd2.max_pids_per_query', type: 'int', default: 'obd2.max_pids_per_query' },
             { id: 'obd2UseRepeat', path: 'obd2.use_repeat', type: 'bool', default: 'obd2.use_repeat' },
-            { id: 'obd2RepeatString', path: 'obd2.repeat_string', type: 'str', default: 'obd2.repeat_string' },
             { id: 'obd2UseFraming', path: 'obd2.use_framing', type: 'bool', default: 'obd2.use_framing' },
             { id: 'obd2UsePipelining', path: 'obd2.use_pipelining', type: 'bool', default: 'obd2.use_pipelining' },
             { id: 'obd2CaptureEnabled', path: 'obd2.capture_enabled', type: 'bool', default: 'obd2.capture_enabled' },

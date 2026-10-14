@@ -21,9 +21,12 @@ use std::time::{Duration, Instant};
 use tachtalk_capture_format::{
     CaptureHeader, RecordType, FLAG_OVERFLOW, HEADER_SIZE, RECORD_HEADER_SIZE,
 };
-use tachtalk_elm327_lib::{Command, Identity, ObdCommand, ReplyLine, ServerSession, WireBytes};
+use tachtalk_elm327_lib::{
+    ClientConfig, ClientSession, Command, FeatureSupport, Identity, Lines, ObdCommand, Pid,
+    PidGroup, ServerSession, WireBytes,
+};
 
-use crate::config::{PidDataLengths, PidPriority, SlowPollMode, MODE01_PID_DATA_LENGTHS};
+use crate::config::{PidPriority, SlowPollMode};
 use crate::led_display::LedTaskMessage;
 use crate::status_leds::StatusLedMessage;
 use crate::watchdog::WatchdogHandle;
@@ -57,48 +60,13 @@ const RECONNECT_DELAY: Duration = Duration::from_secs(1);
 /// Maintenance interval for checking promotion/demotion/removal
 const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(2);
 
-/// OBD2 PID byte. Mode is always 0x01 for this application.
-type Pid = u8;
-
-/// Data bytes for a single ECU response (excluding mode/PID prefix).
-/// Max 8 bytes inline covers all Mode 01 PIDs (longest is 6 bytes).
-/// Size: 12 bytes on 32-bit.
-type PidData = SmallVec<u8, 8>;
-
-/// Cached OBD2 response: one data entry per ECU. Most PIDs get exactly 1.
-type CachedResponse = SmallVec<PidData, 1>;
-
-/// A group of PIDs sharing the same learned ECU count, for multi-PID batching.
-type PidGroup = SmallVec<Pid, 8>;
+/// Cached OBD2 response: one reply line per ECU (`41 {pid} {data}`), with
+/// the ECU's id when the dongle sends headers. Most PIDs get exactly 1.
+type CachedResponse = Lines;
 
 // ============================================================================
 // PID/Wire Conversion Helpers
 // ============================================================================
-
-/// Convert a PID to wire-format Mode 01 command (e.g., `0x0C` → `b"010C"`).
-fn pid_to_wire_command(pid: Pid) -> WireBytes {
-    // Always 4 bytes ("01XX"), fits the 16 inline bytes of WireBytes
-    let mut buf = WireBytes::new();
-    write!(buf, "01{pid:02X}").unwrap();
-    buf
-}
-
-/// Build a wire-format multi-PID command (e.g., `[0x0C, 0x0D]` → `b"010C0D 1"`).
-///
-/// Appends the ECU `response_count` suffix so the adapter knows how many
-/// responses to wait for. All PIDs in a batch must share the same ECU count
-/// (callers group by count before calling this).
-fn build_multi_pid_wire_command(pids: &[Pid], response_count: u8) -> WireBytes {
-    // Maximum 6 PIDs: "01" + 6×"XX" + " N" = 16 bytes, fits inline
-    // in WireBytes
-    let mut cmd = WireBytes::new();
-    cmd.extend_from_slice(b"01");
-    for &pid in pids {
-        write!(cmd, "{pid:02X}").unwrap();
-    }
-    write!(cmd, " {response_count}").unwrap();
-    cmd
-}
 
 /// Parse a wire-format command (e.g., `b"010C"`) to PID byte.
 /// Returns `None` for invalid/non-OBD commands or non-Mode-01 commands.
@@ -122,30 +90,13 @@ fn wire_command_to_pid(cmd: &[u8]) -> Option<Pid> {
     Some(pid)
 }
 
-/// A cached PID value as reply lines for a client, one per ECU:
-/// `41 {pid} {data}`. The cache keeps no ECU ids yet.
-fn cached_lines(pid: Pid, values: &CachedResponse) -> SmallVec<ReplyLine, 1> {
-    values
-        .iter()
-        .map(|data| {
-            let mut line = WireBytes::new();
-            line.extend_from_slice(&[0x41, pid]);
-            line.extend_from_slice(data);
-            ReplyLine {
-                ecu: None,
-                data: line,
-            }
-        })
-        .collect()
-}
-
 /// Cached supported-PID query responses plus a readiness flag.
 ///
 /// The `ready` flag is `false` while connecting or after a disconnect, and
 /// `true` once all 8 supported-PID queries have been attempted.
 #[derive(Default)]
 pub struct SupportedPidsCache {
-    pub entries: [Option<WireBytes>; 8],
+    pub entries: [Option<CachedResponse>; 8],
     pub ready: bool,
 }
 
@@ -282,269 +233,6 @@ fn normalize_obd_command(cmd: &[u8]) -> WireBytes {
 // Response Parsing (Framing Layer)
 // ============================================================================
 
-/// A single parsed response line, optionally with ECU CAN ID.
-#[derive(Debug, Clone)]
-struct ParsedLine {
-    /// Parsed 11-bit CAN ID when framing is enabled (e.g., `0x7E8`).
-    ecu_id: Option<u16>,
-    /// OBD data bytes (after PCI byte when framing, or raw hex bytes when not).
-    data: WireBytes,
-}
-
-/// Parse a raw dongle response into structured lines.
-///
-/// When `framing_enabled` is true (ATH1), expects format like:
-/// `7E8 03 41 0C 1A F8\r7E9 03 41 0C 1B 00\r>`
-///
-/// When `framing_enabled` is false (ATH0), expects format like:
-/// `41 0C 1A F8\r41 0C 1B 00\r>`
-fn parse_response_framed(response: &[u8], framing_enabled: bool) -> SmallVec<ParsedLine, 4> {
-    let response_str = String::from_utf8_lossy(response);
-    let mut lines = SmallVec::new();
-
-    // ELM327 with ATL0 uses bare '\r' as line terminator.
-    // str::lines() only splits on '\n' and '\r\n', not bare '\r'.
-    for line in response_str.split('\r') {
-        let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.contains('>') {
-            continue;
-        }
-
-        if framing_enabled {
-            // Framing on: expect `{3-char CAN ID}{PCI byte}{OBD data...}`
-            // With ATS0 (spaces off), format is `7E80341 0C1AF8`
-            // First 3 chars = CAN ID, next 2 = PCI hex byte, rest = data
-            let bytes: SmallVec<u8, 24> = trimmed.replace(' ', "").into_bytes().into();
-            if bytes.len() < 5 {
-                // Too short for framing format, return as-is
-                lines.push(ParsedLine {
-                    ecu_id: None,
-                    data: bytes.into_iter().collect(),
-                });
-                continue;
-            }
-
-            let ecu_id = std::str::from_utf8(&bytes[..3])
-                .ok()
-                .and_then(|s| u16::from_str_radix(s, 16).ok())
-                .unwrap_or(0);
-
-            // Parse PCI byte (2 hex chars after CAN ID) - indicates data length
-            let pci_str = std::str::from_utf8(&bytes[3..5]).unwrap_or("00");
-            let pci_byte = u8::from_str_radix(pci_str, 16).unwrap_or(0);
-
-            // Remaining data after PCI (hex pairs)
-            let data_hex = &bytes[5..];
-            let actual_data_bytes = data_hex.len() / 2;
-
-            if actual_data_bytes != usize::from(pci_byte) {
-                warn!(
-                    "PCI byte mismatch: PCI={pci_byte}, actual data bytes={actual_data_bytes}, line={trimmed}"
-                );
-            }
-
-            // Parse the data hex bytes
-            let mut data: WireBytes = WireBytes::new();
-            let mut i = 0;
-            while i + 1 < data_hex.len() {
-                if let Ok(b) =
-                    u8::from_str_radix(std::str::from_utf8(&data_hex[i..i + 2]).unwrap_or("00"), 16)
-                {
-                    data.push(b);
-                }
-                i += 2;
-            }
-
-            lines.push(ParsedLine {
-                ecu_id: Some(ecu_id),
-                data,
-            });
-        } else {
-            // Framing off: raw hex line, parse bytes
-            let hex_str = trimmed.replace(' ', "");
-            let mut data: WireBytes = WireBytes::new();
-            let hex_bytes = hex_str.as_bytes();
-            let mut i = 0;
-            while i + 1 < hex_bytes.len() {
-                if let Ok(b) = u8::from_str_radix(
-                    std::str::from_utf8(&hex_bytes[i..i + 2]).unwrap_or("00"),
-                    16,
-                ) {
-                    data.push(b);
-                }
-                i += 2;
-            }
-            lines.push(ParsedLine { ecu_id: None, data });
-        }
-    }
-
-    lines
-}
-
-/// Look up PID data length from a (possibly runtime-updated) lookup table.
-#[inline]
-fn resolve_pid_data_length(pid: u8, pid_lengths: &PidDataLengths) -> Option<u8> {
-    pid_lengths[pid as usize]
-}
-
-/// Count ECUs per PID from parsed response lines.
-///
-/// Returns a map of PID byte -> ECU count. Works for both single and multi-PID
-/// queries by parsing the full response data using `resolve_pid_data_length()` to
-/// determine byte boundaries.
-///
-/// For multi-PID responses like `41 0C 0C B8 05 62`, this parses:
-/// - 0x41 = mode 01 response
-/// - 0x0C = PID (RPM), followed by 2 data bytes
-/// - 0x05 = PID (coolant), followed by 1 data byte
-///
-/// When framing is enabled, also verifies unique CAN IDs per PID.
-fn count_ecus_per_pid(
-    parsed: &[ParsedLine],
-    framing_enabled: bool,
-    pid_lengths: &PidDataLengths,
-) -> HashMap<u8, u8> {
-    let mut counts: HashMap<u8, u8> = HashMap::new();
-
-    if framing_enabled {
-        // Group by (CAN ID, PID) to count unique ECUs per PID
-        let mut seen_per_pid: HashMap<u8, SmallVec<u16, 4>> = HashMap::new();
-        for line in parsed {
-            if let Some(ecu_id) = line.ecu_id {
-                for pid in extract_pids_from_response(&line.data, pid_lengths) {
-                    let ecus = seen_per_pid.entry(pid).or_default();
-                    if !ecus.contains(&ecu_id) {
-                        ecus.push(ecu_id);
-                    }
-                }
-            }
-        }
-        for (pid, ecus) in seen_per_pid {
-            #[allow(clippy::cast_possible_truncation)]
-            let count = ecus.len() as u8;
-            counts.insert(pid, count);
-        }
-    } else {
-        // Count PID occurrences across response lines (no deduplication without CAN IDs)
-        for line in parsed {
-            for pid in extract_pids_from_response(&line.data, pid_lengths) {
-                *counts.entry(pid).or_insert(0) += 1;
-            }
-        }
-    }
-
-    counts
-}
-
-/// Extract all PIDs from a Mode 01 response data buffer.
-///
-/// Response format: `41 <PID1> <DATA1...> <PID2> <DATA2...> ...`
-/// Uses `resolve_pid_data_length()` (with runtime-learned overrides) to determine how
-/// many data bytes follow each PID.
-fn extract_pids_from_response(data: &[u8], pid_lengths: &PidDataLengths) -> PidGroup {
-    let mut pids = PidGroup::new();
-
-    // Need at least service byte + PID
-    if data.len() < 2 || data[0] != 0x41 {
-        return pids;
-    }
-
-    let mut i = 1; // Skip service byte (0x41)
-    while i < data.len() {
-        let pid = data[i];
-        pids.push(pid);
-
-        // Skip PID byte + data bytes for this PID
-        let Some(data_len) = resolve_pid_data_length(pid, pid_lengths) else {
-            // Single-PID response for an unknown-length PID: the one PID is already
-            // pushed, so breaking is correct.  Multi-PID responses should never
-            // contain unknown-length PIDs (partition_pids_by_ecu_count filters them).
-            debug_assert!(
-                i == 1,
-                "Unknown PID length for {pid:#04X} at offset {i} — \
-                 multi-PID response contains unlearned PID"
-            );
-            break;
-        };
-        i += 1 + usize::from(data_len);
-    }
-
-    pids
-}
-
-/// Parse a raw dongle response into cache entries grouped by PID.
-///
-/// The dongle returns responses like `b"410C1AF8\r410C1B00\r\r>"`.
-/// This splits on `\r`, parses each ECU response, and groups data by PID.
-/// For multi-PID responses like `410C0CB805627D`, splits into separate entries.
-///
-/// Returns a map of PID to `CachedResponse` (data per ECU).
-/// Only parses Mode 01 (0x41) responses.
-fn parse_response_to_cache(
-    raw: &WireBytes,
-    pid_lengths: &PidDataLengths,
-) -> HashMap<Pid, CachedResponse> {
-    let mut result: HashMap<Pid, CachedResponse> = HashMap::new();
-
-    for line in raw.split(|&b| b == b'\r') {
-        if line.is_empty() || line == b">" {
-            continue;
-        }
-
-        // Parse hex string to bytes
-        let hex_str: String = line
-            .iter()
-            .filter(|b| b.is_ascii_hexdigit())
-            .map(|&b| b as char)
-            .collect();
-        let bytes: SmallVec<u8, 12> = hex_str
-            .as_bytes()
-            .chunks(2)
-            .filter_map(|chunk| {
-                if chunk.len() == 2 {
-                    u8::from_str_radix(std::str::from_utf8(chunk).ok()?, 16).ok()
-                } else {
-                    None
-                }
-            })
-            .collect();
-
-        // Need at least mode + PID
-        if bytes.len() < 2 {
-            continue;
-        }
-
-        // Only accept Mode 01 responses (0x41)
-        if bytes[0] != 0x41 {
-            continue;
-        }
-
-        // Extract PIDs and their data
-        let mut i = 1;
-        while i < bytes.len() {
-            let pid = bytes[i];
-            let Some(data_len) = resolve_pid_data_length(pid, pid_lengths) else {
-                let data: PidData = bytes[i + 1..].iter().copied().collect();
-                result.entry(pid).or_default().push(data);
-                break;
-            };
-            let data_len = usize::from(data_len);
-
-            // Extract data bytes for this PID
-            let data_end = (i + 1 + data_len).min(bytes.len());
-            let data: PidData = bytes[i + 1..data_end].iter().copied().collect();
-
-            // Add to result (append if multiple ECUs responded)
-            result.entry(pid).or_default().push(data);
-
-            // Move to next PID
-            i += 1 + data_len;
-        }
-    }
-
-    result
-}
-
 // ============================================================================
 // Cache Types
 // ============================================================================
@@ -633,24 +321,11 @@ pub enum DongleMessage {
 pub type DongleSender = Sender<DongleMessage>;
 pub type DongleReceiver = Receiver<DongleMessage>;
 
-/// Tri-state for dongle/ECU feature probing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FeatureSupport {
-    /// Not yet tested.
-    Unknown,
-    /// Confirmed supported.
-    Yes,
-    /// Confirmed unsupported.
-    No,
-}
-
-/// Errors from the dongle task
+/// Why a client's wait for a PID value failed.
 #[derive(Debug, Clone)]
 pub enum DongleError {
     NotConnected,
     Timeout,
-    Disconnected,
-    IoError(String),
 }
 
 impl std::fmt::Display for DongleError {
@@ -658,8 +333,6 @@ impl std::fmt::Display for DongleError {
         match self {
             Self::NotConnected => write!(f, "Not connected to dongle"),
             Self::Timeout => write!(f, "Dongle timeout"),
-            Self::Disconnected => write!(f, "Dongle disconnected"),
-            Self::IoError(e) => write!(f, "IO error: {e}"),
         }
     }
 }
@@ -672,353 +345,62 @@ impl DongleError {
         match self {
             Self::NotConnected => "UNABLE TO CONNECT",
             Self::Timeout => "NO DATA",
-            Self::Disconnected => "CAN ERROR",
-            Self::IoError(_) => "BUS ERROR",
         }
     }
 }
 
 // ============================================================================
-// Dongle Connection State
+// Dongle Connection
 // ============================================================================
 
-/// State for the dongle connection
-struct DongleState {
+/// The dongle's TCP stream, recording every write and read into the capture
+/// buffer while capture is switched on.
+struct CapturingStream {
     stream: TcpStream,
-    /// Reference to shared state for capture recording
+    /// Shared state: the capture switch and buffer.
     state: Arc<State>,
-    /// Capture buffer size snapshot from config
+    /// Capture buffer size snapshot from config.
     capture_buffer_size: u32,
-    /// Capture start time (for relative timestamps)
+    /// Connection start, for relative capture timestamps.
     capture_start: Instant,
-    /// Whether the dongle supports the repeat command
-    supports_repeat: FeatureSupport,
-    /// The repeat command to send (e.g. b"1" or empty for bare CR).
-    /// Only meaningful when `supports_repeat != No`.
-    repeat_cmd: WireBytes,
-    /// Last wire command sent to the dongle (includes response count suffix if learned)
-    last_command: Option<WireBytes>,
-    /// Learned ECU counts per PID (how many ECUs respond to each PID).
-    /// On first request for a PID, we send without a count to learn it.
-    /// Subsequent requests append the count for faster dongle response.
-    response_counts: HashMap<Pid, u8>,
-    /// PID → data-byte-count lookup table.
-    /// Initialized from the static SAE J1979 table; updated at runtime when
-    /// single-PID query responses reveal lengths for vendor-specific PIDs.
-    /// Reset to the static table on reconnect.
-    pid_lengths: PidDataLengths,
-    /// Whether the ECU supports multi-PID queries.
-    /// Set to `Yes` after a validated multi-PID response, `No` on failure.
-    /// Reset on reconnect.
-    supports_multi_pid: FeatureSupport,
-    /// Whether framing (ATH1) is enabled for CAN header parsing
-    framing_enabled: bool,
 }
 
-impl DongleState {
-    /// Build the wire command for a PID, appending the learned response count if known.
-    fn build_wire_command(&self, pid: Pid) -> WireBytes {
-        let mut cmd = pid_to_wire_command(pid);
-        if let Some(&count) = self.response_counts.get(&pid) {
-            write!(cmd, " {count}").unwrap();
-        }
-        cmd
-    }
-
-    /// Send a command to the dongle without waiting for response.
-    /// Records to capture buffer if capture is enabled.
-    fn send_command(&mut self, command: &[u8]) -> Result<(), DongleError> {
-        let mut cmd_with_cr: WireBytes = command.into();
-        if !cmd_with_cr.ends_with(b"\r") {
-            cmd_with_cr.push(b'\r');
-        }
-
-        debug!(
-            "Sending to dongle: {:?}",
-            String::from_utf8_lossy(&cmd_with_cr)
-        );
-
-        // Record to capture buffer
-        if self.state.capture_active.load(Ordering::Relaxed) {
+impl CapturingStream {
+    fn record(&self, record_type: RecordType, data: &[u8]) {
+        if !data.is_empty() && self.state.capture_active.load(Ordering::Relaxed) {
             record_event(
                 &self.state,
                 self.capture_start.elapsed(),
-                RecordType::ClientToDongle,
-                &cmd_with_cr,
+                record_type,
+                data,
                 self.capture_buffer_size,
             );
         }
-
-        self.stream
-            .write_all(&cmd_with_cr)
-            .map_err(|e| DongleError::IoError(e.to_string()))
-    }
-
-    /// Receive response from dongle until `>` prompt.
-    /// Records to capture buffer if capture is enabled.
-    fn recv_response(&mut self, timeout: Duration) -> Result<WireBytes, DongleError> {
-        let mut buffer = [0u8; 128];
-        let mut response = WireBytes::new();
-        let start = Instant::now();
-
-        loop {
-            match self.stream.read(&mut buffer) {
-                Ok(0) => return Err(DongleError::Disconnected),
-                Ok(n) => {
-                    response.extend_from_slice(&buffer[..n]);
-                    debug!("Read {} bytes from dongle, total: {}", n, response.len());
-                    if response.contains(&b'>') {
-                        debug!(
-                            "Complete response: {:?}",
-                            String::from_utf8_lossy(&response)
-                        );
-                        break;
-                    }
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    warn!("Unexpected WouldBlock on blocking socket - lwIP quirk?");
-                    if start.elapsed() > timeout {
-                        return Err(DongleError::Timeout);
-                    }
-                    std::thread::sleep(Duration::from_millis(10));
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
-                    return Err(DongleError::Timeout);
-                }
-                Err(e) => return Err(DongleError::IoError(e.to_string())),
-            }
-        }
-
-        // Record to capture buffer
-        if self.state.capture_active.load(Ordering::Relaxed) {
-            record_event(
-                &self.state,
-                self.capture_start.elapsed(),
-                RecordType::DongleToClient,
-                &response,
-                self.capture_buffer_size,
-            );
-        }
-
-        Ok(response)
-    }
-
-    /// Send a command and receive the response (raw send + receive with capture recording).
-    fn raw_execute(&mut self, command: &[u8], timeout: Duration) -> Result<WireBytes, DongleError> {
-        self.send_command(command)?;
-        self.recv_response(timeout)
-    }
-
-    /// Learn ECU counts from a response, storing per-PID.
-    ///
-    /// Parses the response to extract per-PID ECU counts and stores them.
-    /// Works for both single-PID and multi-PID responses.
-    fn learn_response_counts(&mut self, response: &WireBytes) {
-        let parsed = parse_response_framed(response, self.framing_enabled);
-        let counts = count_ecus_per_pid(&parsed, self.framing_enabled, &self.pid_lengths);
-
-        for (pid, count) in counts {
-            if !self.response_counts.contains_key(&pid) && count > 0 {
-                info!("Learned ECU count for PID {pid:02X}: {count}");
-                self.response_counts.insert(pid, count);
-            }
-        }
-    }
-
-    /// Learn the data byte count for a PID from a single-PID query response.
-    ///
-    /// For a single-PID query `01XX`, each ECU response line has format:
-    /// `41 XX DD DD DD...` — the bytes after service byte + PID are data bytes.
-    /// Verifies all ECU responses agree on the length before storing.
-    fn learn_pid_data_length(&mut self, pid: Pid, response: &WireBytes) {
-        // Skip if already known (static table or previously learned)
-        if resolve_pid_data_length(pid, &self.pid_lengths).is_some() {
-            return;
-        }
-
-        let parsed = parse_response_framed(response, self.framing_enabled);
-        let mut learned_len: Option<u8> = None;
-
-        for line in &parsed {
-            // Expect [0x41, pid, data...]
-            if line.data.len() < 2 || line.data[0] != 0x41 || line.data[1] != pid {
-                continue;
-            }
-            // OBD2 CAN single-frame data is at most 7 bytes (minus service + PID = 5),
-            // so this always fits u8.
-            #[allow(clippy::cast_possible_truncation)]
-            let data_len = (line.data.len() - 2) as u8;
-            match learned_len {
-                None => learned_len = Some(data_len),
-                Some(prev) if prev != data_len => {
-                    warn!(
-                        "Inconsistent data length for PID {pid:02X}: {prev} vs {data_len}, \
-                         not learning"
-                    );
-                    return;
-                }
-                _ => {}
-            }
-        }
-
-        if let Some(len) = learned_len {
-            info!("Learned data length for PID {pid:02X}: {len} bytes");
-            self.pid_lengths[pid as usize] = Some(len);
-        }
-    }
-
-    /// Execute a wire command with the ELM327 repeat optimization.
-    ///
-    /// If `wire_cmd` matches `last_command` and repeat is supported (or
-    /// untested), sends the repeat command instead of the full command.
-    /// Falls back to a full resend when the dongle replies with `?`.
-    ///
-    /// Maintains `last_command` and `supports_repeat` state. Callers are
-    /// responsible for running any learning logic (ECU counts, data lengths)
-    /// on the returned response.
-    fn execute(
-        &mut self,
-        wire_cmd: WireBytes,
-        timeout: Duration,
-    ) -> Result<WireBytes, DongleError> {
-        let can_try_repeat = self.supports_repeat != FeatureSupport::No
-            && self.last_command.as_ref() == Some(&wire_cmd);
-
-        if can_try_repeat {
-            debug!("Trying repeat command");
-            let repeat_result = self.raw_execute(&self.repeat_cmd.clone(), timeout);
-
-            if let Ok(response) = &repeat_result {
-                let response_str = String::from_utf8_lossy(response);
-                if response_str.contains('?') {
-                    // Repeat not supported, mark and resend full command
-                    info!("Dongle does not support repeat command");
-                    self.supports_repeat = FeatureSupport::No;
-                    let result = self.raw_execute(&wire_cmd, timeout);
-                    self.last_command = if result.is_ok() { Some(wire_cmd) } else { None };
-                    result
-                } else {
-                    if self.supports_repeat == FeatureSupport::Unknown {
-                        info!("Dongle supports repeat command");
-                        self.supports_repeat = FeatureSupport::Yes;
-                    }
-                    repeat_result
-                }
-            } else {
-                self.last_command = None;
-                repeat_result
-            }
-        } else {
-            let result = self.raw_execute(&wire_cmd, timeout);
-            self.last_command = if result.is_ok() { Some(wire_cmd) } else { None };
-            result
-        }
-    }
-
-    /// Query a single PID from the ECU.
-    ///
-    /// Builds the wire command (with learned response count if known), sends
-    /// via [`execute`], then learns data length and ECU counts from
-    /// the response.
-    fn query_single_pid(&mut self, pid: Pid, timeout: Duration) -> Result<WireBytes, DongleError> {
-        let wire_cmd = self.build_wire_command(pid);
-        let result = self.execute(wire_cmd, timeout);
-        if let Ok(ref resp) = result {
-            self.learn_pid_data_length(pid, resp);
-            self.learn_response_counts(resp);
-        }
-        result
-    }
-
-    /// Query multiple PIDs from the ECU in a single command.
-    ///
-    /// Builds a combined wire command (e.g., `010C0D 1`) and sends via
-    /// [`execute`], then learns ECU counts from the response.
-    fn query_multiple_pids(
-        &mut self,
-        pids: &[Pid],
-        response_count: u8,
-        timeout: Duration,
-    ) -> Result<WireBytes, DongleError> {
-        let wire_cmd = build_multi_pid_wire_command(pids, response_count);
-        let result = self.execute(wire_cmd, timeout);
-        if let Ok(ref resp) = result {
-            self.learn_response_counts(resp);
-        }
-        result
-    }
-
-    /// Validate multi-PID support from the first multi-PID response.
-    ///
-    /// Checks whether ≥ 2 of the queried PIDs appear in the response.
-    /// Sets `supports_multi_pid` to `Yes` or `No`; no-ops if already known.
-    fn validate_multi_pid_support(
-        &mut self,
-        result: &Result<WireBytes, DongleError>,
-        queried_pids: &[Pid],
-    ) {
-        if self.supports_multi_pid != FeatureSupport::Unknown {
-            return;
-        }
-        if let Ok(raw) = result {
-            let parsed = parse_response_to_cache(raw, &self.pid_lengths);
-            let matched = queried_pids
-                .iter()
-                .filter(|pid| parsed.contains_key(pid))
-                .count();
-            if matched >= 2 {
-                info!("ECU supports multi-PID queries ({matched} PIDs in response)");
-                self.supports_multi_pid = FeatureSupport::Yes;
-            } else {
-                info!(
-                    "ECU does not support multi-PID queries \
-                     (only {matched} PIDs in response)"
-                );
-                self.supports_multi_pid = FeatureSupport::No;
-            }
-        } else {
-            info!("Multi-PID query failed, assuming not supported");
-            self.supports_multi_pid = FeatureSupport::No;
-        }
-    }
-
-    /// Run the standard ELM327 initialization sequence.
-    ///
-    /// Sends ATZ reset, then ATE0/ATL0/ATS0/ATSP0, and finally ATH1 or ATH0
-    /// depending on `use_framing`.
-    fn run_init_commands(
-        &mut self,
-        timeout: Duration,
-        use_framing: bool,
-    ) -> Result<(), DongleError> {
-        // ATZ needs raw write (does not follow normal echo/prompt pattern after reset)
-        debug!("Sending ATZ reset");
-        self.stream
-            .write_all(b"ATZ\r")
-            .map_err(|e| DongleError::IoError(e.to_string()))?;
-        std::thread::sleep(Duration::from_millis(500));
-        let mut buf = [0u8; 256];
-        let _ = self.stream.read(&mut buf);
-
-        // Normal init commands
-        self.raw_execute(b"ATE0", timeout)?;
-        self.raw_execute(b"ATL0", timeout)?;
-        self.raw_execute(b"ATS0", timeout)?;
-        self.raw_execute(b"ATSP0", timeout)?;
-
-        // Set framing mode based on config
-        if use_framing {
-            self.raw_execute(b"ATH1", timeout)?;
-            self.framing_enabled = true;
-            info!("Framing enabled (ATH1)");
-        } else {
-            self.raw_execute(b"ATH0", timeout)?;
-            self.framing_enabled = false;
-        }
-
-        Ok(())
     }
 }
+
+impl Read for CapturingStream {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.stream.read(buf)?;
+        self.record(RecordType::DongleToClient, &buf[..n]);
+        Ok(n)
+    }
+}
+
+impl Write for CapturingStream {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let n = self.stream.write(buf)?;
+        self.record(RecordType::ClientToDongle, &buf[..n]);
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.stream.flush()
+    }
+}
+
+/// A connected, initialized dongle.
+type DongleSession = ClientSession<CapturingStream>;
 
 // ============================================================================
 // Dongle Task
@@ -1032,6 +414,9 @@ struct PollingState {
     slow_index: usize,
     last_slow_poll: Instant,
     fast_requests_since_slow: u32,
+    /// ECU counts per PID, learned from the dongle's replies. Kept across
+    /// reconnects, where the session's own knowledge starts afresh.
+    ecu_counts: HashMap<Pid, u8>,
 }
 
 impl Default for PollingState {
@@ -1044,6 +429,7 @@ impl Default for PollingState {
             slow_index: 0,
             last_slow_poll: Instant::now(),
             fast_requests_since_slow: 0,
+            ecu_counts: HashMap::new(),
         }
     }
 }
@@ -1105,14 +491,14 @@ impl PollingState {
     /// - `None`: PIDs needing individual queries to learn their ECU count or data length
     fn partition_pids_by_ecu_count(
         &self,
-        dongle: &DongleState,
+        dongle: &DongleSession,
     ) -> SmallVec<(Option<u8>, PidGroup), 4> {
         let mut groups: HashMap<Option<u8>, PidGroup> = HashMap::new();
 
         for &pid in self.fast_pids.iter().chain(self.slow_pids.iter()) {
-            let has_data_len = resolve_pid_data_length(pid, &dongle.pid_lengths).is_some();
+            let has_data_len = dongle.server_state().data_length(pid).is_some();
             let key = if has_data_len {
-                dongle.response_counts.get(&pid).copied()
+                self.ecu_counts.get(&pid).copied()
             } else {
                 None
             };
@@ -1120,6 +506,27 @@ impl PollingState {
         }
 
         groups.into_iter().collect()
+    }
+
+    /// Query one PID with the ECU count learned for it.
+    fn query_single(
+        &mut self,
+        dongle: &mut DongleSession,
+        pid: Pid,
+    ) -> std::io::Result<HashMap<Pid, CachedResponse>> {
+        let result = dongle.query_pid(pid, self.ecu_counts.get(&pid).copied());
+        self.keep_ecu_counts(dongle, &[pid]);
+        result
+    }
+
+    /// Keep the ECU counts the session has learned for `pids`; a count,
+    /// once learned, is not replaced.
+    fn keep_ecu_counts(&mut self, dongle: &DongleSession, pids: &[Pid]) {
+        for &pid in pids {
+            if let Some(count) = dongle.server_state().ecu_count(pid) {
+                self.ecu_counts.entry(pid).or_insert(count);
+            }
+        }
     }
 
     /// Sync PID counts and lists to the shared polling metrics in `State`.
@@ -1136,14 +543,14 @@ impl PollingState {
             *fast = self
                 .fast_pids
                 .iter()
-                .map(|k| String::from_utf8_lossy(&pid_to_wire_command(*k)).into_owned())
+                .map(|k| format!("01{k:02X}"))
                 .collect();
         }
         if let Ok(mut slow) = state.polling_metrics.slow_pids.lock() {
             *slow = self
                 .slow_pids
                 .iter()
-                .map(|k| String::from_utf8_lossy(&pid_to_wire_command(*k)).into_owned())
+                .map(|k| format!("01{k:02X}"))
                 .collect();
         }
     }
@@ -1156,12 +563,7 @@ impl PollingState {
     /// confirmed unsupported.
     ///
     /// Returns the number of dongle requests made this iteration.
-    fn poll_pids(
-        &mut self,
-        connection: &mut Option<DongleState>,
-        state: &Arc<State>,
-        timeout: Duration,
-    ) -> u32 {
+    fn poll_pids(&mut self, connection: &mut Option<DongleSession>, state: &Arc<State>) -> u32 {
         if connection.is_none() {
             return 0;
         }
@@ -1187,15 +589,14 @@ impl PollingState {
         let try_multi = use_multi_pid
             && connection
                 .as_ref()
-                .is_some_and(|ds| ds.supports_multi_pid != FeatureSupport::No);
+                .is_some_and(|ds| ds.server_state().multi_pid() != FeatureSupport::No);
 
         if try_multi {
-            self.poll_pids_multi(connection, state, timeout, max_pids_per_query)
+            self.poll_pids_multi(connection, state, max_pids_per_query)
         } else {
             self.poll_pids_single(
                 connection,
                 state,
-                timeout,
                 slow_poll_mode,
                 slow_poll_interval,
                 slow_poll_ratio,
@@ -1206,9 +607,8 @@ impl PollingState {
     /// Single-PID polling: one fast PID round-robin, plus one slow PID when due.
     fn poll_pids_single(
         &mut self,
-        connection: &mut Option<DongleState>,
+        connection: &mut Option<DongleSession>,
         state: &Arc<State>,
-        timeout: Duration,
         slow_poll_mode: SlowPollMode,
         slow_poll_interval: Duration,
         slow_poll_ratio: u32,
@@ -1221,7 +621,7 @@ impl PollingState {
 
         // Always try to poll a fast PID
         if let Some(pid) = self.next_fast_pid() {
-            let result = dongle_state.query_single_pid(pid, timeout);
+            let result = self.query_single(dongle_state, pid);
             handle_dongle_result(result, connection, state);
 
             requests += 1;
@@ -1243,7 +643,7 @@ impl PollingState {
             if let Some(pid) = self.next_slow_pid() {
                 // Re-check connection after potential fast poll failure
                 if let Some(ref mut dongle_state) = connection {
-                    let result = dongle_state.query_single_pid(pid, timeout);
+                    let result = self.query_single(dongle_state, pid);
                     handle_dongle_result(result, connection, state);
 
                     requests += 1;
@@ -1275,9 +675,8 @@ impl PollingState {
     /// caller will fall back to `poll_pids_single` on the next iteration.
     fn poll_pids_multi(
         &mut self,
-        connection: &mut Option<DongleState>,
+        connection: &mut Option<DongleSession>,
         state: &Arc<State>,
-        timeout: Duration,
         max_pids: u8,
     ) -> u32 {
         let Some(dongle_state) = connection.as_mut() else {
@@ -1299,19 +698,18 @@ impl PollingState {
                         };
 
                         if chunk.len() == 1 {
-                            let result = ds.query_single_pid(chunk[0], timeout);
+                            let result = self.query_single(ds, chunk[0]);
                             handle_dongle_result(result, connection, state);
                         } else {
-                            let result = ds.query_multiple_pids(chunk, *count, timeout);
-                            ds.validate_multi_pid_support(&result, chunk);
+                            let result = ds.query_pids(chunk, Some(*count));
+                            self.keep_ecu_counts(ds, chunk);
                             handle_dongle_result(result, connection, state);
 
                             // If multi-PID was just rejected, stop sending more chunks —
                             // the next poll_pids call will use single-PID mode.
-                            if connection
-                                .as_ref()
-                                .map_or(true, |ds| ds.supports_multi_pid == FeatureSupport::No)
-                            {
+                            if connection.as_ref().map_or(true, |ds| {
+                                ds.server_state().multi_pid() == FeatureSupport::No
+                            }) {
                                 requests += 1;
                                 state
                                     .polling_metrics
@@ -1336,7 +734,7 @@ impl PollingState {
                         let Some(ref mut ds) = connection else {
                             break;
                         };
-                        let result = ds.query_single_pid(pid, timeout);
+                        let result = self.query_single(ds, pid);
                         handle_dongle_result(result, connection, state);
 
                         requests += 1;
@@ -1358,7 +756,7 @@ impl PollingState {
 pub fn dongle_task(state: &Arc<State>, control_rx: &DongleReceiver) {
     info!("OBD2 dongle task starting...");
 
-    let mut connection: Option<DongleState> = None;
+    let mut connection: Option<DongleSession> = None;
     let mut last_connect_attempt: Option<Instant> = None;
     let mut polling = PollingState::default();
 
@@ -1410,7 +808,7 @@ pub fn dongle_task(state: &Arc<State>, control_rx: &DongleReceiver) {
 
         // Poll PIDs if connected
         if connection.is_some() {
-            requests_this_second += polling.poll_pids(&mut connection, state, timeout);
+            requests_this_second += polling.poll_pids(&mut connection, state);
         } else {
             // Not connected, sleep before retry
             std::thread::sleep(Duration::from_millis(100));
@@ -1433,7 +831,7 @@ pub fn dongle_task(state: &Arc<State>, control_rx: &DongleReceiver) {
 
 /// Attempt to reconnect to the dongle if the reconnect delay has elapsed.
 fn try_reconnect(
-    connection: &mut Option<DongleState>,
+    connection: &mut Option<DongleSession>,
     last_connect_attempt: &mut Option<Instant>,
     dongle_ip: &str,
     dongle_port: u16,
@@ -1471,26 +869,25 @@ fn try_reconnect(
     }
 }
 
-/// Handle a dongle result: parse the response on success, tear down the
-/// connection on fatal errors, and forward parsed data to the cache manager.
+/// Handle a dongle result: forward parsed data to the cache manager on
+/// success, tear down the connection on fatal errors.
 fn handle_dongle_result(
-    result: Result<WireBytes, DongleError>,
-    connection: &mut Option<DongleState>,
+    result: std::io::Result<HashMap<Pid, CachedResponse>>,
+    connection: &mut Option<DongleSession>,
     state: &Arc<State>,
 ) {
     match result {
-        Ok(raw) => {
-            // Connection is guaranteed to be Some when the result is Ok —
-            // only fatal errors (Disconnected/IoError) drop it.
-            let pid_lengths = &connection.as_ref().unwrap().pid_lengths;
-            let responses = parse_response_to_cache(&raw, pid_lengths);
+        Ok(responses) => {
             state
                 .cache_manager_tx
                 .send(CacheManagerMessage::DongleResponse { responses })
                 .expect("cache manager task dead");
         }
-        Err(DongleError::Disconnected | DongleError::IoError(_)) => {
-            warn!("Dongle connection lost, will reconnect");
+        // A timeout leaves the connection up; anything else (closed by the
+        // dongle, an I/O error) drops it.
+        Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {}
+        Err(e) => {
+            warn!("Dongle connection lost ({e}), will reconnect");
             *connection = None;
             state
                 .dongle_tcp_state
@@ -1503,7 +900,6 @@ fn handle_dongle_result(
             // doesn't serve outdated supported-PID responses.
             *state.supported_pids.lock().unwrap() = SupportedPidsCache::default();
         }
-        Err(DongleError::Timeout | DongleError::NotConnected) => {}
     }
 }
 
@@ -1607,7 +1003,7 @@ fn run_maintenance(
         .map(|(pid, info)| {
             #[allow(clippy::cast_precision_loss)]
             let rate = info.request_count as f32 / elapsed_secs;
-            let pid_str = String::from_utf8_lossy(&pid_to_wire_command(*pid)).into_owned();
+            let pid_str = format!("01{pid:02X}");
             info.request_count = 0;
             (pid_str, rate)
         })
@@ -1906,9 +1302,10 @@ pub fn cache_manager_task(state: &Arc<State>, manager_rx: &Receiver<CacheManager
                     update_client_caches(&clients, *pid, data);
 
                     // Convert raw response bytes to u32 and send to LED task
-                    let raw = data.first().map_or(0, |pid_data| {
-                        pid_data
+                    let raw = data.first().map_or(0, |line| {
+                        line.data
                             .iter()
+                            .skip(2) // mode and PID bytes
                             .take(4)
                             .fold(0u32, |acc, &b| (acc << 8) | u32::from(b))
                     });
@@ -1981,7 +1378,7 @@ fn try_connect(
     timeout: Duration,
     watchdog: &WatchdogHandle,
     state: &Arc<State>,
-) -> Option<(DongleState, SocketAddr, SocketAddr)> {
+) -> Option<(DongleSession, SocketAddr, SocketAddr)> {
     info!(
         "Connecting to OBD2 dongle at {dongle_ip}:{dongle_port} (timeout: {}ms)",
         timeout.as_millis()
@@ -2018,70 +1415,48 @@ fn try_connect(
         return None;
     }
 
-    let capture_start = Instant::now();
     let cfg = state.config.lock().unwrap();
-    let capture_buffer_size = cfg.obd2.capture_buffer_size;
-    let use_framing = cfg.obd2.use_framing;
-    let use_repeat = cfg.obd2.use_repeat;
-    let repeat_cmd: WireBytes = cfg.obd2.repeat_string.as_bytes().into();
-    drop(cfg);
-
-    // Create DongleState for init and queries
-    let mut dongle_state = DongleState {
+    let stream = CapturingStream {
         stream,
         state: state.clone(),
-        capture_buffer_size,
-        capture_start,
-        supports_repeat: if use_repeat {
-            FeatureSupport::Unknown
-        } else {
-            FeatureSupport::No
-        },
-        repeat_cmd,
-        last_command: None,
-        response_counts: HashMap::new(),
-        pid_lengths: MODE01_PID_DATA_LENGTHS,
-        supports_multi_pid: FeatureSupport::Unknown,
-        framing_enabled: false, // Will be set after ATH command
+        capture_buffer_size: cfg.obd2.capture_buffer_size,
+        capture_start: Instant::now(),
     };
+    let config = ClientConfig {
+        framing: cfg.obd2.use_framing,
+        repeat: cfg.obd2.use_repeat,
+        timeout,
+        ..ClientConfig::default()
+    };
+    drop(cfg);
 
-    if let Err(e) = dongle_state.run_init_commands(timeout, use_framing) {
+    let mut dongle = ClientSession::new(stream, config);
+    if let Err(e) = dongle.init() {
         error!("Dongle init failed: {e}");
         return None;
     }
 
     info!("Connected to OBD2 dongle, querying supported PIDs...");
-    query_supported_pids(&mut dongle_state, state, timeout, watchdog);
+    query_supported_pids(&mut dongle, state, watchdog);
     info!("Connected to OBD2 dongle");
 
-    Some((dongle_state, local_addr, remote_addr))
+    Some((dongle, local_addr, remote_addr))
 }
 
 /// Query the 8 standard supported-PID ranges and store results in `State`.
-fn query_supported_pids(
-    dongle: &mut DongleState,
-    state: &Arc<State>,
-    timeout: Duration,
-    watchdog: &WatchdogHandle,
-) {
+fn query_supported_pids(dongle: &mut DongleSession, state: &Arc<State>, watchdog: &WatchdogHandle) {
     let mut guard = state.supported_pids.lock().unwrap();
     *guard = SupportedPidsCache::default();
-    for (idx, query) in SUPPORTED_PID_QUERIES.iter().enumerate() {
+    for (idx, pid) in (0..=0xE0).step_by(0x20).enumerate() {
         watchdog.feed();
-        match dongle.raw_execute(query, timeout) {
-            Ok(response) => {
-                debug!(
-                    "Supported PIDs query {:?}: {:?}",
-                    String::from_utf8_lossy(query),
-                    String::from_utf8_lossy(&response)
-                );
-                guard.entries[idx] = Some(response);
+        match dongle.query_pid(pid, None) {
+            Ok(mut parsed) => {
+                debug!("Supported PIDs query 01{pid:02X}: {parsed:?}");
+                // No Mode 01 line (NO DATA) stores an empty answer.
+                guard.entries[idx] = Some(parsed.remove(&pid).unwrap_or_default());
             }
             Err(e) => {
-                debug!(
-                    "Supported PIDs query {:?} failed: {e}",
-                    String::from_utf8_lossy(query)
-                );
+                debug!("Supported PIDs query 01{pid:02X} failed: {e}");
                 guard.entries[idx] = None;
             }
         }
@@ -2267,16 +1642,13 @@ impl Obd2Proxy {
         // Check if this is a supported PIDs query - return from State cache
         if let Some(idx) = supported_pids_index(&normalized) {
             let supported_pids_guard = state.supported_pids.lock().unwrap();
-            if let Some(ref cached_response) = supported_pids_guard.entries[idx] {
-                let framing = state.config.lock().unwrap().obd2.use_framing;
-                let lines: SmallVec<ReplyLine, 4> = parse_response_framed(cached_response, framing)
-                    .into_iter()
-                    .map(|line| ReplyLine {
-                        ecu: line.ecu_id,
-                        data: line.data,
-                    })
-                    .collect();
-                obd.reply(&lines)?;
+            if let Some(ref lines) = supported_pids_guard.entries[idx] {
+                // The dongle answered without a Mode 01 line.
+                if lines.is_empty() {
+                    obd.reject("NO DATA")?;
+                } else {
+                    obd.reply(lines)?;
+                }
                 return Ok(());
             }
             drop(supported_pids_guard);
@@ -2295,7 +1667,7 @@ impl Obd2Proxy {
         // Get value from cache
         let timeout = Duration::from_millis(state.config.lock().unwrap().obd2_timeout_ms);
         match Self::get_cached_value(pid, client_cache, state, timeout) {
-            Ok(response) => obd.reply(&cached_lines(pid, &response))?,
+            Ok(response) => obd.reply(&response)?,
             Err(e) => {
                 error!("Cache error: {e}");
                 obd.reject(e.to_elm327_error())?;

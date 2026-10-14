@@ -3,8 +3,12 @@
 //! This library provides types and functions for implementing ELM327-compatible
 //! OBD2 adapters and clients.
 
+mod client_session;
+mod pid;
 mod server_session;
 
+pub use client_session::{ClientConfig, ClientSession, FeatureSupport, ServerState};
+pub use pid::{Pid, PidDataLengths, PidGroup, MODE01_PID_DATA_LENGTHS};
 pub use server_session::{AtCommand, Command, Identity, ObdCommand, ServerSession};
 
 /// Bytes the library hands to an adapter to write. Sixteen bytes inline
@@ -21,6 +25,9 @@ pub struct ReplyLine {
     /// The reply's data bytes, starting with the mode byte.
     pub data: WireBytes,
 }
+
+/// The lines answering one PID, one per ECU; most PIDs get exactly one.
+pub type Lines = smallvec::SmallVec<ReplyLine, 1>;
 
 /// Per-connection client state (ELM327 settings)
 #[derive(Debug, Clone)]

@@ -6,9 +6,10 @@
 //! Usage: cargo run -p tachtalk-benchmark-client -- [OPTIONS]
 
 use clap::Parser;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::net::TcpStream;
 use std::time::{Duration, Instant};
+use tachtalk_elm327_lib::{ClientConfig, ClientSession};
 
 #[derive(Parser, Debug)]
 #[command(name = "tachtalk-benchmark")]
@@ -136,78 +137,30 @@ impl Stats {
     }
 }
 
-fn read_until_prompt(stream: &mut TcpStream) -> std::io::Result<String> {
-    let mut response = Vec::new();
-    let mut byte = [0u8; 1];
-
-    loop {
-        stream.read_exact(&mut byte)?;
-        response.push(byte[0]);
-        if byte[0] == b'>' {
-            break;
-        }
-    }
-
-    Ok(String::from_utf8_lossy(&response).to_string())
-}
-
-fn initialize_connection(stream: &mut TcpStream) -> std::io::Result<()> {
-    // Send ATZ to reset
-    stream.write_all(b"ATZ\r")?;
-    read_until_prompt(stream)?;
-
-    // Disable echo (ATE0) for faster communication
-    stream.write_all(b"ATE0\r")?;
-    read_until_prompt(stream)?;
-
-    // Disable spaces (ATS0) for faster parsing
-    stream.write_all(b"ATS0\r")?;
-    read_until_prompt(stream)?;
-
-    // Disable linefeeds (ATL0) for simpler parsing
-    stream.write_all(b"ATL0\r")?;
-    read_until_prompt(stream)?;
-
-    Ok(())
-}
-
-fn parse_rpm_response(response: &str) -> Option<u32> {
-    // Response format: "410CXXXX" where XXXX is RPM * 4 in hex
-    // May have trailing \r or > characters
-    let clean = response.trim().trim_end_matches('>').trim();
-
-    if clean.len() >= 8 && clean.starts_with("410C") {
-        let hex_value = &clean[4..8];
-        if let Ok(value) = u32::from_str_radix(hex_value, 16) {
-            return Some(value / 4);
-        }
-    }
-    None
-}
-
-fn request_rpm(stream: &mut TcpStream, use_repeat: bool) -> std::io::Result<Option<u32>> {
-    // Send RPM request (PID 0x0C)
-    // A bare CR repeats the last command if enabled (saves 4 bytes per request)
-    if use_repeat {
-        stream.write_all(b"\r")?;
-    } else {
-        stream.write_all(b"010C\r")?;
-    }
-
-    // Read until we get the prompt
-    let response = read_until_prompt(stream)?;
-
-    Ok(parse_rpm_response(&response))
+/// Request RPM (PID 0x0C); `None` when the reply holds no RPM line.
+fn request_rpm(client: &mut ClientSession<TcpStream>) -> std::io::Result<Option<u32>> {
+    let parsed = client.query_pid(0x0C, None)?;
+    // A line is `41 0C A B`; RPM is (256 * A + B) / 4.
+    Ok(parsed
+        .get(&0x0C)
+        .and_then(|lines| lines.first())
+        .and_then(|line| line.data.get(2..4))
+        .map(|ab| (u32::from(ab[0]) << 8 | u32::from(ab[1])) / 4))
 }
 
 fn run_benchmark(args: &Args) -> std::io::Result<()> {
     println!("Connecting to {}...", args.address);
 
-    let mut stream = TcpStream::connect(&args.address)?;
+    let stream = TcpStream::connect(&args.address)?;
     stream.set_nodelay(true)?;
 
     println!("Connected. Initializing ELM327...");
-    initialize_connection(&mut stream)?;
+    let config = ClientConfig {
+        repeat: args.repeat,
+        ..ClientConfig::default()
+    };
+    let mut client = ClientSession::new(stream, config);
+    client.init()?;
 
     println!(
         "Starting benchmark{}...\n",
@@ -226,8 +179,6 @@ fn run_benchmark(args: &Args) -> std::io::Result<()> {
         None
     };
     let interval = Duration::from_secs_f64(args.interval);
-    let use_repeat = args.repeat;
-    let mut can_repeat = false; // Need to send full command first
 
     loop {
         // Check if we should stop
@@ -239,9 +190,8 @@ fn run_benchmark(args: &Args) -> std::io::Result<()> {
 
         // Request RPM
         let request_start = Instant::now();
-        match request_rpm(&mut stream, use_repeat && can_repeat) {
+        match request_rpm(&mut client) {
             Ok(Some(rpm)) => {
-                can_repeat = true; // After first successful request, we can use repeat
                 let latency = request_start.elapsed();
                 stats.record_success(latency, rpm);
 

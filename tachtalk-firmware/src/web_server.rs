@@ -457,23 +457,14 @@ fn check_restart_needed(current: &Config, new: &Config) -> (SmallVec<u8, 4>, boo
 fn decode_supported_pids(cache: &crate::obd2::SupportedPidsCache) -> Vec<u8> {
     let mut pids = Vec::new();
     for (slot, entry) in cache.entries.iter().enumerate() {
-        let Some(raw) = entry else { continue };
-        let hex_str: String = raw
-            .iter()
-            .filter(|b| b.is_ascii_hexdigit())
-            .map(|&b| b as char)
-            .collect();
-        let bytes: Vec<u8> = hex_str
-            .as_bytes()
-            .chunks(2)
-            .filter_map(|chunk| {
-                if chunk.len() == 2 {
-                    u8::from_str_radix(std::str::from_utf8(chunk).ok()?, 16).ok()
-                } else {
-                    None
-                }
-            })
-            .collect();
+        // The first ECU's line: `41 {base} {4 bitmask bytes}`.
+        let Some(bytes) = entry
+            .as_ref()
+            .and_then(|lines| lines.first())
+            .map(|line| &line.data)
+        else {
+            continue;
+        };
         if bytes.len() < 6 || bytes[0] != 0x41 {
             continue;
         }
