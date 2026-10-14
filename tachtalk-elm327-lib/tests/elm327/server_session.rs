@@ -4,8 +4,10 @@
 //! (tachtalk-firmware/src/obd2.rs, `handle_client` + `process_command` as of
 //! bcaa695) and lock its behavior byte-for-byte, warts included: echo per
 //! byte read, CR framing with LF dropped, empty commands silently ignored,
-//! replies formatted `{le}{line}{le}>`, AT responses formatted with the line
-//! ending from before the command took effect, and the invented `1` repeat.
+//! replies formatted `{le}{line}{le}>`, and AT responses formatted with the
+//! line ending from before the command took effect. Deliberate changes since
+//! are noted at their tests: the datasheet's bare-CR repeat replaced the
+//! invented `1`.
 
 use std::io::ErrorKind;
 
@@ -117,9 +119,10 @@ fn linefeeds_are_echoed_but_not_buffered() {
 }
 
 #[test]
-fn empty_and_whitespace_commands_are_silently_ignored() {
+fn an_empty_line_with_nothing_to_repeat_answers_a_question_mark() {
+    // Spaces are ignored, so a line of spaces is an empty line too.
     let (written, seen) = serve_input(b"\r   \r");
-    assert_eq!(written, "\\r   \\r"); // echo only
+    assert_eq!(written, "\\r\\r\\n?\\r\\n>   \\r\\r\\n?\\r\\n>");
     assert!(seen.is_empty());
 }
 
@@ -251,19 +254,29 @@ fn each_command_is_answered_before_the_next_is_read() {
 }
 
 #[test]
-fn repeat_expands_to_the_last_replied_command() {
-    let mut session = firmware_session(FakeStream::new(b"ATE0\r010C\r1\r"));
+fn a_bare_cr_repeats_the_last_replied_command() {
+    // The datasheet's repeat: a single carriage return re-runs the last
+    // command (changed from the invented `1`, ADR 0001).
+    let mut session = firmware_session(FakeStream::new(b"ATE0\r010C 1\r\r  \r"));
     let seen = serve(&mut session, |_| {
         Answer::Reply(vec![line(&[0x41, 0x0C, 0x1A, 0xF8])])
     });
-    assert_eq!(seen, ["AT ATE0", "OBD 010C | 010C", "OBD 010C | 010C"]);
+    assert_eq!(
+        seen,
+        [
+            "AT ATE0",
+            "OBD 010C 1 | 010C 1",
+            "OBD 010C 1 | 010C 1",
+            "OBD 010C 1 | 010C 1"
+        ]
+    );
 }
 
 #[test]
-fn repeat_without_a_replied_command_answers_a_question_mark() {
-    // A rejected command is not recorded, so the 1 after it has nothing to
-    // repeat; the session answers it without handing it out.
-    let (written, seen) = serve_input(b"ATE0\r010C\r1\r");
+fn a_bare_cr_after_a_rejected_command_answers_a_question_mark() {
+    // A rejected command is not recorded, so there is nothing to repeat;
+    // the session answers the CR itself without handing anything out.
+    let (written, seen) = serve_input(b"ATE0\r010C\r\r");
     assert_eq!(seen, ["AT ATE0", "OBD 010C | 010C"]);
     assert_eq!(
         written,
@@ -272,8 +285,15 @@ fn repeat_without_a_replied_command_answers_a_question_mark() {
 }
 
 #[test]
+fn a_1_is_an_ordinary_command() {
+    // The invented `1` repeat is retired (ADR 0001): it reaches the program.
+    let (_, seen) = serve_input(b"ATE0\r1\r");
+    assert_eq!(seen, ["AT ATE0", "OBD 1 | 1"]);
+}
+
+#[test]
 fn torn_reads_write_the_same_bytes_as_whole_reads() {
-    let script: &[u8] = b"ATZ\rATE0\r010C\rAT H1\r\r  \rATL0\ratdp\r1\r\n010D\r";
+    let script: &[u8] = b"ATZ\rATE0\r010C\rAT H1\r\r  \rATL0\ratdp\r\r\n010D\r";
     let answer =
         |_: &ObdCommand<'_, FakeStream>| Answer::Reply(vec![line(&[0x41, 0x0C, 0x1A, 0xF8])]);
 
@@ -291,6 +311,8 @@ fn torn_reads_write_the_same_bytes_as_whole_reads() {
             "AT ATE0",
             "OBD 010C | 010C",
             "AT AT H1",
+            "OBD 010C | 010C",
+            "OBD 010C | 010C",
             "AT ATL0",
             "AT atdp",
             "OBD 010C | 010C",

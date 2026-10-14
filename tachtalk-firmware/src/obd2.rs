@@ -2239,7 +2239,7 @@ impl Obd2Proxy {
     }
 
     /// Answer a non-AT command: readiness gate, supported-PID cache, then
-    /// the client cache. The session has already expanded a `1` repeat.
+    /// the client cache. The session has already expanded a bare-CR repeat.
     fn answer_obd(
         obd: ObdCommand<'_, &TcpStream>,
         state: &Arc<State>,

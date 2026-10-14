@@ -34,7 +34,7 @@ pub struct ClientState {
     pub spaces_enabled: bool,
     /// Show header bytes in responses (ATH0/ATH1)
     pub headers_enabled: bool,
-    /// The last OBD command replied to, which a `1` repeats
+    /// The last OBD command replied to, which a bare carriage return repeats
     pub last_obd_command: Option<String>,
 }
 

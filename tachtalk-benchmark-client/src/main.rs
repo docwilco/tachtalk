@@ -30,7 +30,8 @@ struct Args {
     #[arg(short, long, default_value = "1")]
     interval: f64,
 
-    /// Use "1" repeat command instead of full "010C" for subsequent requests
+    /// Repeat with a bare carriage return instead of the full "010C" for
+    /// subsequent requests (the ELM327 datasheet's repeat)
     #[arg(short, long)]
     repeat: bool,
 }
@@ -186,9 +187,9 @@ fn parse_rpm_response(response: &str) -> Option<u32> {
 
 fn request_rpm(stream: &mut TcpStream, use_repeat: bool) -> std::io::Result<Option<u32>> {
     // Send RPM request (PID 0x0C)
-    // Use "1" to repeat last command if enabled (saves 3 bytes per request)
+    // A bare CR repeats the last command if enabled (saves 4 bytes per request)
     if use_repeat {
-        stream.write_all(b"1\r")?;
+        stream.write_all(b"\r")?;
     } else {
         stream.write_all(b"010C\r")?;
     }

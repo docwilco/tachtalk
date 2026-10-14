@@ -97,7 +97,8 @@ pub struct ObdCommand<'a, S: Read + Write> {
 }
 
 impl<S: Read + Write> ObdCommand<'_, S> {
-    /// The command, trimmed (the repeated command if the client sent `1`).
+    /// The command, trimmed (the repeated command for a bare carriage
+    /// return).
     #[must_use]
     pub fn command(&self) -> &str {
         &self.command
@@ -116,7 +117,7 @@ impl<S: Read + Write> ObdCommand<'_, S> {
     }
 
     /// Answer with one line per ECU, formatted to the client's settings.
-    /// The command becomes the one a later `1` repeats.
+    /// The command becomes the one a later bare carriage return repeats.
     ///
     /// # Errors
     /// Returns the stream's error if writing fails.
@@ -164,7 +165,8 @@ enum Line {
 }
 
 /// Server side of the wire protocol over a stream it owns: CR framing,
-/// echo, the AT dialect, the `1` repeat, reply formatting, the `>` prompt.
+/// echo, the AT dialect, the bare-CR repeat, reply formatting, the `>`
+/// prompt.
 #[derive(Debug)]
 pub struct ServerSession<S> {
     stream: S,
@@ -200,8 +202,8 @@ impl<S: Read + Write> ServerSession<S> {
     }
 
     /// Read until the next command, echoing as the client's settings say,
-    /// and hand it out. Empty lines are ignored; a `1` with nothing to
-    /// repeat is answered `?` here.
+    /// and hand it out. An empty line repeats the last command replied to,
+    /// or is answered `?` here when there is none.
     ///
     /// # Errors
     /// Returns the stream's errors: a read timeout (`TimedOut` or
@@ -284,13 +286,8 @@ impl<S: Read + Write> ServerSession<S> {
         let text = String::from_utf8_lossy(&self.line);
         let command = text.trim();
         let line = if command.is_empty() {
-            // Empty commands are silently ignored (firmware behavior; the
-            // datasheet's bare-CR repeat is a later, deliberate change).
-            None
-        } else if command.to_uppercase().starts_with("AT") {
-            Some(Line::At(command.to_string()))
-        } else if command == "1" {
-            // The invented `1` repeat (transitional; see ADR 0001).
+            // The datasheet's repeat: a bare carriage return re-runs the
+            // last command replied to; with none, it is answered `?`.
             if let Some(last) = &self.state.last_obd_command {
                 Some(Line::Obd(last.clone(), WireBytes::from(last.as_bytes())))
             } else {
@@ -298,6 +295,8 @@ impl<S: Read + Write> ServerSession<S> {
                 self.write_line("?")?;
                 return Ok(None);
             }
+        } else if command.to_uppercase().starts_with("AT") {
+            Some(Line::At(command.to_string()))
         } else {
             Some(Line::Obd(
                 command.to_string(),

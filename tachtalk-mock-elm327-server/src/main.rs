@@ -269,8 +269,8 @@ fn get_pid_response(pid: &str, start_time: &Instant) -> Option<String> {
     }
 }
 
-/// The mock engine ECU's answer to a non-AT command (already expanded if
-/// the client sent the `1` repeat): PID dispatch over simulated values.
+/// The mock engine ECU's answer to a non-AT command (the repeated command
+/// if the client sent a bare CR): PID dispatch over simulated values.
 fn respond_obd(command: &str, start_time: &Instant) -> Answer {
     let hex_data = match command {
         // Mode 03 - Show stored DTCs
@@ -466,16 +466,18 @@ mod tests {
     }
 
     #[test]
-    fn repeat_replays_the_last_replied_command() {
-        // A rejected command does not replace what 1 repeats.
+    fn a_bare_cr_repeats_the_last_replied_command() {
+        // A rejected command does not replace what a bare CR repeats, and
+        // the retired `1` is just an unknown command.
         assert_eq!(
-            serve(b"ATE0\rATS0\r0104 1\r0199 1\r1\r1\r"),
+            serve(b"ATE0\rATS0\r0104 1\r0199 1\r\r\r1\r"),
             "ATE0\r\r\nOK\r\n>\
              \r\nOK\r\n>\
              \r\n410464\r\n>\
              \r\nNO DATA\r\n>\
              \r\n410464\r\n>\
-             \r\n410464\r\n>"
+             \r\n410464\r\n>\
+             \r\n?\r\n>"
         );
     }
 }
